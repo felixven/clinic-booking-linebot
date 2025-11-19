@@ -19,10 +19,12 @@ from linebot.v3.webhooks import (
     TextMessageContent,
 )
 
+from datetime import datetime, timedelta
+
 import certifi 
 import os 
 import requests 
-import json
+
 
 app = Flask(__name__)
 
@@ -54,10 +56,11 @@ def get_graph_token():
     resp.raise_for_status()
     return resp.json()["access_token"]
 
+
 def list_appointments_for_date(date_str):
     """
-    取得某一天的所有預約（從 Bookings 讀取）
-    例如 date_str = "2025-01-15"
+    取得某一天的所有預約（從 Bookings 讀取，依「台北當地日期」判斷）
+    例如 date_str = "2025-11-15"
     """
     token = get_graph_token()
     business_id = os.environ.get("BOOKING_BUSINESS_ID")
@@ -78,10 +81,200 @@ def list_appointments_for_date(date_str):
 
     all_appts = resp.json().get("value", [])
 
-    # 過濾出「指定日期」的預約
-    result = [a for a in all_appts if a["startDateTime"]["date"] == date_str]
+    result = []
+    for a in all_appts:
+        start_info = a.get("startDateTime", {})
+        start_dt_str = start_info.get("dateTime")  # 例如 "2025-11-20T06:00:00.0000000Z"
+        if not start_dt_str:
+            continue
+
+        try:
+            # 去掉尾巴的 'Z' 跟小數秒
+            s = start_dt_str
+            if s.endswith("Z"):
+                s = s[:-1]
+            s = s.split(".")[0]
+            utc_dt = datetime.fromisoformat(s)
+        except Exception as e:
+            app.logger.error(f"解析 startDateTime 失敗: {start_dt_str}, error: {e}")
+            continue
+
+        # 轉成台北時間（UTC+8）
+        local_dt = utc_dt + timedelta(hours=8)
+        local_date_str = local_dt.date().isoformat()  # 'YYYY-MM-DD'
+
+        if local_date_str == date_str:
+            result.append(a)
 
     return result
+
+
+
+def get_available_slots_for_date(date_str: str) -> list[str]:
+    """
+    回傳指定日期「可預約」的時段列表，例如：
+    ["09:00", "09:30", "10:00", ...]
+    規則：09:00–21:00，每 30 分鐘，排除當天已被預約的「台北時間」開始時段。
+    """
+    appts = list_appointments_for_date(date_str)
+
+    booked_times = set()
+    for appt in appts:
+        start_info = appt.get("startDateTime", {})
+        start_dt_str = start_info.get("dateTime")  # "2025-11-20T06:00:00.0000000Z"
+        if not start_dt_str:
+            continue
+
+        try:
+            s = start_dt_str
+            if s.endswith("Z"):
+                s = s[:-1]
+            s = s.split(".")[0]
+            utc_dt = datetime.fromisoformat(s)
+        except Exception as e:
+            app.logger.error(f"解析 startDateTime 失敗（get_available_slots）：{start_dt_str}, error: {e}")
+            continue
+
+        local_dt = utc_dt + timedelta(hours=8)
+        hhmm = local_dt.strftime("%H:%M")  # 例如 "14:00"
+        booked_times.add(hhmm)
+
+    # 生成 09:00 ~ 21:00，每 30 分鐘
+    start = datetime.strptime("09:00", "%H:%M")
+    end = datetime.strptime("21:00", "%H:%M")
+
+    slots: list[str] = []
+    cur = start
+    while cur <= end:
+        hhmm = cur.strftime("%H:%M")
+        if hhmm not in booked_times:
+            slots.append(hhmm)
+        cur += timedelta(minutes=30)
+
+    return slots
+
+def create_booking_appointment(date_str: str, time_str: str):
+    """
+    用最簡化方式建立一筆 Bookings 預約。
+    - 實際只填必要欄位
+    - 客戶資料用假資料（之後你想接 LINE user 資料再改）
+    """
+
+    token = get_graph_token()
+    business_id = os.environ.get("BOOKING_BUSINESS_ID")
+
+    if not business_id:
+        raise Exception("缺 BOOKING_BUSINESS_ID")
+
+    # 合併日期與時間，轉成 ISO 格式
+    # 例如 date_str="2025-11-21", time_str="15:00"
+    local_str = f"{date_str} {time_str}:00"  # "2025-11-21 15:00:00"
+    local_dt = datetime.strptime(local_str, "%Y-%m-%d %H:%M:%S")
+
+    # Bookings API 是吃 UTC → 所以要 -8 小時
+    utc_dt = local_dt - timedelta(hours=8)
+    utc_iso = utc_dt.isoformat() + "Z"       # "2025-11-21T07:00:00Z"
+
+    # Booking duration（你可先固定 30 分鐘）
+    duration = "PT30M"  
+
+    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
+
+    
+    
+    payload = {
+        "customerName": "陳女士",              # 假資料
+        "customerEmailAddress": "test@example.com",
+        "customerPhone": "0912345678",
+
+        # 🔸 這兩個用你現有的 service/staff
+        "serviceId": BOOKING_DEMO_SERVICE_ID,
+        "serviceName": "一般門診",              # 看你要叫什麼，都可以
+
+        "startDateTime": {
+            "dateTime": utc_iso,
+            "timeZone": "UTC"
+        },
+        "endDateTime": {
+            "dateTime": (utc_dt + timedelta(minutes=30)).isoformat() + "Z",
+            "timeZone": "UTC"
+        },
+
+        "priceType": "free",
+        "price": 0.0,
+        "smsNotificationsEnabled": False,
+
+        # 🔸 至少填一個 staff
+        "staffMemberIds": [BOOKING_DEMO_STAFF_ID],
+
+        "maximumAttendeesCount": 1,
+        "filledAttendeesCount": 1,
+    }
+
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    resp = requests.post(url, headers=headers, json=payload)
+
+    app.logger.info(f"CREATE APPT STATUS: {resp.status_code}, BODY: {resp.text}")
+
+    resp.raise_for_status()
+
+    return resp.json()
+
+
+def build_slots_carousel(date_str: str, slots: list[str]) -> TemplateMessage:
+    """
+    將某一天的可預約時段變成 LINE CarouselTemplate。
+    slots 例如：["09:00", "09:30", "10:00", ...]
+    ✅ 修正版：每個 column 固定 3 個 actions，符合 LINE 要求。
+    """
+    columns = []
+    BUTTONS_PER_COLUMN = 3
+
+    for i in range(0, len(slots), BUTTONS_PER_COLUMN):
+        chunk = slots[i:i+BUTTONS_PER_COLUMN]
+
+        actions = []
+        for idx in range(BUTTONS_PER_COLUMN):
+            if idx < len(chunk):
+                # 真正有時段的按鈕
+                time_str = chunk[idx]
+                msg_text = f"我想預約 {date_str} {time_str}"
+                actions.append(
+                    MessageAction(
+                        label=time_str,
+                        text=msg_text,
+                    )
+                )
+            else:
+                # 用「空白按鈕」補滿，避免不同 column actions 數量不同
+                actions.append(
+                    MessageAction(
+                        label="　",  # 全形空白，看起來像空格
+                        text="請選擇上方有時間的按鈕",
+                    )
+                )
+
+        col_index = (i // BUTTONS_PER_COLUMN) + 1
+        columns.append(
+            CarouselColumn(
+                title=f"{date_str}（第 {col_index} 組）",
+                text="請選擇看診時段",
+                actions=actions,
+            )
+        )
+
+    return TemplateMessage(
+        alt_text=f"{date_str} 可預約時段",
+        template=CarouselTemplate(columns=columns),
+    )
+
+
+
 
 
 
@@ -94,6 +287,10 @@ CLINIC_LNG = 120.6500
 
 # 線上預約用的共用圖片
 WEEK_IMAGE_URL = "https://res.cloudinary.com/drbhr7kmb/image/upload/v1763314182/pulse_ultzw0.jpg"
+
+BOOKING_DEMO_SERVICE_ID = "172a2a02-a28b-453c-9704-1249633c87b7"
+BOOKING_DEMO_STAFF_ID = "cc6bf258-7441-40be-ab8c-78101d228870"
+
 
 
 # ========= Webhook 入口 =========
@@ -150,26 +347,24 @@ def handle_message(event: MessageEvent):
             return
 
         # === 測試：查某一天 Bookings 預約（指令範例：查 2025-01-15） ===
-        if text.startswith("查"):
+                # === 測試：查某一天 Bookings 預約（指令範例：查 2025-01-15） ===
+        if text.startswith("查 "):
             parts = text.split()
             if len(parts) >= 2:
                 date_str = parts[1]   # 第二個字串當日期
                 try:
                     appts = list_appointments_for_date(date_str)
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[TextMessage(text=f"{date_str} 有 {len(appts)} 筆預約")]
-                        )
-                    )
+                    reply_text = f"{date_str} 有 {len(appts)} 筆預約"
                 except Exception as e:
                     app.logger.error(f"查預約失敗: {e}")
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[TextMessage(text="查預約失敗，請看後端 log")]
-                        )
+                    reply_text = "查預約失敗，請看後端 log"
+
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
                     )
+                )
             else:
                 # 使用者只打了「查」沒帶日期
                 line_bot_api.reply_message(
@@ -180,9 +375,30 @@ def handle_message(event: MessageEvent):
                 )
             return
 
-        # ① 「線上約診」→ 本週 / 下週按鈕
-        if text == "線上約診":
-            ...
+        
+                # === 預約 YYYY-MM-DD → 顯示動態可預約時段 Carousel ===
+                # === 預約 YYYY-MM-DD → 顯示動態可預約時段 Carousel ===
+        elif text.startswith("預約 "):
+            # 範例：預約 2025-02-01
+            date_str = text.replace("預約", "").strip()
+
+            try:
+                available_slots = get_available_slots_for_date(date_str)
+                if not available_slots:
+                    reply_msg = TextMessage(text=f"{date_str} 當天目前沒有可預約時段喔～")
+                else:
+                    reply_msg = build_slots_carousel(date_str, available_slots)
+            except Exception as e:
+                app.logger.error(f"取得可預約時段失敗: {e}")
+                reply_msg = TextMessage(text="取得可預約時段時發生錯誤，請稍後再試 QQ")
+
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[reply_msg]
+                )
+            )
+            return
 
         
         # ① 「線上約診」→ 本週 / 下週按鈕
@@ -306,45 +522,42 @@ def handle_message(event: MessageEvent):
             )
 
         # ④ 使用者挑好門診（我想預約本週四 早診）
+        # ④ 使用者挑好門診 / 指定時段
+               # ④ 使用者挑好門診 / 指定時段（正式建立 Bookings 預約）
         elif text.startswith("我想預約"):
-            # 把「我想預約」後面的字抓出來，當作顯示文字
-            slot = text.replace("我想預約", "").strip()  # 例如「本週四 晚診」
+            # 預期格式：我想預約 YYYY-MM-DD HH:MM
+            payload = text.replace("我想預約", "").strip()
+            parts = payload.split()  # ["2025-11-21", "15:00"]
 
-            # ButtonsTemplate 的 text 只能放很短，詳細內容另外用 TextMessage 補充
-            buttons_template = ButtonsTemplate(
-                title="預約成功",
-                text="完成預約，請注意約診時間", 
-                actions=[
-                    MessageAction(
-                        label="查詢約診",
-                        text="查詢約診"
-                    ),
-                ],
-            )
+            if len(parts) == 2 and parts[0].count("-") == 2 and ":" in parts[1]:
+                date_str, time_str = parts
 
-            template_message = TemplateMessage(
-                alt_text="預約成功（DEMO）",
-                template=buttons_template
-            )
+                try:
+                    created = create_booking_appointment(date_str, time_str)
+                    appt_id = created.get("id", "（沒有取得 ID）")
 
-            # 詳細資訊用一般文字訊息，沒字數限制
-            detail_text = (
-                "預約成功\n"
-                f"門診時段：{slot}\n"
-                "就診人姓名：王小明\n"
-                "預約編號：A123456\n"
-                "\n（假資料）"
-            )
+                    reply_text = (
+                        "預約成功！🎉\n"
+                        f"📅 日期：{date_str}\n"
+                        f"🕒 時間：{time_str}\n"
+                        f"預約 ID：{appt_id}\n"
+                        "\n目前客戶資料為 DEMO 假資料。"
+                    )
+                except Exception as e:
+                    app.logger.error(f"建立 Bookings 預約失敗: {e}")
+                    reply_text = "建立預約失敗了，請稍後再試 QQ"
+            else:
+                # 格式不正確（防呆）
+                reply_text = "請用格式：我想預約 YYYY-MM-DD HH:MM 喔！"
 
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[
-                        template_message,
-                        TextMessage(text=detail_text)
-                    ]
+                    messages=[TextMessage(text=reply_text)]
                 )
             )
+            return
+
 
 
        # ⑤ 查詢約診 → 顯示一筆假資料 + 「確認回診」按鈕
@@ -497,4 +710,4 @@ def handle_message(event: MessageEvent):
 
 
 if __name__ == "__main__":
-    app.run(port=5678)
+    app.run(port=5001)
