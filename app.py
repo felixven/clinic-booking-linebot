@@ -33,6 +33,15 @@ configuration = Configuration( access_token="foYlKgBuLjIHB8ekKkfkYjVrjABqWg/ZaSv
 configuration.ssl_ca_cert = certifi.where() 
 handler = WebhookHandler("0a35ddd79939b228c5934101a4c979f8")
 
+# ======== 預約時段相關設定（之後要改時段只改這裡） ========
+SLOT_START = "09:00"             # 看診起始時間（含）
+SLOT_END = "21:00"               # 看診結束時間（含）
+SLOT_INTERVAL_MINUTES = 30       # 每一格 slot 間隔（目前半小時）
+APPOINTMENT_DURATION_MINUTES = 30  # 實際預約時長（要跟 Bookings duration 對齊）
+# 禮拜幾
+WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]
+
+
 # ======== 跟 Entra 拿 Microsoft Graph 的 access token ========
 def get_graph_token():
     tenant_id = os.environ.get("GRAPH_TENANT_ID")
@@ -140,18 +149,21 @@ def get_available_slots_for_date(date_str: str) -> list[str]:
         booked_times.add(hhmm)
 
     # 生成 09:00 ~ 21:00，每 30 分鐘
-    start = datetime.strptime("09:00", "%H:%M")
-    end = datetime.strptime("21:00", "%H:%M")
+        # 生成 SLOT_START ~ SLOT_END，每 SLOT_INTERVAL_MINUTES 分鐘一格
+    start = datetime.strptime(SLOT_START, "%H:%M")
+    end = datetime.strptime(SLOT_END, "%H:%M")
 
+    # 生成 SLOT_START ~ SLOT_END，每 SLOT_INTERVAL_MINUTES 分鐘一格
     slots: list[str] = []
     cur = start
     while cur <= end:
         hhmm = cur.strftime("%H:%M")
         if hhmm not in booked_times:
             slots.append(hhmm)
-        cur += timedelta(minutes=30)
+        cur += timedelta(minutes=SLOT_INTERVAL_MINUTES)
 
     return slots
+
 
 def create_booking_appointment(date_str: str, time_str: str):
     """
@@ -175,8 +187,9 @@ def create_booking_appointment(date_str: str, time_str: str):
     utc_dt = local_dt - timedelta(hours=8)
     utc_iso = utc_dt.isoformat() + "Z"       # "2025-11-21T07:00:00Z"
 
-    # Booking duration（你可先固定 30 分鐘）
-    duration = "PT30M"  
+    # Booking duration（跟 SLOT_INTERVAL/預約時長一致）
+    duration = f"PT{APPOINTMENT_DURATION_MINUTES}M"
+ 
 
     url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
 
@@ -196,7 +209,7 @@ def create_booking_appointment(date_str: str, time_str: str):
             "timeZone": "UTC"
         },
         "endDateTime": {
-            "dateTime": (utc_dt + timedelta(minutes=30)).isoformat() + "Z",
+            "dateTime": (utc_dt + timedelta(minutes=APPOINTMENT_DURATION_MINUTES)).isoformat() + "Z",
             "timeZone": "UTC"
         },
 
@@ -432,40 +445,66 @@ def handle_message(event: MessageEvent):
             )
 
         # ② 「我要預約本週」→ Carousel
+                # ② 「我要預約本週」→ 動態顯示本週剩餘可預約日期（不含週日）
         elif text == "我要預約本週":
-            columns = [
-                CarouselColumn(
-                    title="本週四（11/20）",
-                    text="可預約門診：早診 / 午診 / 晚診",
-                    actions=[
-                        MessageAction(label="早診 09:00-12:00", text="我想預約本週四 早診"),
-                        MessageAction(label="午診 14:00-17:00", text="我想預約本週四 午診"),
-                        MessageAction(label="晚診 18:00-21:00", text="我想預約本週四 晚診"),
-                    ],
-                ),
-                CarouselColumn(
-                    title="本週五（11/21）",
-                    text="可預約門診：早診 / 午診 / 晚診",
-                    actions=[
-                        MessageAction(label="早診 09:00-12:00", text="我想預約本週五 早診"),
-                        MessageAction(label="午診 14:00-17:00", text="我想預約本週五 午診"),
-                        MessageAction(label="晚診 18:00-21:00", text="我想預約本週五 晚診"),
-                    ],
-                ),
-                CarouselColumn(
-                    title="本週六（11/22）",
-                    text="可預約門診：早診 / 午診 / 晚診",
-                    actions=[
-                        MessageAction(label="早診 09:00-12:00", text="我想預約本週六 早診"),
-                        MessageAction(label="午診 14:00-17:00", text="我想預約本週六 午診"),
-                        MessageAction(label="晚診 18:00-21:00", text="我想預約本週六 晚診"),
-                    ],
-                ),
-            ]
+            today = datetime.now()
+            weekday = today.weekday()  # Monday=0 ... Sunday=6
+
+            # 本週一 = 今天 - weekday 天
+            monday = today - timedelta(days=weekday)
+            saturday = monday + timedelta(days=5)  # 本週六（不含週日）
+
+            # 本週要顯示的日期：從「明天」開始，到本週六為止
+            start_date = today + timedelta(days=1)
+
+            candidate_dates = []
+            cur = start_date
+            while cur.date() <= saturday.date():
+                # cur 本身一定是 Mon~Sat，所以不用另外排除 Sunday
+                candidate_dates.append(cur.date())
+                cur += timedelta(days=1)
+
+            columns = []
+
+            for d in candidate_dates:
+                date_str = d.isoformat()  # "YYYY-MM-DD"
+                # 查這一天還有沒有可預約 slot
+                available_slots = get_available_slots_for_date(date_str)
+                if not available_slots:
+                    # 當天已滿 / 沒開診 → 不顯示這張卡片
+                    continue
+
+                # 顯示名稱，例如：本週四（11/20）
+                mmdd = d.strftime("%m/%d")
+                weekday_label = WEEKDAY_ZH[d.weekday()]  # 0~6 → 一二三四五六日
+                title = f"本週{weekday_label}（{mmdd}）"
+
+                columns.append(
+                    CarouselColumn(
+                        title=title,
+                        text="點擊下方查看該日可預約時段。",
+                        actions=[
+                            MessageAction(
+                                label="查看這天時段",
+                                text=f"預約 {date_str}",  # 👉 丟給「預約 YYYY-MM-DD」分支
+                            ),
+                        ],
+                    )
+                )
+
+            if not columns:
+                # 本週沒有任何有空位的日期
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="本週目前沒有可預約的日期喔～")]
+                    )
+                )
+                return
 
             carousel_template = CarouselTemplate(columns=columns)
             template_message = TemplateMessage(
-                alt_text="本週可預約門診列表",
+                alt_text="本週可預約日期列表",
                 template=carousel_template
             )
 
@@ -475,42 +514,63 @@ def handle_message(event: MessageEvent):
                     messages=[template_message]
                 )
             )
+            return
 
-        # ③ 「我要預約下週」→ Carousel
+        
+        # ③ 「我要預約下週」→ 動態顯示下週一～下週六的可預約日期
         elif text == "我要預約下週":
-            columns = [
-                CarouselColumn(
-                    title="下週一（11/24）",
-                    text="可預約門診：早診 / 午診 / 晚診",
-                    actions=[
-                        MessageAction(label="早診 09:00-12:00", text="我想預約下週一 早診"),
-                        MessageAction(label="午診 14:00-17:00", text="我想預約下週一 午診"),
-                        MessageAction(label="晚診 18:00-21:00", text="我想預約下週一 晚診"),
-                    ],
-                ),
-                CarouselColumn(
-                    title="下週三（11/26）",
-                    text="可預約門診：早診 / 午診 / 晚診",
-                    actions=[
-                        MessageAction(label="早診 09:00-12:00", text="我想預約下週三 早診"),
-                        MessageAction(label="午診 14:00-17:00", text="我想預約下週三 午診"),
-                        MessageAction(label="晚診 18:00-21:00", text="我想預約下週三 晚診"),
-                    ],
-                ),
-                CarouselColumn(
-                    title="下週五（11/28）",
-                    text="可預約門診：早診 / 午診 / 晚診",
-                    actions=[
-                        MessageAction(label="早診 09:00-12:00", text="我想預約下週五 早診"),
-                        MessageAction(label="午診 14:00-17:00", text="我想預約下週五 午診"),
-                        MessageAction(label="晚診 18:00-21:00", text="我想預約下週五 晚診"),
-                    ],
-                ),
-            ]
+            today = datetime.now()
+            weekday = today.weekday()  # Monday=0 ... Sunday=6
+
+            # 本週一 + 7 天 = 下週一
+            monday = today - timedelta(days=weekday)
+            next_monday = monday + timedelta(days=7)
+            next_saturday = next_monday + timedelta(days=5)  # 下週六（不含週日）
+
+            candidate_dates = []
+            cur = next_monday
+            while cur.date() <= next_saturday.date():
+                candidate_dates.append(cur.date())
+                cur += timedelta(days=1)
+
+            columns = []
+
+            for d in candidate_dates:
+                date_str = d.isoformat()  # "YYYY-MM-DD"
+                available_slots = get_available_slots_for_date(date_str)
+                if not available_slots:
+                    continue
+
+                # 顯示名稱，例如：下週三（11/26）
+                mmdd = d.strftime("%m/%d")
+                weekday_label = WEEKDAY_ZH[d.weekday()]
+                title = f"下週{weekday_label}（{mmdd}）"
+
+                columns.append(
+                    CarouselColumn(
+                        title=title,
+                        text="點擊下方查看該日可預約時段。",
+                        actions=[
+                            MessageAction(
+                                label="查看這天時段",
+                                text=f"預約 {date_str}",  # 👉 丟給「預約 YYYY-MM-DD」分支
+                            ),
+                        ],
+                    )
+                )
+
+            if not columns:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="下週目前沒有可預約的日期喔～")]
+                    )
+                )
+                return
 
             carousel_template = CarouselTemplate(columns=columns)
             template_message = TemplateMessage(
-                alt_text="下週可預約門診列表",
+                alt_text="下週可預約日期列表",
                 template=carousel_template
             )
 
@@ -520,14 +580,68 @@ def handle_message(event: MessageEvent):
                     messages=[template_message]
                 )
             )
+            return
 
-        # ④ 使用者挑好門診（我想預約本週四 早診）
-        # ④ 使用者挑好門診 / 指定時段
-               # ④ 使用者挑好門診 / 指定時段（正式建立 Bookings 預約）
+
+        # ④ 使用者挑好時段（先顯示確認畫面，不立刻建立預約）
         elif text.startswith("我想預約"):
             # 預期格式：我想預約 YYYY-MM-DD HH:MM
             payload = text.replace("我想預約", "").strip()
-            parts = payload.split()  # ["2025-11-21", "15:00"]
+            parts = payload.split()  # 例如 ["2025-11-21", "15:00"]
+
+            if len(parts) == 2 and parts[0].count("-") == 2 and ":" in parts[1]:
+                date_str, time_str = parts
+
+                # 顯示用的日期格式（2025/11/21 15:00）
+                display_date = date_str.replace("-", "/")
+                display_text = f"您選擇的時段是：\n{display_date} {time_str}\n\n是否確認預約？"
+
+                # 確認／取消按鈕
+                buttons_template = ButtonsTemplate(
+                    title="預約確認",
+                    text=display_text,
+                    actions=[
+                        MessageAction(
+                            label="確認預約",
+                            text=f"確認預約 {date_str} {time_str}",
+                        ),
+                        MessageAction(
+                            label="取消",
+                            text="取消預約流程",
+                        ),
+                    ],
+                )
+
+                template_message = TemplateMessage(
+                    alt_text="預約確認",
+                    template=buttons_template
+                )
+
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[template_message]
+                    )
+                )
+                return
+
+            else:
+                # 格式不正確（防呆）
+                reply_text = "請用格式：我想預約 YYYY-MM-DD HH:MM 喔！"
+
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
+                )
+                return
+
+         # ⑤ 使用者按下「確認預約」→ 真正建立 Bookings 預約 + 顯示完成畫面
+        elif text.startswith("確認預約"):
+            # 預期格式：確認預約 YYYY-MM-DD HH:MM
+            payload = text.replace("確認預約", "").strip()
+            parts = payload.split()  # 例如 ["2025-11-21", "15:00"]
 
             if len(parts) == 2 and parts[0].count("-") == 2 and ":" in parts[1]:
                 date_str, time_str = parts
@@ -536,20 +650,50 @@ def handle_message(event: MessageEvent):
                     created = create_booking_appointment(date_str, time_str)
                     appt_id = created.get("id", "（沒有取得 ID）")
 
-                    reply_text = (
-                        "預約成功！🎉\n"
-                        f"📅 日期：{date_str}\n"
-                        f"🕒 時間：{time_str}\n"
-                        f"預約 ID：{appt_id}\n"
-                        "\n目前客戶資料為 DEMO 假資料。"
+                    display_date = date_str.replace("-", "/")
+
+                    # ✅ 完成預約的文字說明（之後這裡可以換成真的患者姓名）
+                    detail_text = (
+                        "已為您完成預約，請準時報到。\n"
+                        f"姓名：陳女士（DEMO）\n"
+                        f"時段：{display_date} {time_str}\n"
+                        f"預約 ID：{appt_id}"
                     )
+                    detail_message = TextMessage(text=detail_text)
+
+                    # ✅ Buttons：提供「位置導航」按鈕
+                    buttons_template = ButtonsTemplate(
+                        title="診所位置",
+                        text="如需導航，請點選下方按鈕查看地圖位置。",
+                        actions=[
+                            MessageAction(
+                                label="位置導航",
+                                text="查詢診所位置"
+                            ),
+                        ],
+                    )
+
+                    template_message = TemplateMessage(
+                        alt_text="診所位置導航",
+                        template=buttons_template
+                    )
+
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[detail_message, template_message]
+                        )
+                    )
+                    return
+
                 except Exception as e:
                     app.logger.error(f"建立 Bookings 預約失敗: {e}")
                     reply_text = "建立預約失敗了，請稍後再試 QQ"
-            else:
-                # 格式不正確（防呆）
-                reply_text = "請用格式：我想預約 YYYY-MM-DD HH:MM 喔！"
 
+            else:
+                reply_text = "請用格式：確認預約 YYYY-MM-DD HH:MM 喔！"
+
+            # 格式錯誤或建立失敗
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
@@ -557,7 +701,6 @@ def handle_message(event: MessageEvent):
                 )
             )
             return
-
 
 
        # ⑤ 查詢約診 → 顯示一筆假資料 + 「確認回診」按鈕
