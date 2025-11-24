@@ -9,29 +9,50 @@ from linebot.v3.messaging import (
     TextMessage,
     TemplateMessage,
     ButtonsTemplate,
+    MessageAction,
     CarouselTemplate,
     CarouselColumn,
     LocationMessage,
-    MessageAction,
+    PostbackAction,  # 🆕 新增：用來做不外露 ID 的按鈕
 )
+
 from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
+    PostbackEvent,
 )
 
 from datetime import datetime, timedelta
 
-import certifi 
-import os 
-import requests 
+import certifi
+import os
+import requests
+import base64
 
 
 app = Flask(__name__)
 
+# ======================================
+#  一、共用設定 & Helper 函數區
+# ======================================
+
 # ======== LINE 基本設定（記得換成你自己的） ========
-configuration = Configuration( access_token="foYlKgBuLjIHB8ekKkfkYjVrjABqWg/ZaSve6YjntmGiuO7PZGPtoE49pmLf6iaOji8jvR8E1tSdMBNZUKBdTEWu67T8EAop+PzLsjTwD5Gb+rULtbRaR2jcLjQ+Dpcnb+TuVAUwNRYU4Qwmy80KnwdB04t89/1O/w1cDnyilFU=" ) 
-configuration.ssl_ca_cert = certifi.where() 
+configuration = Configuration(
+access_token="foYlKgBuLjIHB8ekKkfkYjVrjABqWg/ZaSve6YjntmGiuO7PZGPtoE49pmLf6iaOji8jvR8E1tSdMBNZUKBdTEWu67T8EAop+PzLsjTwD5Gb+rULtbRaR2jcLjQ+Dpcnb+TuVAUwNRYU4Qwmy80KnwdB04t89/1O/w1cDnyilFU=")
+configuration.ssl_ca_cert = certifi.where()
+
+api_client = ApiClient(configuration)
+line_bot_api = MessagingApi(api_client)
+
 handler = WebhookHandler("0a35ddd79939b228c5934101a4c979f8")
+
+# ===================== Zendesk 設定 =====================
+ZENDESK_SUBDOMAIN = "con-nwdemo"  # 你的 Zendesk subdomain
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL") or "tech_support@newwave.tw"
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN") or "YXSw4TaiddeScmhBoAxm6hqDemaE1p2LoG4jL1FB"  # 之後記得改成環境變數
+
+
+# YXSw4TaiddeScmhBoAxm6hqDemaE1p2LoG4jL1FB
 
 # ======== 預約時段相關設定（之後要改時段只改這裡） ========
 SLOT_START = "09:00"             # 看診起始時間（第一個）
@@ -64,8 +85,14 @@ BOOKING_DEMO_STAFF_ID = "cc6bf258-7441-40be-ab8c-78101d228870"
 # serviceNotes 裡當「確認」的標記字串
 CONFIRM_NOTE_KEYWORD = "Confirmed via LINE"
 
+# 暫存「首次建檔」流程的狀態（key = line_user_id）
+PENDING_REGISTRATIONS = {}
 
 
+
+# ======================================
+#  二、業務流程（Business Flows）函數區
+# ======================================
 
 # ======== 跟 Entra 拿 Microsoft Graph 的 access token ========
 def get_graph_token():
@@ -74,7 +101,8 @@ def get_graph_token():
     client_secret = os.environ.get("GRAPH_CLIENT_SECRET")
 
     if not tenant_id or not client_id or not client_secret:
-        raise Exception("GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET 有缺，先到終端機 export")
+        raise Exception(
+            "GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET 有缺，先到終端機 export")
 
     url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     data = {
@@ -85,10 +113,101 @@ def get_graph_token():
     }
 
     resp = requests.post(url, data=data)
-    app.logger.info(f"GRAPH TOKEN STATUS: {resp.status_code}, BODY: {resp.text}")
+    app.logger.info(
+        f"GRAPH TOKEN STATUS: {resp.status_code}, BODY: {resp.text}")
 
     resp.raise_for_status()
     return resp.json()["access_token"]
+
+# ===================== Zendesk Helper：用 line_user_id 查使用者 =====================
+def search_zendesk_user_by_line_id(line_user_id: str):
+    """
+    給一個 LINE userId，
+    去 Zendesk 搜尋 user_fields.line_user_id = 這個值 的使用者。
+
+    回傳：
+        - count: 幾筆
+        - user: 若 count == 1，回傳那一個 dict，否則 None
+    """
+    if not line_user_id:
+        return 0, None
+
+    base_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
+    search_url = f"{base_url}/api/v2/search.json"
+
+    # Zendesk API 認證： email/token:API_TOKEN 做 Basic Auth
+    auth_str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
+    auth_bytes = auth_str.encode("utf-8")
+    auth_header = base64.b64encode(auth_bytes).decode("utf-8")
+
+    headers = {
+        "Authorization": f"Basic {auth_header}",
+        "Content-Type": "application/json",
+    }
+
+    # query 語法：type:user line_user_id:<xxx>
+    params = {
+        "query": f"type:user line_user_id:{line_user_id}"
+    }
+
+    try:
+        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.error(f"Zendesk 搜尋失敗: {e}")
+        return 0, None
+
+    data = resp.json()
+    count = data.get("count", 0)
+    results = data.get("results") or []
+
+    if count == 1 and results:
+        return 1, results[0]
+    else:
+        # 0 筆 或 >1 筆（理論上不會 >1）
+        return count, None
+
+def create_zendesk_user(line_user_id: str, name: str, phone: str):
+    """
+    用姓名 / 手機 / line_user_id 在 Zendesk 建立一個 end-user。
+    成功時回傳 user dict，失敗時回傳 None。
+    """
+    base_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
+    url = f"{base_url}/api/v2/users.json"
+
+    auth_str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
+    auth_bytes = auth_str.encode("utf-8")
+    auth_header = base64.b64encode(auth_bytes).decode("utf-8")
+
+    headers = {
+        "Authorization": f"Basic {auth_header}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "user": {
+            "name": name,
+            "phone": phone,
+            "role": "end-user",
+            "verified": True,
+            "user_fields": {
+                "line_user_id": line_user_id
+            }
+        }
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.error(f"建立 Zendesk 使用者失敗: {e}")
+        return None
+
+    data = resp.json()
+    user = data.get("user")
+    app.logger.info(f"已建立 Zendesk 使用者 id={user.get('id') if user else 'N/A'}")
+    return user
+
 
 
 def list_appointments_for_date(date_str):
@@ -109,7 +228,8 @@ def list_appointments_for_date(date_str):
     }
 
     resp = requests.get(url, headers=headers)
-    app.logger.info(f"APPOINTMENTS STATUS: {resp.status_code}, BODY: {resp.text}")
+    app.logger.info(
+        f"APPOINTMENTS STATUS: {resp.status_code}, BODY: {resp.text}")
 
     resp.raise_for_status()
 
@@ -118,7 +238,8 @@ def list_appointments_for_date(date_str):
     result = []
     for a in all_appts:
         start_info = a.get("startDateTime", {})
-        start_dt_str = start_info.get("dateTime")  # 例如 "2025-11-20T06:00:00.0000000Z"
+        # 例如 "2025-11-20T06:00:00.0000000Z"
+        start_dt_str = start_info.get("dateTime")
         if not start_dt_str:
             continue
 
@@ -130,7 +251,8 @@ def list_appointments_for_date(date_str):
             s = s.split(".")[0]
             utc_dt = datetime.fromisoformat(s)
         except Exception as e:
-            app.logger.error(f"解讀 startDateTime 失敗: {start_dt_str}, error: {e}")
+            app.logger.error(
+                f"解讀 startDateTime 失敗: {start_dt_str}, error: {e}")
             continue
 
         # 轉成台北時間（UTC+8）
@@ -141,6 +263,7 @@ def list_appointments_for_date(date_str):
             result.append(a)
 
     return result
+
 
 def get_next_upcoming_appointment_for_demo():
     """
@@ -162,7 +285,8 @@ def get_next_upcoming_appointment_for_demo():
     }
 
     resp = requests.get(url, headers=headers)
-    app.logger.info(f"APPOINTMENTS (for upcoming demo) STATUS: {resp.status_code}, BODY: {resp.text}")
+    app.logger.info(
+        f"APPOINTMENTS (for upcoming demo) STATUS: {resp.status_code}, BODY: {resp.text}")
     resp.raise_for_status()
 
     all_appts = resp.json().get("value", [])
@@ -197,6 +321,126 @@ def get_next_upcoming_appointment_for_demo():
 
     return best_appt, best_local_start
 
+def normalize_phone(phone: str) -> str:
+    """
+    將電話號碼轉成統一格式，用來比對：
+    - 只留數字
+    - 把 886 開頭的改成 0 開頭（例如 +8869xxxx → 09xxxx）
+    """
+    if not phone:
+        return ""
+
+    # 只留數字
+    digits = "".join(ch for ch in phone if ch.isdigit())
+
+    # 處理台灣號碼：+8869xxx or 8869xxx → 09xxx
+    if digits.startswith("8869"):
+        digits = "0" + digits[3:]  # 8869xxxxxxxx → 09xxxxxxxx
+
+    return digits
+
+# 查 31 天（含今天）的資料，30+1
+def get_next_upcoming_appointment_for_line_user(line_user_id: str, max_days: int = 30):
+    """
+    依照 LINE userId 找「未來最近一筆」屬於他的預約。
+
+    優化版：
+    - 從今天起往後最多 max_days 天
+    - 一旦在某一天找到屬於這個人的預約，就不再往後查（early break）
+    - 全程用「naive 台北時間」做比較，避免 tz 問題
+    """
+    try:
+        count, zd_user = search_zendesk_user_by_line_id(line_user_id)
+    except Exception as e:
+        app.logger.error(f"用 line_user_id 查 Zendesk user 失敗: {e}")
+        return None, None
+
+    if not zd_user:
+        app.logger.info(f"line_user_id={line_user_id} 在 Zendesk 中查無使用者")
+        return None, None
+
+    raw_phone = zd_user.get("phone") or ""
+    target_phone = normalize_phone(raw_phone)
+    if not target_phone:
+        app.logger.info(f"Zendesk user 沒有 phone，無法過濾 Bookings 預約")
+        return None, None
+
+    now_local = datetime.now()
+    matched: list[tuple[datetime, dict]] = []
+
+    for offset in range(max_days + 1):
+        d = now_local.date() + timedelta(days=offset)
+        date_str = d.isoformat()
+
+        app.logger.info(f"[get_next_for_line] 檢查日期: {date_str}")
+
+        try:
+            appts = list_appointments_for_date(date_str)
+        except Exception as e:
+            app.logger.error(f"list_appointments_for_date({date_str}) 失敗: {e}")
+            continue
+
+        app.logger.info(f"[get_next_for_line] {date_str} 共有 {len(appts)} 筆預約")
+
+        # 用來判斷這一天有沒有至少一筆符合條件
+        found_this_day = False
+
+        for appt in appts:
+            appt_phone = normalize_phone(appt.get("customerPhone") or "")
+            service_notes = appt.get("serviceNotes") or ""
+
+            matched_by_phone = (appt_phone and appt_phone == target_phone)
+            matched_by_line_id = (
+                line_user_id
+                and "[LINE_USER]" in service_notes
+                and line_user_id in service_notes
+            )
+
+            if not (matched_by_phone or matched_by_line_id):
+                continue
+
+            start_info = appt.get("startDateTime") or {}
+            start_str = start_info.get("dateTime")
+            if not start_str:
+                continue
+
+            try:
+                cleaned = start_str.replace("Z", "")
+                dt_utc = datetime.fromisoformat(cleaned)
+                if dt_utc.tzinfo is not None:
+                    dt_utc = dt_utc.replace(tzinfo=None)
+            except Exception:
+                app.logger.warning(f"無法解析 startDateTime: {start_str}")
+                continue
+
+            local_start = dt_utc + timedelta(hours=8)
+
+            if local_start < now_local:
+                continue
+
+            matched.append((local_start, appt))
+            found_this_day = True
+
+        # 如果這一天有找到屬於他的預約，代表這些都是「最近那一天」的預約 → 可以直接停
+        if found_this_day:
+            break
+
+    if not matched:
+        app.logger.info("[get_next_for_line] 找不到符合條件的預約")
+        return None, None
+
+    matched.sort(key=lambda x: x[0])
+    local_start, appt = matched[0]
+    app.logger.info(
+        f"[get_next_for_line] 命中預約 id={appt.get('id')} local_start={local_start}"
+    )
+    return appt, local_start
+
+
+
+
+
+
 def get_appointment_by_id(appt_id: str):
     """
     用 Bookings appointment id 取得單一預約資訊。
@@ -218,7 +462,8 @@ def get_appointment_by_id(appt_id: str):
     }
 
     resp = requests.get(url, headers=headers)
-    app.logger.info(f"GET APPOINTMENT {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
+    app.logger.info(
+        f"GET APPOINTMENT {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
 
     if resp.status_code == 404:
         # 已被刪除或不存在
@@ -261,7 +506,8 @@ def cancel_booking_appointment(appt_id: str):
     }
 
     resp = requests.delete(url, headers=headers)
-    app.logger.info(f"DELETE APPOINTMENT {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
+    app.logger.info(
+        f"DELETE APPOINTMENT {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
 
     # 204 No Content / 200 / 202
     if resp.status_code not in (200, 202, 204):
@@ -293,12 +539,9 @@ def update_booking_service_notes(appt_id: str, notes_text: str):
     }
 
     resp = requests.patch(url, headers=headers, json=payload)
-    app.logger.info(f"PATCH APPT SERVICE NOTES {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
+    app.logger.info(
+        f"PATCH APPT SERVICE NOTES {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
     resp.raise_for_status()
-
-
-
-
 
 
 def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
@@ -316,14 +559,13 @@ def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
         s = s.split(".")[0]
         utc_dt = datetime.fromisoformat(s)
     except Exception as e:
-        app.logger.error(f"解讀 Bookings dateTime 失敗: {start_dt_str}, error: {e}")
+        app.logger.error(
+            f"解讀 Bookings dateTime 失敗: {start_dt_str}, error: {e}")
         return None
 
     # 轉成台北時間（UTC+8）
     local_dt = utc_dt + timedelta(hours=8)
     return local_dt
-
-
 
 
 def get_available_slots_for_date(date_str: str) -> list[str]:
@@ -337,7 +579,8 @@ def get_available_slots_for_date(date_str: str) -> list[str]:
     booked_times = set()
     for appt in appts:
         start_info = appt.get("startDateTime", {})
-        start_dt_str = start_info.get("dateTime")  # "2025-11-20T06:00:00.0000000Z"
+        # "2025-11-20T06:00:00.0000000Z"
+        start_dt_str = start_info.get("dateTime")
         if not start_dt_str:
             continue
 
@@ -348,7 +591,8 @@ def get_available_slots_for_date(date_str: str) -> list[str]:
             s = s.split(".")[0]
             utc_dt = datetime.fromisoformat(s)
         except Exception as e:
-            app.logger.error(f"解讀 startDateTime 失敗（get_available_slots）：{start_dt_str}, error: {e}")
+            app.logger.error(
+                f"解讀 startDateTime 失敗（get_available_slots）：{start_dt_str}, error: {e}")
             continue
 
         local_dt = utc_dt + timedelta(hours=8)
@@ -372,11 +616,19 @@ def get_available_slots_for_date(date_str: str) -> list[str]:
     return slots
 
 
-def create_booking_appointment(date_str: str, time_str: str):
+def create_booking_appointment(
+    date_str: str,
+    time_str: str,
+    customer_name: str,
+    customer_phone: str,
+    line_display_name: str | None = None,
+    line_user_id: str | None = None,
+):
     """
-    用最簡化方式建立一筆 Bookings 預約。
-    - 只填必要欄位
-    - 目前客戶資料是假資料（之後想接 LINE user 資料再改）
+    建立一筆 Bookings 預約。
+    - 改用真實病患資料（Zendesk 的姓名＋手機）
+    - customerName：姓名 +（LINE 名稱）→ 例如：王凱文（Kevin）
+    - serviceNotes：第一行寫入 [LINE_USER] <line_user_id>，方便後續排程／查詢
     """
 
     token = get_graph_token()
@@ -385,65 +637,75 @@ def create_booking_appointment(date_str: str, time_str: str):
     if not business_id:
         raise Exception("缺 BOOKING_BUSINESS_ID")
 
-    # 合併日期與時間，轉成 ISO 格式
-    # 例如 date_str="2025-11-21", time_str="15:00"
-    local_str = f"{date_str} {time_str}:00"  # "2025-11-21 15:00:00"
+    # 合併日期與時間，轉成 ISO 格式（先當作台北時間）
+    local_str = f"{date_str} {time_str}:00"  # 例如 "2025-11-21 15:00:00"
     local_dt = datetime.strptime(local_str, "%Y-%m-%d %H:%M:%S")
 
-    # Bookings API 是吃 UTC → 所以要 -8 小時
+    # Bookings API 使用 UTC → 台北時間 - 8 小時
     utc_dt = local_dt - timedelta(hours=8)
-    utc_iso = utc_dt.isoformat() + "Z"       # "2025-11-21T07:00:00Z"
+    utc_iso = utc_dt.isoformat() + "Z"
 
-    # Booking duration（跟 SLOT_INTERVAL/預約時長一致）
+    # 預約時長（跟 SLOT_INTERVAL / APPOINTMENT_DURATION_MINUTES 一致）
     duration = f"PT{APPOINTMENT_DURATION_MINUTES}M"
- 
 
     url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
 
-    
-    
-    payload = {
-       "customerName": DEMO_CUSTOMER_NAME,
-        "customerEmailAddress": DEMO_CUSTOMER_EMAIL,
-        "customerPhone": DEMO_CUSTOMER_PHONE,
+    # ① 組合要寫進 Bookings 的姓名：姓名 +（LINE 名稱）
+    if line_display_name:
+        booking_customer_name = f"{customer_name}（{line_display_name}）"
+    else:
+        booking_customer_name = customer_name
 
-        # 🔸 這兩個用你現有的 service/staff
+    # ② 預先組好 serviceNotes
+    service_notes_lines = []
+    if line_user_id:
+        service_notes_lines.append(f"[LINE_USER] {line_user_id}")
+    # 之後如果還有其他系統備註，也可以 append 到這個 list
+
+    service_notes = "\n".join(service_notes_lines) if service_notes_lines else None
+
+    payload = {
+        "customerName": booking_customer_name,
+        "customerEmailAddress": None,          # 目前沒有 email，就先不填
+        "customerPhone": customer_phone,
+
         "serviceId": BOOKING_DEMO_SERVICE_ID,
-        "serviceName": "一般門診",              # 看要叫什麼？
+        "serviceName": "一般門診",
 
         "startDateTime": {
             "dateTime": utc_iso,
-            "timeZone": "UTC"
+            "timeZone": "UTC",
         },
         "endDateTime": {
             "dateTime": (utc_dt + timedelta(minutes=APPOINTMENT_DURATION_MINUTES)).isoformat() + "Z",
-            "timeZone": "UTC"
+            "timeZone": "UTC",
         },
 
         "priceType": "free",
         "price": 0.0,
         "smsNotificationsEnabled": False,
 
-        # 🔸 至少填一個 staff
         "staffMemberIds": [BOOKING_DEMO_STAFF_ID],
-
         "maximumAttendeesCount": 1,
         "filledAttendeesCount": 1,
     }
 
+    # 只有在有內容時才塞 serviceNotes，避免送 null
+    if service_notes:
+        payload["serviceNotes"] = service_notes
 
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     resp = requests.post(url, headers=headers, json=payload)
-
     app.logger.info(f"CREATE APPT STATUS: {resp.status_code}, BODY: {resp.text}")
 
     resp.raise_for_status()
-
     return resp.json()
+
+
 
 def get_days_until(local_dt: datetime) -> int:
     """
@@ -453,7 +715,6 @@ def get_days_until(local_dt: datetime) -> int:
     today = datetime.now().date()
     appt_date = local_dt.date()
     return (appt_date - today).days
-
 
 
 def build_slots_carousel(date_str: str, slots: list[str]) -> TemplateMessage:
@@ -504,7 +765,944 @@ def build_slots_carousel(date_str: str, slots: list[str]) -> TemplateMessage:
         template=CarouselTemplate(columns=columns),
     )
 
+#third version
+def flow_query_next_appointment(event, text: str):
+    """
+    約診查詢 Flow：
+    ✅ 已改：改用 line_user_id + Zendesk phone 過濾 Bookings，
+        只查「這位 LINE 使用者」的未來最近一筆預約。
+    """
+    # 先拿 LINE userId
+    line_user_id = None
+    if event.source and hasattr(event.source, "user_id"):
+        line_user_id = event.source.user_id
 
+    try:
+        if line_user_id:
+            # 🆕 新版：用 LINE user 找自己的預約
+            appt, local_start = get_next_upcoming_appointment_for_line_user(line_user_id)
+        else:
+            # 萬一拿不到 line_user_id（理論上不會發生），就當沒預約
+            appt, local_start = (None, None)
+
+    except Exception as e:
+        app.logger.error(f"查詢約診失敗: {e}")
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="約診查詢失敗，請稍後再試")]
+            )
+        )
+        return
+
+    # ① 沒有任何屬於他的 future 預約 → 引導去線上約診
+    if not appt or not local_start:
+        buttons_template = ButtonsTemplate(
+            title="目前沒有約診紀錄",
+            text="若需預約看診，請點擊「線上預約」。",
+            actions=[
+                MessageAction(
+                    label="線上約診",
+                    text="線上約診"
+                ),
+            ],
+        )
+
+        template_message = TemplateMessage(
+            alt_text="沒有約診紀錄",
+            template=buttons_template
+        )
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[template_message]
+            )
+        )
+        return
+
+    # ② 有 future 預約 → 先算天數，再看有沒有已確認
+    days_left = get_days_until(local_start)
+
+    display_date = local_start.strftime("%Y/%m/%d")
+    display_time = local_start.strftime("%H:%M")
+
+    customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
+    appt_id = appt.get("id", "")
+
+    # 詳細資訊放在 TextMessage（不限 60 字）
+    base_text = (
+        f"姓名：{customer_name}\n"
+        f"看診時間：{display_date} {display_time}\n"
+    )
+
+    # ②-0 若已在 LINE 確認過 → 直接顯示「已確認」版本
+    service_notes = appt.get("serviceNotes") or ""
+    if CONFIRM_NOTE_KEYWORD in service_notes:
+        detail_text = (
+            "您已完成回診確認\n"
+            f"姓名：{customer_name}\n"
+            f"看診時間：{display_date} {display_time}\n"
+            "\n如需導航，可點選下方「查詢診所位置」。"
+        )
+        detail_message = TextMessage(text=detail_text)
+
+        buttons_template = ButtonsTemplate(
+            title="已確認回診門診",
+            text="如需導航請點下方按鈕。",
+            actions=[
+                MessageAction(
+                    label="查詢診所位置",
+                    text="查詢診所位置"
+                ),
+            ],
+        )
+
+        template_message = TemplateMessage(
+            alt_text="已確認回診",
+            template=buttons_template
+        )
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[detail_message, template_message]
+            )
+        )
+        return
+
+    # ②-1 距離看診 >= 3 天 → 可取消
+    if days_left >= 3:
+        detail_text = (
+            base_text +
+            f"\n目前距離看診還有 {days_left} 天，"
+            "如需變更請先取消本次預約。"
+        )
+        detail_message = TextMessage(text=detail_text)
+
+        buttons_template = ButtonsTemplate(
+            title="可取消的門診預約",
+            text="是否取消預約？",
+            actions=[
+                PostbackAction(
+                    label="取消約診",
+                    data=f"CANCEL_APPT:{appt_id}",
+                    display_text="取消約診",
+                ),
+            ],
+        )
+
+        template_message = TemplateMessage(
+            alt_text="可取消的門診預約",
+            template=buttons_template
+        )
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[detail_message, template_message]
+            )
+        )
+        return
+
+    # ②-2 距離看診 < 3 天 → 不能取消，只能確認
+    else:
+        detail_text = (
+            base_text +
+            "\n目前距離看診已少於三天，無法透過 LINE 取消預約。\n"
+            "如果您會準時前來，請先完成回診確認。"
+        )
+        detail_message = TextMessage(text=detail_text)
+
+        buttons_template = ButtonsTemplate(
+            title="即將到診的門診",
+            text="是否確認回診？",
+            actions=[
+                PostbackAction(
+                    label="確認回診",
+                    data=f"CONFIRM_APPT:{appt_id}",
+                    display_text="確認回診",
+                ),
+            ],
+        )
+
+        template_message = TemplateMessage(
+            alt_text="即將到診的門診",
+            template=buttons_template
+        )
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[detail_message, template_message]
+            )
+        )
+        return
+
+
+# second version
+# def flow_query_next_appointment(event, text: str):
+#     """
+#     約診查詢 Flow：原本寫在 handle_message 裡面 text == '約診查詢' 的那一整坨。
+#     （已改：取消約診 / 確認回診 按鈕改用 PostbackAction，不再外露 Booking ID）
+#     """
+#     try:
+#         appt, local_start = get_next_upcoming_appointment_for_demo()
+#     except Exception as e:
+#         app.logger.error(f"查詢約診失敗: {e}")
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[TextMessage(text="約診查詢失敗，請稍後再試")]
+#             )
+#         )
+#         return
+
+#     # ① 沒有任何 future 預約 → 引導去線上約診
+#     if not appt or not local_start:
+#         buttons_template = ButtonsTemplate(
+#             title="目前沒有約診紀錄",
+#             text="若需預約看診，請點擊「線上預約」。",
+#             actions=[
+#                 MessageAction(
+#                     label="線上約診",
+#                     text="線上約診"
+#                 ),
+#             ],
+#         )
+
+#         template_message = TemplateMessage(
+#             alt_text="沒有約診紀錄",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[template_message]
+#             )
+#         )
+#         return
+
+#     # ② 有 future 預約 → 先算天數，再看有沒有已確認
+#     days_left = get_days_until(local_start)
+
+#     display_date = local_start.strftime("%Y/%m/%d")
+#     display_time = local_start.strftime("%H:%M")
+
+#     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
+#     appt_id = appt.get("id", "")
+
+#     # 詳細資訊放在 TextMessage（不限 60 字）
+#     base_text = (
+#         f"姓名：{customer_name}\n"
+#         f"看診時間：{display_date} {display_time}\n"
+#     )
+
+#     # ②-0 若已在 LINE 確認過 → 直接顯示「已確認」版本
+#     service_notes = appt.get("serviceNotes") or ""
+#     if CONFIRM_NOTE_KEYWORD in service_notes:
+#         detail_text = (
+#             "您已完成回診確認\n"
+#             f"姓名：{customer_name}\n"
+#             f"看診時間：{display_date} {display_time}\n"
+#             "\n如需導航，可點選下方「查詢診所位置」。"
+#         )
+#         detail_message = TextMessage(text=detail_text)
+
+#         buttons_template = ButtonsTemplate(
+#             title="已確認回診門診",
+#             text="如需導航請點下方按鈕。",
+#             actions=[
+#                 MessageAction(
+#                     label="查詢診所位置",
+#                     text="查詢診所位置"
+#                 ),
+#             ],
+#         )
+
+#         template_message = TemplateMessage(
+#             alt_text="已確認回診",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[detail_message, template_message]
+#             )
+#         )
+#         return
+
+#     # ②-1 距離看診 >= 3 天 → 可取消
+#     if days_left >= 3:
+#         detail_text = (
+#             base_text +
+#             f"\n目前距離看診還有 {days_left} 天，"
+#             "如需變更請先取消本次預約。"
+#         )
+#         detail_message = TextMessage(text=detail_text)
+
+#         # 🔁 這裡原本是 MessageAction + text=f"取消約診 {appt_id}"
+#         #    改成 PostbackAction，把 ID 藏在 data 裡
+#         buttons_template = ButtonsTemplate(
+#             title="可取消的門診預約",
+#             text="是否取消預約？",
+#             actions=[
+#                 PostbackAction(
+#                     label="取消約診",
+#                     data=f"CANCEL_APPT:{appt_id}",
+#                     display_text="取消約診",
+#                 ),
+#             ],
+#         )
+
+#         template_message = TemplateMessage(
+#             alt_text="可取消的門診預約",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[detail_message, template_message]
+#             )
+#         )
+#         return
+
+#     # ②-2 距離看診 < 3 天 → 不能取消，只能確認
+#     else:
+#         detail_text = (
+#             base_text +
+#             "\n目前距離看診已少於三天，無法透過 LINE 取消預約。\n"
+#             "如果您會準時前來，請先完成回診確認。"
+#         )
+#         detail_message = TextMessage(text=detail_text)
+
+#         # 🔁 這裡原本是 MessageAction + text=f"確認回診 {appt_id}"
+#         #    一樣改成 PostbackAction
+#         buttons_template = ButtonsTemplate(
+#             title="即將到診的門診",
+#             text="是否確認回診？",
+#             actions=[
+#                 PostbackAction(
+#                     label="確認回診",
+#                     data=f"CONFIRM_APPT:{appt_id}",
+#                     display_text="確認回診",
+#                 ),
+#             ],
+#         )
+
+#         template_message = TemplateMessage(
+#             alt_text="即將到診的門診",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[detail_message, template_message]
+#             )
+#         )
+#         return
+
+# first version
+# def flow_query_next_appointment(event, text: str):
+#     """
+#     約診查詢 Flow：原本寫在 handle_message 裡面 text == '約診查詢' 的那一整坨。
+#     """
+#     try:
+#         appt, local_start = get_next_upcoming_appointment_for_demo()
+#     except Exception as e:
+#         app.logger.error(f"查詢約診失敗: {e}")
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[TextMessage(text="約診查詢失敗，請稍後再試")]
+#             )
+#         )
+#         return
+
+#     # ① 沒有任何 future 預約 → 引導去線上約診
+#     if not appt or not local_start:
+#         buttons_template = ButtonsTemplate(
+#             title="目前沒有約診紀錄",
+#             text="若需預約看診，請點擊「線上預約」。",
+#             actions=[
+#                 MessageAction(
+#                     label="線上約診",
+#                     text="線上約診"
+#                 ),
+#             ],
+#         )
+
+#         template_message = TemplateMessage(
+#             alt_text="沒有約診紀錄",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[template_message]
+#             )
+#         )
+#         return
+
+#     # ② 有 future 預約 → 先算天數，再看有沒有已確認
+#     days_left = get_days_until(local_start)
+
+#     display_date = local_start.strftime("%Y/%m/%d")
+#     display_time = local_start.strftime("%H:%M")
+
+#     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
+#     appt_id = appt.get("id", "")
+
+#     # 詳細資訊放在 TextMessage（不限 60 字）
+#     base_text = (
+#         f"姓名：{customer_name}\n"
+#         f"看診時間：{display_date} {display_time}\n"
+#     )
+
+#     # ②-0 若已在 LINE 確認過 → 直接顯示「已確認」版本
+#     service_notes = appt.get("serviceNotes") or ""
+#     if CONFIRM_NOTE_KEYWORD in service_notes:
+#         detail_text = (
+#             "您已完成回診確認\n"
+#             f"姓名：{customer_name}\n"
+#             f"看診時間：{display_date} {display_time}\n"
+#             "\n如需導航，可點選下方「查詢診所位置」。"
+#         )
+#         detail_message = TextMessage(text=detail_text)
+
+#         buttons_template = ButtonsTemplate(
+#             title="已確認回診門診",
+#             text="如需導航請點下方按鈕。",
+#             actions=[
+#                 MessageAction(
+#                     label="查詢診所位置",
+#                     text="查詢診所位置"
+#                 ),
+#             ],
+#         )
+
+#         template_message = TemplateMessage(
+#             alt_text="已確認回診",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[detail_message, template_message]
+#             )
+#         )
+#         return
+
+#     # ②-1 距離看診 >= 3 天 → 可取消
+#     if days_left >= 3:
+#         detail_text = (
+#             base_text +
+#             f"\n目前距離看診還有 {days_left} 天，"
+#             "如需變更請先取消本次預約。"
+#         )
+#         detail_message = TextMessage(text=detail_text)
+
+#         buttons_template = ButtonsTemplate(
+#             title="可取消的門診預約",
+#             text="是否取消預約？",
+#             actions=[
+#                 PostbackAction(
+#                     label="取消約診",
+#                     data=f"CANCEL_APPT:{appt_id}",   # 🆕 ID 藏在 data 裡
+#                 ),
+#             ],
+#         )
+#     # if days_left >= 3:
+#     #     detail_text = (
+#     #         base_text +
+#     #         f"\n目前距離看診還有 {days_left} 天，"
+#     #         "如需變更請先取消本次預約。"
+#     #     )
+#     #     detail_message = TextMessage(text=detail_text)
+
+#     #     buttons_template = ButtonsTemplate(
+#     #         title="可取消的門診預約",
+#     #         text="是否取消預約？",
+#     #         actions=[
+#     #             MessageAction(
+#     #                 label="取消約診",
+#     #                 text=f"取消約診 {appt_id}",   # 之後進入取消流程
+#     #             ),
+#     #         ],
+#     #     )
+
+#         template_message = TemplateMessage(
+#             alt_text="可取消的門診預約",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[detail_message, template_message]
+#             )
+#         )
+#         return
+
+#     # ②-2 距離看診 < 3 天 → 不能取消，只能確認
+#     else:
+#         detail_text = (
+#             base_text +
+#             "\n目前距離看診已少於三天，無法透過 LINE 取消預約。\n"
+#             "如果您會準時前來，請先完成回診確認。"
+#         )
+#         detail_message = TextMessage(text=detail_text)
+
+#         buttons_template = ButtonsTemplate(
+#             title="即將到診的門診",
+#             text="是否確認回診？",
+#             actions=[
+#                 PostbackAction(
+#                     label="確認回診",
+#                     data=f"CONFIRM_APPT:{appt_id}",   # 🆕 ID 藏在 data 裡
+#                 ),
+#             ],
+#         )
+
+#     # else:
+#     #     detail_text = (
+#     #         base_text +
+#     #         "\n目前距離看診已少於三天，無法透過 LINE 取消預約。\n"
+#     #         "如果您會準時前來，請先完成回診確認。"
+#     #     )
+#     #     detail_message = TextMessage(text=detail_text)
+
+#     #     buttons_template = ButtonsTemplate(
+#     #         title="即將到診的門診",
+#     #         text="是否確認回診？",
+#     #         actions=[
+#     #             MessageAction(
+#     #                 label="確認回診",
+#     #                 text=f"確認回診 {appt_id}",   # 之後進入確認流程
+#     #             ),
+#     #         ],
+#     #     )
+
+#         template_message = TemplateMessage(
+#             alt_text="即將到診的門診",
+#             template=buttons_template
+#         )
+
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[detail_message, template_message]
+#             )
+#         )
+#         return
+
+def flow_cancel_request(event, text: str):
+    """
+    Flow：處理「取消約診 {id}」
+    - 優先用傳進來的 appt_id
+    - 如果沒有帶 id，就用目前這個 LINE 使用者的預約來當目標（不再用 demo 全診所那種）
+    """
+    parts = text.split()
+    appt_id = parts[1] if len(parts) >= 2 else ""
+
+    # 先拿 LINE userId（用於沒帶 id 的 fallback）
+    line_user_id = None
+    if event.source and hasattr(event.source, "user_id"):
+        line_user_id = event.source.user_id
+
+    # ① 沒帶 id → 用這個 LINE 使用者自己的最近一筆 future 預約
+    if not appt_id:
+        if not line_user_id:
+            # 理論上不會發生，但防呆一下
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="暫時無法取得您的身分，請稍後再試或重新點選「約診查詢」。")]
+                )
+            )
+            return
+
+        appt, local_start = get_next_upcoming_appointment_for_line_user(line_user_id)
+
+    # ② 有帶 id → 直接依 id 查那一筆
+    else:
+        appt, local_start = get_appointment_by_id(appt_id)
+
+    # ③ 找不到可取消的約診
+    if not appt or not local_start:
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="找不到可取消的約診，請先使用「約診查詢」。")]
+            )
+        )
+        return
+
+    # ④ 判斷距離看診日
+    days_left = get_days_until(local_start)
+    if days_left < 3:
+        msg = (
+            "距離看診日已少於三天，無法透過 LINE 取消約診。\n"
+            "如有特殊狀況請致電診所。"
+        )
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg)]
+            )
+        )
+        return
+
+    # ⑤ 組畫面
+    display_date = local_start.strftime("%Y/%m/%d")
+    display_time = local_start.strftime("%H:%M")
+    customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
+    appt_id = appt.get("id", "")
+
+    detail_text = (
+        "您即將取消以下約診：\n"
+        f"姓名：{customer_name}\n"
+        f"看診時間：{display_date} {display_time}\n\n"
+        "確定要取消嗎？"
+    )
+
+    buttons_template = ButtonsTemplate(
+        title="確認取消約診",
+        text="請選擇是否取消本次約診。",
+        actions=[
+            # 這裡我們已經改成 PostbackAction 了，如果你還沒改可以先保留舊版
+            PostbackAction(
+                label="確認取消",
+                data=f"CANCEL_CONFIRM:{appt_id}",
+                display_text="確認取消",
+            ),
+            PostbackAction(
+                label="保留約診",
+                data="CANCEL_KEEP",
+                display_text="保留約診",
+            ),
+        ],
+    )
+
+    line_bot_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[
+                TextMessage(text=detail_text),
+                TemplateMessage(alt_text="確認取消約診", template=buttons_template),
+            ]
+        )
+    )
+    return
+
+
+# first version
+# def flow_cancel_request(event, text: str):
+#     """
+#     Flow：處理「取消約診 {id}」
+#     原本寫在 handle_message 裡 elif text.startswith("取消約診") 的那一段。
+#     （已改：第二階段的「確認取消」改用 PostbackAction，不再外露 Booking ID）
+#     """
+#     parts = text.split()
+#     appt_id = parts[1] if len(parts) >= 2 else ""
+
+#     # 如果沒有帶 id，就抓最近一筆 future 預約
+#     if not appt_id:
+#         appt, local_start = get_next_upcoming_appointment_for_line_user()
+#     else:
+#         appt, local_start = get_appointment_by_id(appt_id)
+
+#     if not appt or not local_start:
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[TextMessage(text="找不到可取消的約診，請先使用「查詢約診」。")]
+#             )
+#         )
+#         return
+
+#     days_left = get_days_until(local_start)
+#     if days_left < 3:
+#         msg = (
+#             "距離看診日已少於三天，無法透過 LINE 取消約診。\n"
+#             "如有特殊狀況請致電診所。"
+#         )
+#         line_bot_api.reply_message(
+#             ReplyMessageRequest(
+#                 reply_token=event.reply_token,
+#                 messages=[TextMessage(text=msg)]
+#             )
+#         )
+#         return
+
+#     display_date = local_start.strftime("%Y/%m/%d")
+#     display_time = local_start.strftime("%H:%M")
+#     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
+#     appt_id = appt.get("id", "")
+
+#     detail_text = (
+#         "您即將取消以下約診：\n"
+#         f"姓名：{customer_name}\n"
+#         f"看診時間：{display_date} {display_time}\n\n"
+#         "確定要取消嗎？"
+#     )
+
+#     # 🆕 這裡把原本的 MessageAction(label="確認取消", text=f"確認取消 {appt_id}")
+#     #     改成 PostbackAction，把 ID 藏在 data 裡
+#     buttons_template = ButtonsTemplate(
+#         title="確認取消約診",
+#         text="請選擇是否取消本次約診。",
+#         actions=[
+#             PostbackAction(
+#                 label="確認取消",
+#                 data=f"CONFIRM_CANCEL:{appt_id}",   # ID 不再出現在聊天室
+#                 display_text="確認取消",
+#             ),
+#             # 這顆不用帶 ID，用文字訊息就好
+#             MessageAction(
+#                 label="保留約診",
+#                 text="約診查詢",
+#             ),
+#         ],
+#     )
+
+#     line_bot_api.reply_message(
+#         ReplyMessageRequest(
+#             reply_token=event.reply_token,
+#             messages=[
+#                 TextMessage(text=detail_text),
+#                 TemplateMessage(alt_text="確認取消約診", template=buttons_template),
+#             ]
+#         )
+#     )
+#     return
+
+
+
+
+def flow_confirm_cancel(event, text: str):
+    """
+    Flow：處理「確認取消 {id}」
+    原本寫在 handle_message 裡 elif text.startswith("確認取消") 的那一段。
+    """
+    parts = text.split()
+    appt_id = parts[1] if len(parts) >= 2 else ""
+
+    if not appt_id:
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="要取消的資訊不完整，請重新查詢約診。")]
+            )
+        )
+        return
+
+    # 再查一次這筆約診（避免早就被改時間或取消）
+    appt, local_start = get_appointment_by_id(appt_id)
+    if not appt or not local_start:
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="找不到這筆約診，請重新查詢。")]
+            )
+        )
+        return
+
+    days_left = get_days_until(local_start)
+    if days_left < 3:
+        msg = (
+            "距離看診日已少於三天，無法透過 LINE 取消約診。\n"
+            "如有特殊狀況請電話聯繫診所。"
+        )
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg)]
+            )
+        )
+        return
+
+    # 真的取消（DELETE Bookings appointment）
+    try:
+        cancel_booking_appointment(appt_id)
+    except Exception as e:
+        app.logger.error(f"取消預約失敗: {e}")
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="取消時發生錯誤，請稍後再試")]
+            )
+        )
+        return
+
+    display_date = local_start.strftime("%Y/%m/%d")
+    display_time = local_start.strftime("%H:%M")
+    customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
+
+    msg = (
+        "已為您取消以下約診：\n"
+        f"姓名：{customer_name}\n"
+        f"時間：{display_date} {display_time}"
+    )
+
+    buttons_template = ButtonsTemplate(
+        title="需要重新約診嗎？",
+        text="如需重新預約請點選「線上約診」。",
+        actions=[
+            MessageAction(label="線上約診", text="線上約診"),
+        ],
+    )
+
+    line_bot_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[
+                TextMessage(text=msg),
+                TemplateMessage(alt_text="約診已取消", template=buttons_template),
+            ]
+        )
+    )
+    return
+
+
+
+def flow_confirm_visit(event, text: str):
+    """
+    Flow：處理「確認回診 {id}」
+    規則：
+    - 只允許看診日前 < 3 天確認
+    - serviceNotes 已含 CONFIRM_NOTE_KEYWORD → 不再 PATCH，只回「已確認」
+    - 第一次確認時，寫入一行 `Confirmed via LINE on ...`
+    """
+    parts = text.split(maxsplit=1)
+    appt_id = parts[1].strip() if len(parts) >= 2 else ""
+
+    # 沒帶 id → DEMO：抓最近一筆 future 預約
+    if not appt_id:
+        appt, local_start = get_next_upcoming_appointment_for_line_user()
+    else:
+        appt, local_start = get_appointment_by_id(appt_id)
+
+    if not appt or not local_start:
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="找不到需要確認的約診，請先使用「約診查詢」確認預約狀態。")]
+            )
+        )
+        return
+
+    days_left = get_days_until(local_start)
+    display_date = local_start.strftime("%Y/%m/%d")
+    display_time = local_start.strftime("%H:%M")
+    customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
+    appt_id = appt.get("id", "")
+
+    # ① 太早確認（≥ 3 天） → 擋掉
+    if days_left >= 3:
+        msg = (
+            "目前距離看診日仍大於三天，暫不開放線上確認回診。\n"
+            "可於看診前三天內再透過 LINE 進行確認。"
+        )
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg)]
+            )
+        )
+        return
+
+    # ② 看這筆約診是不是已經 Confirm 過
+    service_notes = appt.get("serviceNotes") or ""
+    already_confirmed = (CONFIRM_NOTE_KEYWORD in service_notes)
+
+    # 已確認 → 不再 PATCH，只回提示＋位置按鈕
+    if already_confirmed:
+        detail_text = (
+            "您已完成回診確認\n"
+            f"姓名：{customer_name}\n"
+            f"看診時間：{display_date} {display_time}\n"
+            "\n如需導航，可點選下方「查詢診所位置」。"
+        )
+        detail_message = TextMessage(text=detail_text)
+
+        buttons_template = ButtonsTemplate(
+            title="回診資訊確認",
+            text="預約已確認，如需導航請點選下方。",
+            actions=[
+                MessageAction(
+                    label="查詢診所位置",
+                    text="查詢診所位置"
+                ),
+            ],
+        )
+
+        template_message = TemplateMessage(
+            alt_text="已確認回診資訊",
+            template=buttons_template
+        )
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[detail_message, template_message]
+            )
+        )
+        return  # ⬅ 一定要 return，避免下面再 PATCH
+
+    # ③ 尚未確認 → 這裡才會真的 PATCH，一次寫入 Confirmed via LINE
+    now_local = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    new_line = f"{CONFIRM_NOTE_KEYWORD} on {now_local} (UTC+8)"
+
+    if service_notes:
+        merged_notes = service_notes + "\n" + new_line
+    else:
+        merged_notes = new_line
+
+    try:
+        update_booking_service_notes(appt_id, merged_notes)
+    except Exception as e:
+        app.logger.error(f"更新 Bookings 備註失敗: {e}")
+        # 寫備註失敗不影響使用者體驗，只記 log
+
+    # ====== 回 LINE 提醒文字＋位置導航按鈕 ======
+    detail_text = (
+        "回診提醒：\n"
+        f"姓名：{customer_name}\n"
+        f"看診時間：{display_date} {display_time}\n"
+        "\n請於門診開始前 10 分鐘至診所報到。"
+    )
+    detail_message = TextMessage(text=detail_text)
+
+    buttons_template = ButtonsTemplate(
+        title="回診資訊已確認",
+        text="如需導航至診所，請點選下方按鈕。",
+        actions=[
+            MessageAction(
+                label="查詢診所位置",
+                text="查詢診所位置",
+            ),
+        ],
+    )
+
+    template_message = TemplateMessage(
+        alt_text="回診資訊確認",
+        template=buttons_template
+    )
+
+    line_bot_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[detail_message, template_message]
+        )
+    )
+    return
 
 # ========= Webhook 入口 =========
 
@@ -526,371 +1724,66 @@ def callback():
 
     return "OK"
 
-
-# ========= 訊息處理 =========
-
+# ======================================
+#  LINE Event Handlers 區/訊息處理
+# ======================================
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
     text = event.message.text.strip()
     app.logger.info(f"收到使用者訊息: {text}")
 
-    # 參考的範例：在 handler 裡面用 ApiClient
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
+    # === 0. 檢查是否處於首次建檔流程 ===
+    line_user_id_for_state = None
+    if event.source and hasattr(event.source, "user_id"):
+        line_user_id_for_state = event.source.user_id
 
-        # === 測試：從這支後端跟 Entra 拿 Graph token ===
-        if text == "測試token":
-            try:
-                token = get_graph_token()
-                app.logger.info(f"GRAPH ACCESS TOKEN (HEAD): {token[:30]}...")
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="成功取得 Graph token")]
-                    )
-                )
-            except Exception as e:
-                app.logger.error(f"Graph token 申請失敗: {e}")
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="Graph token 申請失敗，後端資訊：")]
-                    )
-                )
-            return
-
-        # === 測試：查某一天 Bookings 預約（指令範例：查 2025-01-15） ===
-                # === 測試：查某一天 Bookings 預約（指令範例：查 2025-01-15） ===
-        if text.startswith("查 "):
-            parts = text.split()
-            if len(parts) >= 2:
-                date_str = parts[1]   # 第二個字串當日期
-                try:
-                    appts = list_appointments_for_date(date_str)
-                    reply_text = f"{date_str} 有 {len(appts)} 筆預約"
-                except Exception as e:
-                    app.logger.error(f"查預約失敗: {e}")
-                    reply_text = "查預約失敗，後端資訊："
-
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=reply_text)]
-                    )
-                )
-            else:
-                # 只打了「查」沒帶日期
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="請輸入：查 YYYY-MM-DD，例：查 2025-01-15")]
-                    )
-                )
-            return
-
-        # === 預約 YYYY-MM-DD → 顯示動態可預約時段 Carousel ===
-        elif text.startswith("預約 "):
-            # 範例：預約 2025-02-01
-            date_str = text.replace("預約", "").strip()
-
-            try:
-                available_slots = get_available_slots_for_date(date_str)
-                if not available_slots:
-                    reply_msg = TextMessage(text=f"{date_str} 沒有可預約時段")
-                else:
-                    reply_msg = build_slots_carousel(date_str, available_slots)
-            except Exception as e:
-                app.logger.error(f"取得可預約時段失敗: {e}")
-                reply_msg = TextMessage(text="取得可預約時段時發生錯誤，請稍後再試")
-
+        # === -1. 使用者主動中斷建檔流程 ===
+    if text == "取消建檔":
+        if line_user_id_for_state and line_user_id_for_state in PENDING_REGISTRATIONS:
+            del PENDING_REGISTRATIONS[line_user_id_for_state]
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[reply_msg]
+                    messages=[TextMessage(
+                        text="已為您取消建檔流程，謝謝。"
+                    )]
                 )
             )
-            return
-
-        
-        # ① 「線上約診」→ 本週 / 下週按鈕
-        if text == "線上約診":
-            buttons_template = ButtonsTemplate(
-                title="線上預約",
-                text="目前僅開放預約本週及下週的時段：",
-                thumbnail_image_url=WEEK_IMAGE_URL,
-                actions=[
-                    MessageAction(
-                        label="本週",
-                        text="我要預約本週"
-                    ),
-                    MessageAction(
-                        label="下週",
-                        text="我要預約下週"
-                    ),
-                ],
-            )
-
-            template_message = TemplateMessage(
-                alt_text="線上預約時段選擇",
-                template=buttons_template
-            )
-
+        else:
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[template_message]
+                    messages=[TextMessage(
+                        text="目前沒有正在進行的建檔流程。\n如需開始建檔，請輸入「測試身分」。"
+                    )]
                 )
             )
+        return
 
-        # ② 「我要預約本週」→ 動態顯示本週剩餘可預約日期（不含週日）
-        elif text == "我要預約本週":
-            today = datetime.now()
-            weekday = today.weekday()  # Monday=0 ... Sunday=6
 
-            # 本週一 = 今天 - weekday 天
-            monday = today - timedelta(days=weekday)
-            saturday = monday + timedelta(days=5)  # 本週六（不含週日）
+    if line_user_id_for_state and line_user_id_for_state in PENDING_REGISTRATIONS:
+        state = PENDING_REGISTRATIONS[line_user_id_for_state]
+        step = state.get("step")
 
-            # 本週要顯示的日期：從「明天」開始，到本週六為止
-            start_date = today + timedelta(days=1)
 
-            candidate_dates = []
-            cur = start_date
-            while cur.date() <= saturday.date():
-                # cur 本身一定是 Mon~Sat，所以不用另外排除 Sunday
-                candidate_dates.append(cur.date())
-                cur += timedelta(days=1)
-
-            columns = []
-
-            for d in candidate_dates:
-                date_str = d.isoformat()  # "YYYY-MM-DD"
-                # 查這一天還有沒有可預約 slot
-                available_slots = get_available_slots_for_date(date_str)
-                if not available_slots:
-                    # 當天已滿 / 沒開診 → 不顯示這張卡片
-                    continue
-
-                # 顯示名稱，例如：本週四（11/20）
-                mmdd = d.strftime("%m/%d")
-                weekday_label = WEEKDAY_ZH[d.weekday()]  # 0~6 → 一二三四五六日
-                title = f"本週{weekday_label}（{mmdd}）"
-
-                columns.append(
-                    CarouselColumn(
-                        title=title,
-                        text="點擊查看可預約時段。",
-                        actions=[
-                            MessageAction(
-                                label="查看可預約時段",
-                                text=f"預約 {date_str}",  #丟給「預約 YYYY-MM-DD」分支
-                            ),
-                        ],
-                    )
-                )
-
-            if not columns:
-                # 本週沒有任何有空位的日期
+        # 0-1. 問姓名
+        if step == "ask_name":
+            name = text.strip()
+            if not name:
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[TextMessage(text="本週目前沒有可預約的日期")]
+                        messages=[TextMessage(text="姓名不能是空白，請再次輸入您的姓名。")]
                     )
                 )
                 return
 
-            carousel_template = CarouselTemplate(columns=columns)
-            template_message = TemplateMessage(
-                alt_text="本週可預約日期列表",
-                template=carousel_template
-            )
+            state["name"] = name
+            state["step"] = "ask_phone"
+            PENDING_REGISTRATIONS[line_user_id_for_state] = state
 
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[template_message]
-                )
-            )
-            return
+            reply_text = f"{name} 您好，請輸入您的手機號碼（格式：09xxxxxxxx）："
 
-        
-        # ③ 「我要預約下週」→ 動態顯示下週一～下週六的可預約日期
-        elif text == "我要預約下週":
-            today = datetime.now()
-            weekday = today.weekday()  # Monday=0 ... Sunday=6
-
-            # 本週一 + 7 天 = 下週一
-            monday = today - timedelta(days=weekday)
-            next_monday = monday + timedelta(days=7)
-            next_saturday = next_monday + timedelta(days=5)  # 下週六（不含週日）
-
-            candidate_dates = []
-            cur = next_monday
-            while cur.date() <= next_saturday.date():
-                candidate_dates.append(cur.date())
-                cur += timedelta(days=1)
-
-            columns = []
-
-            for d in candidate_dates:
-                date_str = d.isoformat()  # "YYYY-MM-DD"
-                available_slots = get_available_slots_for_date(date_str)
-                if not available_slots:
-                    continue
-
-                # 顯示名稱，例如：下週三（11/26）
-                mmdd = d.strftime("%m/%d")
-                weekday_label = WEEKDAY_ZH[d.weekday()]
-                title = f"下週{weekday_label}（{mmdd}）"
-
-                columns.append(
-                    CarouselColumn(
-                        title=title,
-                        text="點擊查看可預約時段。",
-                        actions=[
-                            MessageAction(
-                                label="查看這天時段",
-                                text=f"預約 {date_str}",  # 一樣丟給「預約 YYYY-MM-DD」分支
-                            ),
-                        ],
-                    )
-                )
-
-            if not columns:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="下週目前沒有可預約的日期")]
-                    )
-                )
-                return
-
-            carousel_template = CarouselTemplate(columns=columns)
-            template_message = TemplateMessage(
-                alt_text="下週可預約日期列表",
-                template=carousel_template
-            )
-
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[template_message]
-                )
-            )
-            return
-
-
-        # ④ 使用者挑好時段（先顯示確認畫面，還沒建立預約）
-        elif text.startswith("我想預約"):
-            # 預期格式：我想預約 YYYY-MM-DD HH:MM
-            payload = text.replace("我想預約", "").strip()
-            parts = payload.split()  # 例如 ["2025-11-21", "15:00"]
-
-            if len(parts) == 2 and parts[0].count("-") == 2 and ":" in parts[1]:
-                date_str, time_str = parts
-
-                # 顯示用的日期格式（2025/11/21 15:00）
-                display_date = date_str.replace("-", "/")
-                display_text = f"您選擇的時段是：\n{display_date} {time_str}\n\n是否確認預約？"
-
-                # 確認／取消按鈕
-                buttons_template = ButtonsTemplate(
-                    title="預約確認",
-                    text=display_text,
-                    actions=[
-                        MessageAction(
-                            label="確認預約",
-                            text=f"確認預約 {date_str} {time_str}",
-                        ),
-                        MessageAction(
-                            label="取消",
-                            text="取消",
-                        ),
-                    ],
-                )
-
-                template_message = TemplateMessage(
-                    alt_text="預約確認",
-                    template=buttons_template
-                )
-
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[template_message]
-                    )
-                )
-                return
-
-            else:
-                # 格式不正確（防呆）
-                reply_text = "請用格式：我想預約 YYYY-MM-DD HH:MM"
-
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=reply_text)]
-                    )
-                )
-                return
-
-        # ⑤ 使用者按下「確認預約」→ 真正建立 Bookings 預約 + 顯示完成畫面
-        elif text.startswith("確認預約"):
-            # 預期格式：確認預約 YYYY-MM-DD HH:MM
-            payload = text.replace("確認預約", "").strip()
-            parts = payload.split()  # 例如 ["2025-11-21", "15:00"]
-
-            if len(parts) == 2 and parts[0].count("-") == 2 and ":" in parts[1]:
-                date_str, time_str = parts
-
-                try:
-                    created = create_booking_appointment(date_str, time_str)
-                    appt_id = created.get("id", "（沒有取得 ID）")
-
-                    display_date = date_str.replace("-", "/")
-
-                    # 完成預約的文字說明（之後這裡可以換成真的患者姓名）
-                    detail_text = (
-                        "已為您完成預約，請準時報到。\n"
-                        f"姓名：{DEMO_CUSTOMER_NAME}\n"
-                        f"時段：{display_date} {time_str}\n"
-                        # f"預約 ID：{appt_id}"
-                    )
-                    detail_message = TextMessage(text=detail_text)
-
-                    # Buttons：提供「位置導航」按鈕
-                    buttons_template = ButtonsTemplate(
-                        title="診所位置",
-                        text="如需導航，請點選下方按鈕查看地圖。",
-                        actions=[
-                            MessageAction(
-                                label="位置導航",git add .
-                                text="查詢診所位置"
-                            ),
-                        ],
-                    )
-
-                    template_message = TemplateMessage(
-                        alt_text="診所位置導航",
-                        template=buttons_template
-                    )
-
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[detail_message, template_message]
-                        )
-                    )
-                    return
-
-                except Exception as e:
-                    app.logger.error(f"建立 Bookings 預約失敗: {e}")
-                    reply_text = "未成功預約，請重新操作"
-
-            else:
-                reply_text = "格式：確認預約 YYYY-MM-DD HH:MM"
-
-            # 格式錯誤或建立失敗
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
@@ -899,768 +1792,888 @@ def handle_message(event: MessageEvent):
             )
             return
 
+        # 0-2. 問手機
+        elif step == "ask_phone":
+            phone_raw = text.strip()
+            digits = "".join(ch for ch in phone_raw if ch.isdigit())
 
-         # ⑤ 約診查詢：
-        #   - 沒有 future 預約 → 提示無約診 + 「線上約診」
-        #   - 有預約且剩餘天數 >= 3 → 顯示約診 + 「取消約診」按鈕
-        #   - 有預約且剩餘天數 < 3 → 顯示約診 + 「確認回診」按鈕
-        #   - 若 serviceNotes 已含 Confirmed via LINE → 顯示「已確認」版本，只剩「查詢診所位置」
-        elif text == "約診查詢":
-            try:
-                appt, local_start = get_next_upcoming_appointment_for_demo()
-            except Exception as e:
-                app.logger.error(f"查詢約診失敗: {e}")
+            if not (len(digits) == 10 and digits.startswith("09")):
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[TextMessage(text="約診查詢失敗，請稍後再試")]
+                        messages=[TextMessage(text="手機格式不正確，請以 09xxxxxxxx 格式重新輸入。")]
                     )
                 )
                 return
 
-            # ① 沒有任何 future 預約 → 引導去線上約診
-            if not appt or not local_start:
-                buttons_template = ButtonsTemplate(
-                    title="目前沒有約診紀錄",
-                    text="若需預約看診，請點擊「線上預約」。",
-                    actions=[
-                        MessageAction(
-                            label="線上約診",
-                            text="線上約診"
-                        ),
-                    ],
-                )
+            name = state.get("name") or "未填姓名"
 
-                template_message = TemplateMessage(
-                    alt_text="沒有約診紀錄",
-                    template=buttons_template
-                )
-
+            # 呼叫 Zendesk API 建使用者
+            user = create_zendesk_user(line_user_id_for_state, name, digits)
+            if not user:
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[template_message]
+                        messages=[TextMessage(text="建立病患資料時發生問題，請稍後再試。")]
                     )
                 )
                 return
 
-            # ② 有 future 預約 → 先算天數，再看有沒有已確認
-            days_left = get_days_until(local_start)
+            # 成功 → 清除狀態
+            del PENDING_REGISTRATIONS[line_user_id_for_state]
 
-            display_date = local_start.strftime("%Y/%m/%d")
-            display_time = local_start.strftime("%H:%M")
-
-            customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
-            appt_id = appt.get("id", "")
-
-            # 詳細資訊放在 TextMessage（不限 60 字）
-            base_text = (
-                f"姓名：{customer_name}\n"
-                f"看診時間：{display_date} {display_time}\n"
+            info_text = (
+                "已為您完成基本資料建檔\n"
+                f"姓名：{name}\n"
+                f"手機：{digits}\n\n"
+                "接下來請選擇要預約的日期範圍："
             )
-
-            # ②-0 若已在 LINE 確認過 → 直接顯示「已確認」版本
-            service_notes = appt.get("serviceNotes") or ""
-            if CONFIRM_NOTE_KEYWORD in service_notes:
-                detail_text = (
-                    "您已完成回診確認 ✅\n"
-                    f"姓名：{customer_name}\n"
-                    f"看診時間：{display_date} {display_time}\n"
-                    "\n如需導航，可點選下方「查詢診所位置」。"
-                )
-                detail_message = TextMessage(text=detail_text)
-
-                buttons_template = ButtonsTemplate(
-                    title="已確認回診門診",
-                    text="如需導航請點下方按鈕。",
-                    actions=[
-                        MessageAction(
-                            label="查詢診所位置",
-                            text="查詢診所位置"
-                        ),
-                    ],
-                )
-
-                template_message = TemplateMessage(
-                    alt_text="已確認回診",
-                    template=buttons_template
-                )
-
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[detail_message, template_message]
-                    )
-                )
-                return
-
-            # ②-1 距離看診 >= 3 天 → 可取消
-            if days_left >= 3:
-                detail_text = (
-                    base_text +
-                    f"\n目前距離看診還有 {days_left} 天，"
-                    "如需變更請先取消本次預約。"
-                )
-                detail_message = TextMessage(text=detail_text)
-
-                buttons_template = ButtonsTemplate(
-                    title="可取消的門診預約",
-                    text="是否取消預約？",
-                    actions=[
-                        MessageAction(
-                            label="取消約診",
-                            text=f"取消約診 {appt_id}",   # 之後進入取消流程
-                        ),
-                    ],
-                )
-
-                template_message = TemplateMessage(
-                    alt_text="可取消的門診預約",
-                    template=buttons_template
-                )
-
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[detail_message, template_message]
-                    )
-                )
-                return
-
-            # ②-2 距離看診 < 3 天 → 不能取消，只能確認
-            else:
-                detail_text = (
-                    base_text +
-                    "\n目前距離看診已少於三天，無法透過 LINE 取消預約。\n"
-                    "如果您會準時前來，請先完成回診確認。"
-                )
-                detail_message = TextMessage(text=detail_text)
-
-                buttons_template = ButtonsTemplate(
-                    title="即將到診的門診",
-                    text="是否確認回診？",
-                    actions=[
-                        MessageAction(
-                            label="確認回診",
-                            text=f"確認回診 {appt_id}",   # 之後進入確認流程
-                            # text=f"確認回診",
-                        ),
-                    ],
-                )
-
-                template_message = TemplateMessage(
-                    alt_text="即將到診的門診",
-                    template=buttons_template
-                )
-
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[detail_message, template_message]
-                    )
-                )
-                return
-            
-        # ⑤-1 「取消約診 {id}」→ 再次確認是否要取消
-        # elif text.startswith("取消約診"):
-        #     parts = text.split()
-        #     appt_id = parts[1] if len(parts) >= 2 else ""
-
-        #     # 如果沒有帶 id，視為要取消「最近一筆 future 預約」（DEMO 用）
-        #     if not appt_id:
-        #         appt, local_start = get_next_upcoming_appointment_for_demo()
-        #     else:
-        #         appt, local_start = get_appointment_by_id(appt_id)
-
-        #     if not appt or not local_start:
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="找不到可取消的約診，請先使用「查詢約診」確認目前預約狀態。")]
-        #             )
-        #         )
-        #         return
-
-        #     days_left = get_days_until(local_start)
-
-        #     # < 3 天 → 直接套你要的固定文案
-        #     if days_left < 3:
-        #         msg = (
-        #             "由於距離看診日已少於三天，無法透過 LINE 取消約診。\n"
-        #             "如有特殊狀況請直接電話聯繫診所，謝謝理解。"
-        #         )
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text=msg)]
-        #             )
-        #         )
-        #         return
-
-        #     # >= 3 天 → 正常進入「確認取消」畫面
-        #     display_date = local_start.strftime("%Y/%m/%d")
-        #     display_time = local_start.strftime("%H:%M")
-        #     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
-        #     appt_id = appt.get("id", "")
-
-        #     detail_text = (
-        #         f"您即將取消以下約診：\n"
-        #         f"姓名：{customer_name}\n"
-        #         f"看診時間：{display_date} {display_time}\n"
-        #         f"\n確定要取消嗎？"
-        #     )
-        #     detail_message = TextMessage(text=detail_text)
-
-        #     buttons_template = ButtonsTemplate(
-        #         title="確認取消約診",
-        #         text="請選擇是否取消本次約診。",
-        #         actions=[
-        #             MessageAction(
-        #                 label="確認取消",
-        #                 text=f"確認取消 {appt_id}",
-        #             ),
-        #             MessageAction(
-        #                 label="保留約診",
-        #                 text="查詢約診",   # 回去看一下現況
-        #             ),
-        #         ],
-        #     )
-
-        #     template_message = TemplateMessage(
-        #         alt_text="確認取消約診",
-        #         template=buttons_template
-        #     )
-
-        #     line_bot_api.reply_message(
-        #         ReplyMessageRequest(
-        #             reply_token=event.reply_token,
-        #             messages=[detail_message, template_message]
-        #         )
-        #     )
-        #     return
-        
-        #         # ⑤-2 「確認取消 {id}」→ 真正呼叫 Bookings 取消預約
-        # elif text.startswith("確認取消"):
-        #     parts = text.split()
-        #     appt_id = parts[1] if len(parts) >= 2 else ""
-
-        #     if not appt_id:
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="要取消的約診資訊不完整，請重新操作「約診查詢」。")]
-        #             )
-        #         )
-        #         return
-
-        #     # 再查一次這筆約診（避免被改時間或已經被取消）
-        #     appt, local_start = get_appointment_by_id(appt_id)
-        #     if not appt or not local_start:
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="找不到這筆約診，可能已被取消或不存在，請重新查詢約診。")]
-        #             )
-        #         )
-        #         return
-
-        #     days_left = get_days_until(local_start)
-        #     if days_left < 3:
-        #         msg = (
-        #             "由於距離看診日已少於三天，無法透過 LINE 取消約診。\n"
-        #             "如有特殊狀況請直接電話聯繫診所，謝謝理解。"
-        #         )
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text=msg)]
-        #             )
-        #         )
-        #         return
-
-        #     # 真的取消
-        #     try:
-        #         cancel_booking_appointment(appt_id)
-        #     except Exception as e:
-        #         app.logger.error(f"取消預約失敗: {e}")
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="取消約診時發生錯誤，請稍後再試或聯繫診所。")]
-        #             )
-        #         )
-        #         return
-
-        #     display_date = local_start.strftime("%Y/%m/%d")
-        #     display_time = local_start.strftime("%H:%M")
-        #     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
-
-        #     msg = (
-        #         "已為您取消以下約診：\n"
-        #         f"姓名：{customer_name}\n"
-        #         f"看診時間：{display_date} {display_time}\n"
-        #         "\n如需重新預約，歡迎使用「線上約診」。"
-        #     )
-        #     text_message = TextMessage(text=msg)
-
-        #     buttons_template = ButtonsTemplate(
-        #         title="下一步操作",
-        #         text="如需再次預約可點選下方按鈕。",
-        #         actions=[
-        #             MessageAction(
-        #                 label="線上約診",
-        #                 text="線上約診",
-        #             ),
-        #         ],
-        #     )
-
-        #     template_message = TemplateMessage(
-        #         alt_text="約診已取消",
-        #         template=buttons_template
-        #     )
-
-        #     line_bot_api.reply_message(
-        #         ReplyMessageRequest(
-        #             reply_token=event.reply_token,
-        #             messages=[text_message, template_message]
-        #         )
-        #     )
-        #     return
-
-        # ⑤-1 「取消約診 {id}」→ 再次確認是否要取消
-        elif text.startswith("取消約診"):
-            parts = text.split()
-            appt_id = parts[1] if len(parts) >= 2 else ""
-
-            # 如果沒有帶 id，就是取消「最近一筆 future 預約」
-            if not appt_id:
-                appt, local_start = get_next_upcoming_appointment_for_demo()
-            else:
-                appt, local_start = get_appointment_by_id(appt_id)
-
-            if not appt or not local_start:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="找不到可取消的約診，請先使用「查詢約診」確認預約狀態。")]
-                    )
-                )
-                return
-
-            days_left = get_days_until(local_start)
-
-            # < 3 天 → 直接套固定文案
-            if days_left < 3:
-                msg = (
-                    "由於距離看診日已少於三天，無法透過 LINE 取消約診。\n"
-                    "如有特殊狀況請致電診所，謝謝您的諒解。"
-                )
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)]
-                    )
-                )
-                return
-
-            # >= 3 天 → 正常進入「確認取消」畫面
-            display_date = local_start.strftime("%Y/%m/%d")
-            display_time = local_start.strftime("%H:%M")
-            customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
-            appt_id = appt.get("id", "")
-
-            detail_text = (
-                f"您即將取消以下約診：\n"
-                f"姓名：{customer_name}\n"
-                f"看診時間：{display_date} {display_time}\n"
-                f"\n確定要取消嗎？"
-            )
-            detail_message = TextMessage(text=detail_text)
 
             buttons_template = ButtonsTemplate(
-                title="確認取消約診",
-                text="請選擇是否取消本次約診。",
+                title="線上預約",
+                text="請選擇要預約的日期範圍：",
+                thumbnail_image_url=WEEK_IMAGE_URL,
                 actions=[
-                    MessageAction(
-                        label="確認取消",
-                        text=f"確認取消 {appt_id}",
-                        # text=f"確認取消",
-                    ),
-                    MessageAction(
-                        label="保留約診",
-                        text="約診查詢",   # 回去看一下現況
-                    ),
+                    MessageAction(label="本週", text="我要預約本週"),
+                    MessageAction(label="下週", text="我要預約下週"),
+                    MessageAction(label="其他日期", text="其他日期"),
                 ],
-            )
-
-            template_message = TemplateMessage(
-                alt_text="確認取消約診",
-                template=buttons_template
             )
 
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[detail_message, template_message]
-                )
-            )
-            return
-        
-        # ⑤-2 「確認取消 {id}」→ 真正呼叫 Bookings 取消預約
-        elif text.startswith("確認取消"):
-            parts = text.split()
-            appt_id = parts[1] if len(parts) >= 2 else ""
-
-            if not appt_id:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="要取消的約診資訊不完整，請重新操作「查詢約診」。")]
-                    )
-                )
-                return
-
-            # 再查一次這筆約診（避免被改時間或已經被取消）
-            appt, local_start = get_appointment_by_id(appt_id)
-            if not appt or not local_start:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="找不到這筆約診，可能已被取消或不存在，請重新查詢約診。")]
-                    )
-                )
-                return
-
-            days_left = get_days_until(local_start)
-            if days_left < 3:
-                msg = (
-                    "由於距離看診日已少於三天，無法透過 LINE 取消約診。\n"
-                    "如有特殊狀況請直接電話聯繫診所，謝謝理解。"
-                )
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)]
-                    )
-                )
-                return
-
-            # 真的取消（DELETE Bookings appointment）
-            try:
-                cancel_booking_appointment(appt_id)
-            except Exception as e:
-                app.logger.error(f"取消預約失敗: {e}")
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="取消約診時發生錯誤，請稍後再試或聯繫診所。")]
-                    )
-                )
-                return
-
-            display_date = local_start.strftime("%Y/%m/%d")
-            display_time = local_start.strftime("%H:%M")
-            customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
-
-            msg = (
-                "已為您取消以下約診：\n"
-                f"姓名：{customer_name}\n"
-                f"時間：{display_date} {display_time}\n"
-            )
-            text_message = TextMessage(text=msg)
-
-            buttons_template = ButtonsTemplate(
-                title="需要重新約診嗎？",
-                text="如需重新預約請點選「線上約診」。",
-                actions=[
-                    MessageAction(
-                        label="線上約診",
-                        text="線上約診",
-                    ),
-                ],
-            )
-
-            template_message = TemplateMessage(
-                alt_text="約診已取消",
-                template=buttons_template
-            )
-
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[text_message, template_message]
+                    messages=[
+                        TextMessage(text=info_text),
+                        TemplateMessage(alt_text="線上預約時段選擇", template=buttons_template)
+                    ]
                 )
             )
             return
 
-        
-        # # ⑤-3 「確認回診 {id}」→ 提醒文字＋位置導航（目前先不寫回 Bookings 備註）
-        # elif text.startswith("確認回診"):
-        #     parts = text.split()
-        #     appt_id = parts[1] if len(parts) >= 2 else ""
-
-        #     # 沒帶 id 就用最近一筆 future 預約（DEMO 用）
-        #     if not appt_id:
-        #         appt, local_start = get_next_upcoming_appointment_for_demo()
-        #     else:
-        #         appt, local_start = get_appointment_by_id(appt_id)
-
-        #     if not appt or not local_start:
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="找不到可確認的約診，請先使用「查詢約診」確認目前預約狀態。")]
-        #             )
-        #         )
-        #         return
-
-        #     display_date = local_start.strftime("%Y/%m/%d")
-        #     display_time = local_start.strftime("%H:%M")
-        #     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
-
-        #     detail_text = (
-        #         "回診提醒：\n"
-        #         f"姓名：{customer_name}\n"
-        #         f"看診時間：{display_date} {display_time}\n"
-        #         "\n請於門診開始前 10 分鐘至診所報到。"
-        #     )
-        #     detail_message = TextMessage(text=detail_text)
-
-        #     buttons_template = ButtonsTemplate(
-        #         title="回診資訊已確認",
-        #         text="如需導航至診所，請點選下方按鈕。",
-        #         actions=[
-        #             MessageAction(
-        #                 label="查詢診所位置",
-        #                 text="查詢診所位置",
-        #             ),
-        #         ],
-        #     )
-
-        #     template_message = TemplateMessage(
-        #         alt_text="回診資訊確認",
-        #         template=buttons_template
-        #     )
-
-        #     line_bot_api.reply_message(
-        #         ReplyMessageRequest(
-        #             reply_token=event.reply_token,
-        #             messages=[detail_message, template_message]
-        #         )
-        #     )
-        #     return
-
-
-        # ⑦ 「確認回診 {id}」→ 寫入 Bookings 備註（僅第一次）＋提醒文字＋位置導航
-        elif text.startswith("確認回診"):
-            parts = text.split(maxsplit=1)
-            appt_id = parts[1].strip() if len(parts) >= 2 else ""
-
-            # 沒帶 id → DEMO：抓最近一筆 future 預約
-            if not appt_id:
-                appt, local_start = get_next_upcoming_appointment_for_demo()
-            else:
-                appt, local_start = get_appointment_by_id(appt_id)
-
-            if not appt or not local_start:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="找不到需要確認的約診，請先使用「約診查詢」確認預約狀態。")]
-                    )
-                )
-                return
-
-            days_left = get_days_until(local_start)
-            display_date = local_start.strftime("%Y/%m/%d")
-            display_time = local_start.strftime("%H:%M")
-            customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
-            appt_id = appt.get("id", "")
-
-            # ① 太早確認（≥ 3 天） → 擋掉
-            if days_left >= 3:
-                msg = (
-                    "目前距離看診日仍大於三天，暫不開放線上確認回診。\n"
-                    "可於看診前三天內再透過 LINE 進行確認。"
-                )
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)]
-                    )
-                )
-                return
-
-            # ② 看這筆約診是不是已經 Confirm 過
-            service_notes = appt.get("serviceNotes") or ""
-            already_confirmed = (CONFIRM_NOTE_KEYWORD in service_notes)
-
-            # 已確認 → 不再 PATCH，只回提示＋位置按鈕，然後一定要 return
-            if already_confirmed:
-                detail_text = (
-                    "您已完成回診確認 ✅\n"
-                    f"姓名：{customer_name}\n"
-                    f"看診時間：{display_date} {display_time}\n"
-                    "\n如需導航，可點選下方「查詢診所位置」。"
-                )
-                detail_message = TextMessage(text=detail_text)
-
-                buttons_template = ButtonsTemplate(
-                    title="回診資訊確認",
-                    text="預約已確認，如需導航請點選下方。",
-                    actions=[
-                        MessageAction(
-                            label="查詢診所位置",
-                            text="查詢診所位置"
-                        ),
-                    ],
-                )
-
-                template_message = TemplateMessage(
-                    alt_text="已確認回診資訊",
-                    template=buttons_template
-                )
-
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[detail_message, template_message]
-                    )
-                )
-                return  # ⬅⬅⬅ 超重要：這樣下面就不會再 PATCH 了
-
-            # ③ 尚未確認 → 這裡才會真的 PATCH，一次寫入 Confirmed via LINE
-            now_local = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-            new_line = f"{CONFIRM_NOTE_KEYWORD} on {now_local} (UTC+8)"
-
-            if service_notes:
-                merged_notes = service_notes + "\n" + new_line
-            else:
-                merged_notes = new_line
-
-            try:
-                # 用你現在的 helper 名稱（你的是 update_booking_service_notes）
-                update_booking_service_notes(appt_id, merged_notes)
-            except Exception as e:
-                app.logger.error(f"更新 Bookings 備註失敗: {e}")
-                # 寫備註失敗不影響使用者體驗，只記 log
-
-            # ====== 回 LINE 提醒文字＋位置導航按鈕 ======
-            detail_text = (
-                "回診提醒：\n"
-                f"姓名：{customer_name}\n"
-                f"看診時間：{display_date} {display_time}\n"
-                "\n請於門診開始前 10 分鐘至診所報到。"
-            )
-            detail_message = TextMessage(text=detail_text)
-
-            buttons_template = ButtonsTemplate(
-                title="回診資訊已確認",
-                text="如需導航至診所，請點選下方按鈕。",
-                actions=[
-                    MessageAction(
-                        label="查詢診所位置",
-                        text="查詢診所位置",
-                    ),
-                ],
-            )
-
-            template_message = TemplateMessage(
-                alt_text="回診資訊確認",
-                template=buttons_template
-            )
-
+        # 0-3. 例外 step → reset
+        else:
+            del PENDING_REGISTRATIONS[line_user_id_for_state]
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[detail_message, template_message]
+                    messages=[TextMessage(text="資料狀態異常，請重新輸入「線上約診」開始流程。")]
                 )
             )
             return
 
 
+    # === 測試：從後端跟 Entra 拿 Graph token ===
+    if text == "測試token":
+        try:
+            token = get_graph_token()
+            app.logger.info(f"GRAPH ACCESS TOKEN (HEAD): {token[:30]}...")
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="成功取得 Graph token")]
+                )
+            )
+        except Exception as e:
+            app.logger.error(f"Graph token 申請失敗: {e}")
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="Graph token 申請失敗，請稍後再試")]
+                )
+            )
+        return
 
-        # ⑦ 查詢診所位置 → 回傳 Location（地圖）
-        elif text == "查詢診所位置":
-            location_message = LocationMessage(
-                title=CLINIC_NAME,
-                address=CLINIC_ADDRESS,
-                latitude=CLINIC_LAT,
-                longitude=CLINIC_LNG,
+    # === 查詢某天預約 ===
+    if text.startswith("查 "):
+        parts = text.split()
+        if len(parts) >= 2:
+            date_str = parts[1]
+            try:
+                appts = list_appointments_for_date(date_str)
+                reply_text = f"{date_str} 有 {len(appts)} 筆預約"
+            except Exception as e:
+                app.logger.error(f"查預約失敗: {e}")
+                reply_text = "查預約失敗，請稍後再試"
+
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+        else:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="請輸入：查 YYYY-MM-DD，例：查 2025-01-15")]
+                )
+            )
+        return
+
+    # === 預約 YYYY-MM-DD：顯示 Carousel ===
+    elif text.startswith("預約 "):
+        date_str = text.replace("預約", "").strip()
+        try:
+            available_slots = get_available_slots_for_date(date_str)
+            if not available_slots:
+                reply_msg = TextMessage(text=f"{date_str} 沒有可預約時段")
+            else:
+                reply_msg = build_slots_carousel(date_str, available_slots)
+        except Exception as e:
+            app.logger.error(f"取得可預約時段失敗: {e}")
+            reply_msg = TextMessage(text="取得可預約時段失敗，請稍後再試")
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[reply_msg]
+            )
+        )
+        return
+
+    # === ① 線上約診：本週 / 下週 / 其他時間 ===
+    # if text == "線上約診":
+    #     buttons_template = ButtonsTemplate(
+    #         title="線上預約",
+    #         text="目前開放本週起三週內的門診預約，請選擇時間範圍：",
+    #         thumbnail_image_url=WEEK_IMAGE_URL,
+    #         actions=[
+    #             MessageAction(label="本週", text="我要預約本週"),
+    #             MessageAction(label="下週", text="我要預約下週"),
+    #             MessageAction(label="其他時間", text="其他時間"),
+    #         ],
+    #     )
+    #     template_message = TemplateMessage(
+    #         alt_text="線上預約時段選擇",
+    #         template=buttons_template
+    #     )
+    #     line_bot_api.reply_message(
+    #         ReplyMessageRequest(
+    #             reply_token=event.reply_token,
+    #             messages=[template_message]
+    #         )
+    #     )
+    #     return
+
+    # === ① 線上約診：先判斷 Zendesk 有沒有這個病患 ===
+        # === 1. 線上約診入口（正式給病患用） ===
+    elif text == "線上約診":
+        # 1-1 取得 LINE userId
+        line_user_id = None
+        if event.source and hasattr(event.source, "user_id"):
+            line_user_id = event.source.user_id
+
+        if not line_user_id:
+            # 理論上 1:1 聊天一定有 user_id，這裡只是保險用
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="找不到 LINE userId，請改用 1 對 1 聊天測試。")]
+                )
+            )
+            return
+
+        # 1-2 先到 Zendesk 查這個 line_user_id 是否已建檔
+        try:
+            count, user = search_zendesk_user_by_line_id(line_user_id)
+        except Exception as e:
+            app.logger.error(f"查詢 Zendesk 使用者失敗: {e}")
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="後端查詢病患資料發生錯誤，請稍後再試。")]
+                )
+            )
+            return
+
+        # 1-3 沒找到 → 視為新病患，啟動首次建檔流程
+        if count == 0:
+            # 先試著從 LINE 拿暱稱來打招呼
+            try:
+                profile = line_bot_api.get_profile(user_id=line_user_id)
+                display_name = getattr(profile, "display_name", None) or "您好"
+            except Exception as e:
+                app.logger.error(f"取得 LINE Profile 失敗: {e}")
+                display_name = "您好"
+
+            # 記錄這個 user 正在「問姓名」這個 step
+            PENDING_REGISTRATIONS[line_user_id] = {
+                "step": "ask_name",
+                "display_name": display_name,
+            }
+
+            reply_text = (
+                f"{display_name} 您好，歡迎使用線上約診服務。\n"
+                "請先完成基本資料建檔再使用本服務。\n\n"
+                "請輸入您的姓名（全名）："
             )
 
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[location_message]
+                    messages=[TextMessage(text=reply_text)]
                 )
             )
+            return
 
+        # 1-4 已有一筆 → 老病患，直接帶出 Zendesk 資料 + 預約按鈕
+        elif count == 1 and user:
+            name = user.get("name") or "貴賓"
+            phone = user.get("phone") or "（未留電話）"
 
-        # ⑦ 「診所資訊」→ 卡片 + 門診時間文字 + 地圖
-        elif text == "診所資訊":
-            short_text = f"地址：{CLINIC_ADDRESS}\n點擊下方查看地圖位置"
+            info_text = (
+                f"{name} 您好，系統中已有您的資料：\n"
+                f"手機：{phone}\n\n"
+                "請選擇要預約的日期範圍："
+            )
 
-            clinic_info_template = ButtonsTemplate(
-                thumbnail_image_url=CLINIC_IMAGE_URL,
-                title=CLINIC_NAME,
-                text=short_text,
+            buttons_template = ButtonsTemplate(
+                title="線上預約",
+                text="請選擇要預約的日期範圍：",
+                thumbnail_image_url=WEEK_IMAGE_URL,
                 actions=[
-                    MessageAction(
-                        label="查看地圖位置",
-                        text="查看地圖位置"
-                    ),
+                    MessageAction(label="本週", text="我要預約本週"),
+                    MessageAction(label="下週", text="我要預約下週"),
+                    MessageAction(label="其他日期", text="其他日期"),
                 ],
             )
 
-            clinic_info_message = TemplateMessage(
-                alt_text="診所資訊",
-                template=clinic_info_template
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(text=info_text),
+                        TemplateMessage(
+                            alt_text="線上預約時段選擇",
+                            template=buttons_template
+                        ),
+                    ]
+                )
             )
+            return
 
-            opening_hours_message = TextMessage(
-                text=(
-                    "門診時間：\n"
-                    "週一～週六\n"
-                    "早診 09:00–12:00\n"
-                    "午診 14:00–17:00\n"
-                    "晚診 18:00–21:00"
+        # 1-5 保險：理論上不會發生（同一個 line_user_id 對到多筆）
+        else:
+            warn_text = (
+                f"系統偵測到 {count} 筆使用相同 LINE ID 的病患資料，"
+                "請聯繫診所人員協助處理。"
+            )
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=warn_text)]
+                )
+            )
+            return
+
+
+    
+    # === 測試：用目前這個 LINE 使用者去 Zendesk 查身分 ===
+    # === 測試：用目前這個 LINE 使用者去 Zendesk 查身分 ===
+    # === 測試：用目前這個 LINE 使用者去 Zendesk 查身分 ===
+    elif text == "測試身分":
+        # 1. 從 event 取得 LINE userId
+        line_user_id = None
+        if event.source and hasattr(event.source, "user_id"):
+            line_user_id = event.source.user_id
+
+        if not line_user_id:
+            # 理論上 1:1 聊天一定有 user_id，這裡只是保險
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="找不到 LINE userId，請改用 1 對 1 聊天測試。")]
+                )
+            )
+            return
+
+        # 2. 先到 Zendesk 查這個 line_user_id 是否已經建過檔
+        try:
+            count, user = search_zendesk_user_by_line_id(line_user_id)
+        except Exception as e:
+            app.logger.error(f"查詢 Zendesk 使用者失敗: {e}")
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="後端查詢病患資料發生錯誤，請稍後再試。")]
+                )
+            )
+            return
+
+        # 2-1. 已經是老病患 → 先簡單回覆（之後可以在這裡直接串預約）
+        if count > 0 and user is not None:
+            name = user.get("name") or "貴賓"
+            phone = user.get("phone") or "（未留電話）"
+            reply_text = (
+                f"{name} 您好，系統中已有您的資料：\n"
+                f"手機：{phone}\n\n"
+                "之後預約將會直接使用這份資料。"
+            )
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+            return
+
+        # 2-2. 找不到 → 視為第一次使用，需要建檔
+        # 這裡多一步：呼叫 LINE profile 拿 displayName 來打招呼
+        display_name = "您好"
+        try:
+            profile = line_bot_api.get_profile(user_id=line_user_id)
+            # v3 SDK 通常是 display_name
+            if profile and getattr(profile, "display_name", None):
+                display_name = profile.display_name
+        except Exception as e:
+            app.logger.error(f"取得 LINE Profile 失敗: {e}")
+            # 拿不到就維持預設「您好」
+
+        # 3. 把狀態記在 PENDING_REGISTRATIONS 裡，進入 ask_name 流程
+        PENDING_REGISTRATIONS[line_user_id] = {
+            "step": "ask_name",
+            "display_name": display_name,
+        }
+
+        reply_text = (
+            f"{display_name} 您好，歡迎使用線上預約服務。\n"
+            "請先完成基本資料建檔再使用本服務。\n\n"
+            "請輸入您的姓名（全名）："
+        )
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply_text)]
+            )
+        )
+        return
+
+
+    # === ② 我要預約本週 ===
+    elif text == "我要預約本週":
+        today = datetime.now()
+        weekday = today.weekday()
+        monday = today - timedelta(days=weekday)
+        saturday = monday + timedelta(days=5)
+
+        # 從「明天」開始，到本週六為止
+        start_date = today + timedelta(days=1)
+        candidate_dates = []
+        cur = start_date
+        while cur.date() <= saturday.date():
+            candidate_dates.append(cur.date())
+            cur += timedelta(days=1)
+
+        columns = []
+        for d in candidate_dates:
+            date_str = d.isoformat()
+            available_slots = get_available_slots_for_date(date_str)
+            if not available_slots:
+                continue
+
+            mmdd = d.strftime("%m/%d")
+            weekday_label = WEEKDAY_ZH[d.weekday()]
+            title = f"週{weekday_label}（{mmdd}）"
+
+            columns.append(
+                CarouselColumn(
+                    title=title,
+                    text="點擊查看可預約時段。",
+                    actions=[
+                        MessageAction(
+                            label="查看可預約時段",
+                            text=f"預約 {date_str}"
+                        )
+                    ]
                 )
             )
 
-            location_message = LocationMessage(
-                title=CLINIC_NAME,
-                address=CLINIC_ADDRESS,
-                latitude=CLINIC_LAT,
-                longitude=CLINIC_LNG,
+        if not columns:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="本週目前沒有可預約的日期")]
+                )
+            )
+            return
+
+        carousel = CarouselTemplate(columns=columns)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[
+                    TemplateMessage(
+                        alt_text="本週可預約日期列表",
+                        template=carousel
+                    )
+                ]
+            )
+        )
+        return
+
+    # === ③ 我要預約下週 ===
+    elif text == "我要預約下週":
+        today = datetime.now()
+        weekday = today.weekday()
+        monday = today - timedelta(days=weekday)
+        next_monday = monday + timedelta(days=7)
+        next_saturday = next_monday + timedelta(days=5)
+
+        candidate_dates = []
+        cur = next_monday
+        while cur.date() <= next_saturday.date():
+            candidate_dates.append(cur.date())
+            cur += timedelta(days=1)
+
+        columns = []
+        for d in candidate_dates:
+            date_str = d.isoformat()
+            available_slots = get_available_slots_for_date(date_str)
+            if not available_slots:
+                continue
+
+            mmdd = d.strftime("%m/%d")
+            weekday_label = WEEKDAY_ZH[d.weekday()]
+            title = f"週{weekday_label}（{mmdd}）"
+
+            columns.append(
+                CarouselColumn(
+                    title=title,
+                    text="點擊查看可預約時段。",
+                    actions=[
+                        MessageAction(
+                            label="查看這天時段",
+                            text=f"預約 {date_str}"
+                        )
+                    ]
+                )
+            )
+
+        if not columns:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="下週目前沒有可預約的日期")]
+                )
+            )
+            return
+
+        carousel = CarouselTemplate(columns=columns)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[
+                    TemplateMessage(
+                        alt_text="下週可預約日期列表",
+                        template=carousel
+                    )
+                ]
+            )
+        )
+        return
+
+    # === ③-1 其他時間：詢問兩週後 / 三週後 ===
+    elif text == "其他日期":
+        buttons_template = ButtonsTemplate(
+            title="其他日期預約",
+            text="請選擇要預約的週次：",
+            actions=[
+                MessageAction(label="兩週後", text="我要預約兩週後"),
+                MessageAction(label="三週後", text="我要預約三週後"),
+            ],
+        )
+        template_message = TemplateMessage(
+            alt_text="其他日期預約選擇",
+            template=buttons_template
+        )
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[template_message]
+            )
+        )
+        return
+
+    # === ③-2 我要預約兩週後 ===
+    elif text == "我要預約兩週後":
+        today = datetime.now()
+        weekday = today.weekday()
+        monday = today - timedelta(days=weekday)
+
+        two_weeks_monday = monday + timedelta(days=14)
+        two_weeks_saturday = two_weeks_monday + timedelta(days=5)
+
+        candidate_dates = []
+        cur = two_weeks_monday
+        while cur.date() <= two_weeks_saturday.date():
+            candidate_dates.append(cur.date())
+            cur += timedelta(days=1)
+
+        columns = []
+        for d in candidate_dates:
+            date_str = d.isoformat()
+            available_slots = get_available_slots_for_date(date_str)
+            if not available_slots:
+                continue
+
+            mmdd = d.strftime("%m/%d")
+            weekday_label = WEEKDAY_ZH[d.weekday()]
+            title = f"週{weekday_label}（{mmdd}）"
+
+            columns.append(
+                CarouselColumn(
+                    title=title,
+                    text="點擊查看可預約時段。",
+                    actions=[
+                        MessageAction(
+                            label="查看這天時段",
+                            text=f"預約 {date_str}"
+                        )
+                    ]
+                )
+            )
+
+        if not columns:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="兩週後目前沒有可預約的日期")]
+                )
+            )
+            return
+
+        carousel = CarouselTemplate(columns=columns)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[
+                    TemplateMessage(
+                        alt_text="兩週後可預約日期列表",
+                        template=carousel
+                    )
+                ]
+            )
+        )
+        return
+
+    # === ③-3 我要預約三週後 ===
+    elif text == "我要預約三週後":
+        today = datetime.now()
+        weekday = today.weekday()
+        monday = today - timedelta(days=weekday)
+
+        three_weeks_monday = monday + timedelta(days=21)
+        three_weeks_saturday = three_weeks_monday + timedelta(days=5)
+
+        candidate_dates = []
+        cur = three_weeks_monday
+        while cur.date() <= three_weeks_saturday.date():
+            candidate_dates.append(cur.date())
+            cur += timedelta(days=1)
+
+        columns = []
+        for d in candidate_dates:
+            date_str = d.isoformat()
+            available_slots = get_available_slots_for_date(date_str)
+            if not available_slots:
+                continue
+
+            mmdd = d.strftime("%m/%d")
+            weekday_label = WEEKDAY_ZH[d.weekday()]
+            title = f"週{weekday_label}（{mmdd}）"
+
+            columns.append(
+                CarouselColumn(
+                    title=title,
+                    text="點擊查看可預約時段。",
+                    actions=[
+                        MessageAction(
+                            label="查看這天時段",
+                            text=f"預約 {date_str}"
+                        )
+                    ]
+                )
+            )
+
+        if not columns:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="三週後目前沒有可預約的日期")]
+                )
+            )
+            return
+
+        carousel = CarouselTemplate(columns=columns)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[
+                    TemplateMessage(
+                        alt_text="三週後可預約日期列表",
+                        template=carousel
+                    )
+                ]
+            )
+        )
+        return
+
+
+    # === ④ 我想預約 YYYY-MM-DD HH:MM ===
+    elif text.startswith("我想預約"):
+        payload = text.replace("我想預約", "").strip()
+        parts = payload.split()
+
+        if len(parts) == 2 and parts[0].count("-") == 2 and ":" in parts[1]:
+            date_str, time_str = parts
+            display_date = date_str.replace("-", "/")
+
+            buttons_template = ButtonsTemplate(
+                title="預約確認",
+                text=f"您選擇的時段是：\n{display_date} {time_str}\n\n是否確認預約？",
+                actions=[
+                    MessageAction(label="確認預約", text=f"確認預約 {date_str} {time_str}"),
+                    MessageAction(label="取消", text="取消")
+                ]
             )
 
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[clinic_info_message, opening_hours_message, location_message]
+                    messages=[TemplateMessage(alt_text="預約確認", template=buttons_template)]
                 )
             )
-
-        # ⑧ 「我要看診所地圖」→ 只回地圖一則
-        elif text == "查看地圖位置":
-            location_message = LocationMessage(
-                title=CLINIC_NAME,
-                address=CLINIC_ADDRESS,
-                latitude=CLINIC_LAT,
-                longitude=CLINIC_LNG,
-            )
-
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[location_message]
-                )
-            )
+            return
 
         else:
-            # 其他訊息先不處理（之後你要串 Copilot / AI 再延伸）
-            app.logger.info("非線上約診相關指令，請聯繫客服")
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="請用格式：我想預約 YYYY-MM-DD HH:MM")]
+                )
+            )
+            return
+
+    # === ⑤ 確認預約 ===
+    elif text.startswith("確認預約"):
+        payload = text.replace("確認預約", "").strip()
+        parts = payload.split()
+
+        if len(parts) == 2 and parts[0].count("-") == 2 and ":" in parts[1]:
+            date_str, time_str = parts
+
+            # ① 先拿 LINE userId
+            line_user_id = None
+            if event.source and hasattr(event.source, "user_id"):
+                line_user_id = event.source.user_id
+
+            # ② 預設先用 DEMO（避免真的炸掉）
+            customer_name = DEMO_CUSTOMER_NAME
+            customer_phone = DEMO_CUSTOMER_PHONE
+            line_display_name = None
+
+            # ③ 如果拿得到 line_user_id，就去 Zendesk 找 user
+            if line_user_id:
+                try:
+                    zd_count, zd_user = search_zendesk_user_by_line_id(line_user_id)
+                    if zd_user:
+                        # Zendesk 裡的 name / phone
+                        zd_name = zd_user.get("name") or customer_name
+                        zd_phone = zd_user.get("phone") or customer_phone
+                        customer_name = zd_name
+                        customer_phone = zd_phone
+                except Exception as e:
+                    app.logger.error(f"用 line_user_id 查 Zendesk user 失敗: {e}")
+
+                # ④ 再嘗試拿 LINE 顯示名稱（例如 Kevin）
+                try:
+                    profile = line_bot_api.get_profile(line_user_id)
+                    if profile and hasattr(profile, "display_name"):
+                        line_display_name = profile.display_name
+                except Exception as e:
+                    app.logger.error(f"取得 LINE profile 失敗: {e}")
+
+            # ⑤ 呼叫新的 create_booking_appointment（會寫入 LINE_USER 到 serviceNotes）
+            try:
+                created = create_booking_appointment(
+                    date_str=date_str,
+                    time_str=time_str,
+                    customer_name=customer_name,
+                    customer_phone=customer_phone,
+                    line_display_name=line_display_name,
+                    line_user_id=line_user_id,
+                )
+
+                appt_id = created.get("id", "（沒有取得 ID）")
+                display_date = date_str.replace("-", "/")
+
+                # 這裡顯示給病患看的姓名，沿用 booking_customer_name 的邏輯
+                if line_display_name:
+                    display_name = f"{customer_name}（{line_display_name}）"
+                else:
+                    display_name = customer_name
+
+                detail_text = (
+                    "已為您完成預約，請準時報到。\n"
+                    f"姓名：{display_name}\n"
+                    f"時段：{display_date} {time_str}"
+                )
+
+                buttons_template = ButtonsTemplate(
+                    title="診所位置",
+                    text="如需導航，請點選下方按鈕。",
+                    actions=[
+                        MessageAction(label="位置導航", text="查詢診所位置")
+                    ],
+                )
+
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[
+                            TextMessage(text=detail_text),
+                            TemplateMessage(
+                                alt_text="診所位置導航",
+                                template=buttons_template,
+                            ),
+                        ],
+                    )
+                )
+                return
+
+            except Exception as e:
+                app.logger.error(f"建立 Bookings 預約失敗: {e}")
+                reply_text = "未成功預約，請重新操作"
+
+        else:
+            reply_text = "格式：確認預約 YYYY-MM-DD HH:MM"
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply_text)],
+            )
+        )
+        return
+    
+    # === 約診查詢 ===
+    elif text == "約診查詢":
+        return flow_query_next_appointment(event, text)
+
+    # === ⑤-1 取消約診 ===
+    elif text.startswith("取消約診"):
+        return flow_cancel_request(event, text)
+
+    # === ⑤-2 確認取消 ===
+    elif text.startswith("確認取消"):
+        return flow_confirm_cancel(event, text)
+
+    # === ⑦ 確認回診 ===
+    elif text.startswith("確認回診"):
+        return flow_confirm_visit(event, text)
+
+    # === 查詢診所位置 ===
+    elif text == "查詢診所位置":
+        location_message = LocationMessage(
+            title=CLINIC_NAME,
+            address=CLINIC_ADDRESS,
+            latitude=CLINIC_LAT,
+            longitude=CLINIC_LNG
+        )
+        line_bot_api.reply_message(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[location_message])
+        )
+        return
+
+    # === 診所資訊 ===
+    elif text == "診所資訊":
+        short_text = f"地址：{CLINIC_ADDRESS}\n點擊下方查看地圖位置"
+
+        clinic_info_template = ButtonsTemplate(
+            thumbnail_image_url=CLINIC_IMAGE_URL,
+            title=CLINIC_NAME,
+            text=short_text,
+            actions=[MessageAction(label="查看地圖位置", text="查看地圖位置")]
+        )
+
+        opening_hours_message = TextMessage(
+            text=(
+                "門診時間：\n"
+                "週一～週六\n"
+                "早診 09:00–12:00\n"
+                "午診 14:00–17:00\n"
+                "晚診 18:00–21:00"
+            )
+        )
+
+        location_message = LocationMessage(
+            title=CLINIC_NAME,
+            address=CLINIC_ADDRESS,
+            latitude=CLINIC_LAT,
+            longitude=CLINIC_LNG
+        )
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[
+                    TemplateMessage(alt_text="診所資訊", template=clinic_info_template),
+                    opening_hours_message,
+                    location_message
+                ]
+            )
+        )
+        return
+
+    # === 查看地圖位置 ===
+    elif text == "查看地圖位置":
+        location_message = LocationMessage(
+            title=CLINIC_NAME,
+            address=CLINIC_ADDRESS,
+            latitude=CLINIC_LAT,
+            longitude=CLINIC_LNG
+        )
+        line_bot_api.reply_message(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[location_message])
+        )
+        return
+
+    # === 其他訊息 ===
+    else:
+        app.logger.info("非線上約診相關指令，請聯繫客服")
+
+# === PostbackEvent Handler：處理取消約診 / 確認取消 / 確認回診的按鈕 ===
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    data = event.postback.data or ""
+    app.logger.info(f"收到 Postback data: {data}")
+
+    # ① 按下「取消約診」按鈕（從約診查詢畫面）
+    if data.startswith("CANCEL_APPT:"):
+        appt_id = data.split(":", 1)[1].strip()
+        # 用假的 text 丟回原本的 flow，沿用同一套邏輯
+        fake_text = f"取消約診 {appt_id}"
+        return flow_cancel_request(event, fake_text)
+
+    # ② 按下「確認取消」按鈕（第二階段確認）
+    elif data.startswith("CONFIRM_CANCEL:"):
+        appt_id = data.split(":", 1)[1].strip()
+        fake_text = f"確認取消 {appt_id}"
+        return flow_confirm_cancel(event, fake_text)
+
+    # ③ 按下「確認回診」按鈕
+    elif data.startswith("CONFIRM_APPT:"):
+        appt_id = data.split(":", 1)[1].strip()
+        fake_text = f"確認回診 {appt_id}"
+        return flow_confirm_visit(event, fake_text)
+
+    # 其他沒處理到的 Postback 先記 log
+    else:
+        app.logger.warning(f"未處理的 Postback data: {data}")
+        return
+
 
 
 if __name__ == "__main__":
