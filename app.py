@@ -30,6 +30,7 @@ import certifi
 import os
 import requests
 import base64
+import json
 
 
 app = Flask(__name__)
@@ -68,6 +69,16 @@ GRAPH_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
 ZENDESK_SUBDOMAIN = "con-nwdemo" 
 ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL") or "tech_support@newwave.tw"
 ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")  
+
+# ===================== Zendesk 自訂欄位 ID =====================
+ZENDESK_CF_BOOKING_ID = 14459987905295          # Booking ID (Text)
+ZENDESK_CF_APPOINTMENT_DATE = 14460045495695    # Appointment Date (Date)
+ZENDESK_CF_APPOINTMENT_TIME = 14460068239631    # Appointment Time (Text)
+ZENDESK_CF_REMINDER_STATE = 14460033600271      # Reminder State (Dropdown)
+ZENDESK_CF_REMINDER_ATTEMPTS = 14460034088591   # Reminder Attempts (Number)
+ZENDESK_CF_LAST_CALL_ID = 14460059835279        # Last Call Id (備用)
+
+ZENDESK_APPOINTMENT_FORM_ID=14460691929743
 
 
 # ======== 預約時段相關設定（之後要改時段只改這裡） ========
@@ -224,14 +235,13 @@ def create_zendesk_user(line_user_id: str, name: str, phone: str):
 # =========================================================================
 #  Zendesk 核心功能：預約 Ticket 建立
 # =========================================================================
-
 def create_zendesk_appointment_ticket(
     booking_id: str,
     local_start_dt: datetime,
-    zendesk_customer_id: int, 
+    zendesk_customer_id: int,
     customer_name: str,
     booking_service_name: str = "一般門診",
-): 
+):
     """
     在 Zendesk 內建立一個新的 Ticket，作為預約確認提醒的排程觸發點。
     
@@ -241,31 +251,27 @@ def create_zendesk_appointment_ticket(
         zendesk_customer_id: 該客戶在 Zendesk 內的 ID (Requester ID，整數)。
         customer_name: 客戶姓名 (字串)。
         booking_service_name: 預約服務名稱 (字串)。
-
-    Returns:
-        成功建立的 Ticket JSON (字典)，失敗返回 None。
     """
     # 檢查必要的全域變數是否存在
     try:
-        # 使用 ZENDESK_SUBDOMAIN 和 ZENDESK_API_TOKEN
         base_url: str = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
-        # 確保 APPOINTMENT_DURATION_MINUTES 存在
         duration_minutes: int = APPOINTMENT_DURATION_MINUTES
-        
-        # 預先計算結束時間
         local_end_dt: datetime = local_start_dt + timedelta(minutes=duration_minutes)
     except NameError as e:
-        app.logger.error(f"Zendesk 全域變數未定義 (例如 {e})，無法建立 Ticket。請檢查 ZENDESK_SUBDOMAIN 或 APPOINTMENT_DURATION_MINUTES。")
+        app.logger.error(
+            f"Zendesk 全域變數未定義 (例如 {e})，無法建立 Ticket。"
+            "請檢查 ZENDESK_SUBDOMAIN 或 APPOINTMENT_DURATION_MINUTES。"
+        )
         return None
     except Exception:
-        # 如果 APPOINTMENT_DURATION_MINUTES 有問題，使用預設值
-        app.logger.warning("APPOINTMENT_DURATION_MINUTES 定義有誤或缺失，使用預設 30 分鐘計算結束時間。")
+        app.logger.warning(
+            "APPOINTMENT_DURATION_MINUTES 定義有誤或缺失，使用預設 30 分鐘計算結束時間。"
+        )
         local_end_dt: datetime = local_start_dt + timedelta(minutes=30)
-    
-    
+
     url: str = f"{base_url}/api/v2/tickets.json"
 
-    # 使用您函式中的認證方式 (使用 ZENDESK_EMAIL / ZENDESK_API_TOKEN)
+    # Zendesk API 認證
     auth_str: str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
     auth_bytes: bytes = auth_str.encode("utf-8")
     auth_header: str = base64.b64encode(auth_bytes).decode("utf-8")
@@ -274,53 +280,182 @@ def create_zendesk_appointment_ticket(
         "Authorization": f"Basic {auth_header}",
         "Content-Type": "application/json",
     }
-    
-    # 1. 建立 Ticket 內容
-    ticket_subject: str = f"【預約提醒】{customer_name}，將於 {local_start_dt.strftime('%Y/%m/%d %H:%M')} 看診"
+
+    # ====== 1. 組 subject / body（保留你原本的文案） ======
+    ticket_subject: str = (
+        f"【預約提醒】{customer_name}，將於 "
+        f"{local_start_dt.strftime('%Y/%m/%d %H:%M')} 看診"
+    )
+
     ticket_body: str = (
-        f"這是一個由 LINE Bot 自動建立的預約提醒 Ticket。\n"
-        f"🚨 請在 **預約日期前 3 天** 確認此 Ticket 狀態。\n\n"
-        f"--- 預約細節 ---\n"
+        "這是由 LINE Bot 自動建立的預約提醒 Ticket。\n"
+        "請在 **預約日期前 3 天** 確認此 Ticket 狀態。\n\n"
+        "--- 預約資料 ---\n"
         f"Bookings ID: {booking_id}\n"
         f"客戶 ID (Zendesk): {zendesk_customer_id}\n"
-        f"預約時間: {local_start_dt.strftime('%Y/%m/%d %H:%M')} (UTC+8) - {local_end_dt.strftime('%H:%M')}\n"
+        f"預約時間: {local_start_dt.strftime('%Y/%m/%d %H:%M')}  ～ "
+        f"{local_end_dt.strftime('%H:%M')}\n"
         f"服務項目: {booking_service_name}\n\n"
-        f"--- 提醒流程 ---\n"
-        f"如果到期時，Bookings 備註內『尚未』包含 'Confirmed via LINE'，"
-        f"則需要手動或透過 Zendesk Trigger 通知 LINE Bot 進行回呼確認。"
+        "--- 提醒流程 ---\n"
+        "如果到期時，Bookings 備註內『尚未』顯示 'Confirmed via LINE'，"
+        "則需要通知 LINE Bot 進行回呼確認。"
     )
+
+    # ====== 2. 準備 custom_fields 的值 ======
+    # Date 欄位：YYYY-MM-DD
+    appt_date_str: str = local_start_dt.strftime("%Y-%m-%d")
+    # Time 欄位：HH:MM（文字）
+    appt_time_str: str = local_start_dt.strftime("%H:%M")
+
+    custom_fields = [
+        # Booking ID（文字欄位）
+        {"id": ZENDESK_CF_BOOKING_ID, "value": booking_id},
+        # 預約日期（date 欄位：YYYY-MM-DD）
+        {"id": ZENDESK_CF_APPOINTMENT_DATE, "value": appt_date_str},
+        # 預約時間（文字欄位）
+        {"id": ZENDESK_CF_APPOINTMENT_TIME, "value": appt_time_str},
+        # 提醒狀態（dropdown：預設 pending）
+        {"id": ZENDESK_CF_REMINDER_STATE, "value": "pending"},
+        # 提醒次數（integer：預設 0）
+        {"id": ZENDESK_CF_REMINDER_ATTEMPTS, "value": 0},
+        # 最後一次外呼的 call id（目前沒有就先給空字串）
+        {"id": ZENDESK_CF_LAST_CALL_ID, "value": ""},  # 之後有外呼再更新
+    ]
 
     payload: dict = {
         "ticket": {
+            # 🆕 指定這張票要用哪個表單
+            "ticket_form_id": ZENDESK_APPOINTMENT_FORM_ID,
+
             "subject": ticket_subject,
-            "comment": {
-                "body": ticket_body,
-            },
-            # 這是關鍵：將 Ticket 歸屬於該 Zendesk Customer ID
+            "comment": {"body": ticket_body},
             "requester_id": zendesk_customer_id,
-            # 初始狀態設為 Pending，代表待處理/待確認
             "status": "pending",
-            # 設定 Tag，方便 Zendesk Trigger 識別這是 LINE Bot 預約提醒
             "tags": ["line_bot_appointment", "pending_confirmation", "booking_sync"],
+            "custom_fields": custom_fields,
         }
     }
 
-    # 2. 呼叫 Zendesk API
+    # ====== 3. 呼叫 Zendesk API 建立 Ticket ======
     try:
+        app.logger.info(
+            f"ZENDESK TICKET PAYLOAD: {json.dumps(payload, ensure_ascii=False)}"
+        )
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        resp.raise_for_status()  # 處理 HTTP 錯誤
-        ticket_id: int = resp.json().get('ticket', {}).get('id')
+        resp.raise_for_status()
+        ticket = resp.json().get("ticket", {})
+        ticket_id: int = ticket.get("id")
         app.logger.info(f"Zendesk Ticket 建立成功，ID: {ticket_id}")
         return resp.json()
     except requests.exceptions.HTTPError as e:
-        # 使用 app.logger 記錄錯誤
         app.logger.error(f"Zendesk Ticket 建立失敗，HTTP 錯誤: {e.response.status_code}")
         app.logger.error(f"Zendesk 錯誤回應: {e.response.text}")
         return None
     except Exception as e:
-        # 使用 app.logger 記錄其他錯誤
         app.logger.error(f"Zendesk Ticket 建立過程中發生未知錯誤: {e}")
         return None
+
+
+
+
+# def create_zendesk_appointment_ticket(
+#     booking_id: str,
+#     local_start_dt: datetime,
+#     zendesk_customer_id: int, 
+#     customer_name: str,
+#     booking_service_name: str = "一般門診",
+# ): 
+#     """
+#     在 Zendesk 內建立一個新的 Ticket，作為預約確認提醒的排程觸發點。
+    
+#     Args:
+#         booking_id: Microsoft Bookings 的 appointment ID (字串)。
+#         local_start_dt: 預約的台北時間 (datetime 物件)。
+#         zendesk_customer_id: 該客戶在 Zendesk 內的 ID (Requester ID，整數)。
+#         customer_name: 客戶姓名 (字串)。
+#         booking_service_name: 預約服務名稱 (字串)。
+
+#     Returns:
+#         成功建立的 Ticket JSON (字典)，失敗返回 None。
+#     """
+#     # 檢查必要的全域變數是否存在
+#     try:
+#         # 使用 ZENDESK_SUBDOMAIN 和 ZENDESK_API_TOKEN
+#         base_url: str = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
+#         # 確保 APPOINTMENT_DURATION_MINUTES 存在
+#         duration_minutes: int = APPOINTMENT_DURATION_MINUTES
+        
+#         # 預先計算結束時間
+#         local_end_dt: datetime = local_start_dt + timedelta(minutes=duration_minutes)
+#     except NameError as e:
+#         app.logger.error(f"Zendesk 全域變數未定義 (例如 {e})，無法建立 Ticket。請檢查 ZENDESK_SUBDOMAIN 或 APPOINTMENT_DURATION_MINUTES。")
+#         return None
+#     except Exception:
+#         # 如果 APPOINTMENT_DURATION_MINUTES 有問題，使用預設值
+#         app.logger.warning("APPOINTMENT_DURATION_MINUTES 定義有誤或缺失，使用預設 30 分鐘計算結束時間。")
+#         local_end_dt: datetime = local_start_dt + timedelta(minutes=30)
+    
+    
+#     url: str = f"{base_url}/api/v2/tickets.json"
+
+#     # 使用您函式中的認證方式 (使用 ZENDESK_EMAIL / ZENDESK_API_TOKEN)
+#     auth_str: str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
+#     auth_bytes: bytes = auth_str.encode("utf-8")
+#     auth_header: str = base64.b64encode(auth_bytes).decode("utf-8")
+
+#     headers: dict = {
+#         "Authorization": f"Basic {auth_header}",
+#         "Content-Type": "application/json",
+#     }
+    
+#     # 1. 建立 Ticket 內容
+#     ticket_subject: str = f"【預約提醒】{customer_name}，將於 {local_start_dt.strftime('%Y/%m/%d %H:%M')} 看診"
+#     ticket_body: str = (
+#         f"這是一個由 LINE Bot 自動建立的預約提醒 Ticket。\n"
+#         f"🚨 請在 **預約日期前 3 天** 確認此 Ticket 狀態。\n\n"
+#         f"--- 預約細節 ---\n"
+#         f"Bookings ID: {booking_id}\n"
+#         f"客戶 ID (Zendesk): {zendesk_customer_id}\n"
+#         f"預約時間: {local_start_dt.strftime('%Y/%m/%d %H:%M')} (UTC+8) - {local_end_dt.strftime('%H:%M')}\n"
+#         f"服務項目: {booking_service_name}\n\n"
+#         f"--- 提醒流程 ---\n"
+#         f"如果到期時，Bookings 備註內『尚未』包含 'Confirmed via LINE'，"
+#         f"則需要手動或透過 Zendesk Trigger 通知 LINE Bot 進行回呼確認。"
+#     )
+
+#     payload: dict = {
+#         "ticket": {
+#             "subject": ticket_subject,
+#             "comment": {
+#                 "body": ticket_body,
+#             },
+#             # 這是關鍵：將 Ticket 歸屬於該 Zendesk Customer ID
+#             "requester_id": zendesk_customer_id,
+#             # 初始狀態設為 Pending，代表待處理/待確認
+#             "status": "pending",
+#             # 設定 Tag，方便 Zendesk Trigger 識別這是 LINE Bot 預約提醒
+#             "tags": ["line_bot_appointment", "pending_confirmation", "booking_sync"],
+#         }
+#     }
+
+#     # 2. 呼叫 Zendesk API
+#     try:
+#         resp = requests.post(url, headers=headers, json=payload, timeout=10)
+#         resp.raise_for_status()  # 處理 HTTP 錯誤
+#         ticket_id: int = resp.json().get('ticket', {}).get('id')
+#         app.logger.info(f"Zendesk Ticket 建立成功，ID: {ticket_id}")
+#         return resp.json()
+#     except requests.exceptions.HTTPError as e:
+#         # 使用 app.logger 記錄錯誤
+#         app.logger.error(f"Zendesk Ticket 建立失敗，HTTP 錯誤: {e.response.status_code}")
+#         app.logger.error(f"Zendesk 錯誤回應: {e.response.text}")
+#         return None
+#     except Exception as e:
+#         # 使用 app.logger 記錄其他錯誤
+#         app.logger.error(f"Zendesk Ticket 建立過程中發生未知錯誤: {e}")
+#         return None
+    
+
     
 # --- 輔助函式：取得指定日期所有預約 (實際呼叫 Graph API) ---
 def list_appointments_for_date(date_str: str) -> list:
