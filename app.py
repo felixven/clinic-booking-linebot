@@ -80,6 +80,8 @@ ZENDESK_CF_LAST_CALL_ID = 14460059835279        # Last Call Id (備用)
 
 ZENDESK_APPOINTMENT_FORM_ID=14460691929743
 
+ZENDESK_REMINDER_STATE_CANCELLED = "已取消預約"
+
 
 # ======== 預約時段相關設定（之後要改時段只改這裡） ========
 SLOT_START = "09:00"             # 看診起始時間（第一個）
@@ -144,6 +146,84 @@ def get_graph_token():
     return resp.json()["access_token"]
 
 # ===================== Zendesk Helper：用 line_user_id 查使用者 =====================
+
+def _build_zendesk_headers() -> tuple[str, dict]:
+    
+    """
+    回傳 (base_url, headers)
+    """
+    base_url: str = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
+    auth_str: str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
+    auth_bytes: bytes = auth_str.encode("utf-8")
+    auth_header: str = base64.b64encode(auth_bytes).decode("utf-8")
+
+    headers: dict = {
+        "Authorization": f"Basic {auth_header}",
+        "Content-Type": "application/json",
+    }
+    return base_url, headers
+
+def create_zendesk_user(line_user_id: str, name: str, phone: str):
+    """
+    建立 Zendesk end-user，並寫入 user_fields.line_user_id。
+
+    流程：
+      1. 先檢查是否已有此 line_user_id 的使用者 → 有則直接回傳
+      2. 若沒有 → 建立新的 user（含 name / phone / user_fields.line_user_id）
+    """
+    if not line_user_id:
+        app.logger.warning("[create_zendesk_user] 缺少 line_user_id，略過建立 Zendesk user")
+        return None
+
+    # 1) 先搜是否已有使用者
+    try:
+        count, existing_user = search_zendesk_user_by_line_id(line_user_id)
+    except Exception as e:
+        app.logger.error(f"[create_zendesk_user] 搜尋 line_user_id 時發生錯誤: {e}")
+        existing_user = None
+
+    if existing_user:
+        app.logger.info(
+            f"[create_zendesk_user] 已存在對應的 Zendesk user, id={existing_user.get('id')}"
+        )
+        return existing_user
+
+    # 2) 沒有舊資料 → 建立新 user
+    base_url, headers = _build_zendesk_headers()  # ⬅️ 新版！統一認證
+
+    url = f"{base_url}/api/v2/users.json"
+
+    # Field key 要和 Zendesk user field 一致（line_user_id）
+    payload = {
+        "user": {
+            "name": name,
+            "role": "end-user",
+            "phone": phone,
+            "verified": True,  # 讓使用者不會 pending verification
+            "user_fields": {
+                "line_user_id": line_user_id
+            }
+        }
+    }
+
+    app.logger.info(
+        f"[create_zendesk_user] 建立新 Zendesk user, name={name}, phone={phone}, line_user_id={line_user_id}"
+    )
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.error(f"[create_zendesk_user] 呼叫 Zendesk API 建立 user 失敗: {e}")
+        return None
+
+    data = resp.json()
+    user = data.get("user") or {}
+
+    app.logger.info(f"[create_zendesk_user] 建立成功, id={user.get('id')}")
+    return user
+
+
 def search_zendesk_user_by_line_id(line_user_id: str):
     """
     給一個 LINE userId，去 Zendesk 搜尋 user_fields.line_user_id = 這個值 的使用者。
@@ -155,18 +235,9 @@ def search_zendesk_user_by_line_id(line_user_id: str):
     if not line_user_id:
         return 0, None
 
-    base_url: str = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
+    # 共用 helper 拿 base_url + headers
+    base_url, headers = _build_zendesk_headers()
     search_url: str = f"{base_url}/api/v2/search.json"
-
-    # Zendesk API 認證： email/token:API_TOKEN 做 Basic Auth
-    auth_str: str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
-    auth_bytes: bytes = auth_str.encode("utf-8")
-    auth_header: str = base64.b64encode(auth_bytes).decode("utf-8")
-
-    headers: dict = {
-        "Authorization": f"Basic {auth_header}",
-        "Content-Type": "application/json",
-    }
 
     # query 語法：type:user line_user_id:<xxx>
     params: dict = {
@@ -189,47 +260,9 @@ def search_zendesk_user_by_line_id(line_user_id: str):
     else:
         # 0 筆 或 >1 筆（應該不會 >1）
         return count, None
+    
 
-def create_zendesk_user(line_user_id: str, name: str, phone: str):
-    """
-    用姓名 / 手機 / line_user_id 在 Zendesk 建立一個 end-user。
-    成功時回傳 user dict，失敗時回傳 None。
-    """
-    base_url: str = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
-    url: str = f"{base_url}/api/v2/users.json"
 
-    auth_str: str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
-    auth_bytes: bytes = auth_str.encode("utf-8")
-    auth_header: str = base64.b64encode(auth_bytes).decode("utf-8")
-
-    headers: dict = {
-        "Authorization": f"Basic {auth_header}",
-        "Content-Type": "application/json",
-    }
-
-    payload: dict = {
-        "user": {
-            "name": name,
-            "phone": phone,
-            "role": "end-user",
-            "verified": True,
-            "user_fields": {
-                "line_user_id": line_user_id
-            }
-        }
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        resp.raise_for_status()
-    except Exception as e:
-        app.logger.error(f"建立 Zendesk 使用者失敗: {e}")
-        return None
-
-    data: dict = resp.json()
-    user: dict = data.get("user")
-    app.logger.info(f"已建立 Zendesk 使用者 id={user.get('id') if user else 'N/A'}")
-    return user
 
 
 # =========================================================================
@@ -244,23 +277,15 @@ def create_zendesk_appointment_ticket(
 ):
     """
     在 Zendesk 內建立一個新的 Ticket，作為預約確認提醒的排程觸發點。
-    
-    Args:
-        booking_id: Microsoft Bookings 的 appointment ID (字串)。
-        local_start_dt: 預約的台北時間 (datetime 物件)。
-        zendesk_customer_id: 該客戶在 Zendesk 內的 ID (Requester ID，整數)。
-        customer_name: 客戶姓名 (字串)。
-        booking_service_name: 預約服務名稱 (字串)。
     """
-    # 檢查必要的全域變數是否存在
+    # 先處理時間相關（不用在這裡組 base_url 了）
     try:
-        base_url: str = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
         duration_minutes: int = APPOINTMENT_DURATION_MINUTES
         local_end_dt: datetime = local_start_dt + timedelta(minutes=duration_minutes)
     except NameError as e:
         app.logger.error(
             f"Zendesk 全域變數未定義 (例如 {e})，無法建立 Ticket。"
-            "請檢查 ZENDESK_SUBDOMAIN 或 APPOINTMENT_DURATION_MINUTES。"
+            "請檢查 APPOINTMENT_DURATION_MINUTES。"
         )
         return None
     except Exception:
@@ -269,19 +294,11 @@ def create_zendesk_appointment_ticket(
         )
         local_end_dt: datetime = local_start_dt + timedelta(minutes=30)
 
+    # 共用 helper 拿 base_url + headers
+    base_url, headers = _build_zendesk_headers()
     url: str = f"{base_url}/api/v2/tickets.json"
 
-    # Zendesk API 認證
-    auth_str: str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
-    auth_bytes: bytes = auth_str.encode("utf-8")
-    auth_header: str = base64.b64encode(auth_bytes).decode("utf-8")
-
-    headers: dict = {
-        "Authorization": f"Basic {auth_header}",
-        "Content-Type": "application/json",
-    }
-
-    # ====== 1. 組 subject / body（保留你原本的文案） ======
+    # ====== 1. 組 subject / body ======
     ticket_subject: str = (
         f"【預約提醒】{customer_name}，將於 "
         f"{local_start_dt.strftime('%Y/%m/%d %H:%M')} 看診"
@@ -301,32 +318,23 @@ def create_zendesk_appointment_ticket(
         "則需要通知 LINE Bot 進行回呼確認。"
     )
 
-    # ====== 2. 準備 custom_fields 的值 ======
-    # Date 欄位：YYYY-MM-DD
+    # ====== 2. custom_fields ======
     appt_date_str: str = local_start_dt.strftime("%Y-%m-%d")
-    # Time 欄位：HH:MM（文字）
     appt_time_str: str = local_start_dt.strftime("%H:%M")
 
     custom_fields = [
-        # Booking ID（文字欄位）
         {"id": ZENDESK_CF_BOOKING_ID, "value": booking_id},
-        # 預約日期（date 欄位：YYYY-MM-DD）
         {"id": ZENDESK_CF_APPOINTMENT_DATE, "value": appt_date_str},
-        # 預約時間（文字欄位）
         {"id": ZENDESK_CF_APPOINTMENT_TIME, "value": appt_time_str},
-        # 提醒狀態（dropdown：預設 pending）
         {"id": ZENDESK_CF_REMINDER_STATE, "value": "pending"},
-        # 提醒次數（integer：預設 0）
         {"id": ZENDESK_CF_REMINDER_ATTEMPTS, "value": 0},
-        # 最後一次外呼的 call id（目前沒有就先給空字串）
-        {"id": ZENDESK_CF_LAST_CALL_ID, "value": ""},  # 之後有外呼再更新
+        {"id": ZENDESK_CF_LAST_CALL_ID, "value": ""},
     ]
 
     payload: dict = {
         "ticket": {
-            # 🆕 指定這張票要用哪個表單
+            # ✅ 指定使用「預約專用 Form」
             "ticket_form_id": ZENDESK_APPOINTMENT_FORM_ID,
-
             "subject": ticket_subject,
             "comment": {"body": ticket_body},
             "requester_id": zendesk_customer_id,
@@ -336,7 +344,7 @@ def create_zendesk_appointment_ticket(
         }
     }
 
-    # ====== 3. 呼叫 Zendesk API 建立 Ticket ======
+    # ====== 3. 呼叫 Zendesk API ======
     try:
         app.logger.info(
             f"ZENDESK TICKET PAYLOAD: {json.dumps(payload, ensure_ascii=False)}"
@@ -354,6 +362,197 @@ def create_zendesk_appointment_ticket(
     except Exception as e:
         app.logger.error(f"Zendesk Ticket 建立過程中發生未知錯誤: {e}")
         return None
+    
+def find_zendesk_ticket_by_booking_id(booking_id):
+    """
+    給一個 Bookings appointment 的 booking_id，
+    到 Zendesk 找對應的 Ticket（看 custom_field_XXXXX 裡的值）。
+
+    回傳：
+        - 有找到：回傳那一筆 ticket (dict)
+        - 沒找到：回傳 None
+    """
+    if not booking_id:
+        app.logger.warning("[find_zendesk_ticket_by_booking_id] 缺少 booking_id，略過搜尋")
+        return None
+
+    base_url, headers = _build_zendesk_headers()
+
+    # 這裡用 custom_field_<ticket_field_id>:<value> 的新寫法
+    # ZENDESK_CF_BOOKING_ID 是你的 ticket field id（例如 14459987905295）
+    field_key = "custom_field_%s" % ZENDESK_CF_BOOKING_ID
+
+    # booking_id 裡面有 = 等字元，包成雙引號比較安全
+    query = 'type:ticket %s:"%s"' % (field_key, booking_id)
+
+    search_url = "%s/api/v2/search.json" % base_url
+    params = {"query": query}
+
+    try:
+        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.error(f"[find_zendesk_ticket_by_booking_id] 呼叫 Zendesk Search 失敗: {e}")
+        return None
+
+    data = resp.json()
+    results = data.get("results") or []
+    count = data.get("count", 0)
+
+    app.logger.info(
+        "[find_zendesk_ticket_by_booking_id] STATUS=%s, URL=%s, count=%s"
+        % (resp.status_code, resp.url, count)
+    )
+
+    if not results:
+        app.logger.info(
+            "[find_zendesk_ticket_by_booking_id] 找不到 booking_id=%s 的 ticket" % booking_id
+        )
+        return None
+
+    if len(results) > 1:
+        app.logger.warning(
+            "[find_zendesk_ticket_by_booking_id] 找到多筆 booking_id=%s 的 ticket，先取第一筆 id=%s"
+            % (booking_id, results[0].get("id"))
+        )
+
+    return results[0]
+
+
+    
+# def find_zendesk_ticket_by_booking_id(booking_id):
+#     """
+#     用 Booking ID 在 Zendesk 找對應的 ticket。
+#     - 找到：回傳該 ticket (dict)
+#     - 找不到：回傳 None
+#     """
+#     if not booking_id:
+#         app.logger.warning("[find_zendesk_ticket_by_booking_id] 缺 booking_id，直接回 None")
+#         return None
+
+#     base_url, headers = _build_zendesk_headers()
+#     search_url = f"{base_url}/api/v2/search.json"
+
+#     # ⚠️ 這裡的 cf_booking_id 要對應你 Zendesk Ticket Field 的「field key」
+#     query = f"type:ticket cf_booking_id:{booking_id}"
+#     params = {"query": query}
+
+#     try:
+#         resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+#         app.logger.info(
+#             f"[find_zendesk_ticket_by_booking_id] STATUS={resp.status_code}, URL={resp.url}"
+#         )
+#         resp.raise_for_status()
+#     except Exception as e:
+#         app.logger.error(f"[find_zendesk_ticket_by_booking_id] 呼叫 Zendesk API 失敗: {e}")
+#         return None
+
+#     data = resp.json()
+#     results = data.get("results") or []
+#     count = data.get("count", 0)
+
+#     # 沒找到
+#     if count == 0:
+#         app.logger.info(
+#             f"[find_zendesk_ticket_by_booking_id] 找不到 booking_id={booking_id} 的 ticket"
+#         )
+#         return None
+
+#     # 多筆 → 你應該只會有一筆，但如果有，先取第一筆
+#     if count > 1:
+#         app.logger.warning(
+#             f"[find_zendesk_ticket_by_booking_id] booking_id={booking_id} 命中了 {count} 筆，取第一筆"
+#         )
+
+#     return results[0]
+
+
+def mark_zendesk_ticket_confirmed(ticket_id: int):
+    """
+    使用者完成「確認回診」後，更新對應的 Zendesk ticket：
+
+      - 將 reminder_state 改成 success
+      - 將 ticket 狀態改成 solved
+
+    Args:
+        ticket_id: Zendesk ticket id
+    """
+    if not ticket_id:
+        app.logger.warning("[mark_zendesk_ticket_confirmed] 缺少 ticket_id")
+        return
+
+    base_url, headers = _build_zendesk_headers()
+    url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+
+    payload = {
+        "ticket": {
+            "status": "solved",
+            "custom_fields": [
+                {
+                    "id": ZENDESK_CF_REMINDER_STATE,
+                    "value": "success"
+                }
+            ]
+        }
+    }
+
+    app.logger.info(
+        f"[mark_zendesk_ticket_confirmed] 更新 ticket_id={ticket_id}, payload="
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+    try:
+        resp = requests.put(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        app.logger.info(
+            f"[mark_zendesk_ticket_confirmed] 更新成功 ticket_id={ticket_id}"
+        )
+    except Exception as e:
+        app.logger.error(f"[mark_zendesk_ticket_confirmed] 更新失敗: {e}")
+
+
+def mark_zendesk_ticket_cancelled(ticket_id: int):
+    """
+    使用者「取消約診」後，更新該 ticket 狀態：
+
+      - reminder_state 改成cancelled）
+      - ticket 狀態改成 solved
+
+    Args:
+        ticket_id: Zendesk ticket id
+    """
+    if not ticket_id:
+        app.logger.warning("[mark_zendesk_ticket_cancelled] 缺少 ticket_id")
+        return
+
+    base_url, headers = _build_zendesk_headers()
+    url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+
+    payload = {
+        "ticket": {
+            "status": "solved",
+            "custom_fields": [
+                {
+                    "id": ZENDESK_CF_REMINDER_STATE,
+                    "value": "cancelled"
+                }
+            ]
+        }
+    }
+
+    app.logger.info(
+        f"[mark_zendesk_ticket_cancelled] 更新 ticket_id={ticket_id}, payload="
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+    try:
+        resp = requests.put(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        app.logger.info(
+            f"[mark_zendesk_ticket_cancelled] 更新成功 ticket_id={ticket_id}"
+        )
+    except Exception as e:
+        app.logger.error(f"[mark_zendesk_ticket_cancelled] 更新失敗: {e}")
 
 
 
@@ -1418,16 +1617,24 @@ def flow_cancel_request(event, text: str):
 def flow_confirm_cancel(event, text: str):
     """
     Flow：處理「確認取消 {id}」
-    原本寫在 handle_message 裡 elif text.startswith("確認取消") 的那一段。
+    規則：
+    - 只允許看診日前 ≥ 3 天取消
+    - 成功取消 Bookings 後，同步把對應的 Zendesk ticket 標記為「取消 / 不需再提醒」
     """
     parts = text.split()
     appt_id = parts[1] if len(parts) >= 2 else ""
 
+    # 先拿 LINE userId（如果之後想支援「沒帶 id 的取消」，可以用這個做 fallback）
+    line_user_id = None
+    if event.source and hasattr(event.source, "user_id"):
+        line_user_id = event.source.user_id
+
     if not appt_id:
+        # 目前 UI 設計理論上一定會帶 id，這裡先保守處理
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="要取消的資訊不完整，請重新查詢約診。")]
+                messages=[TextMessage(text="要取消的資訊不完整，請重新透過「約診查詢」進行操作。")]
             )
         )
         return
@@ -1470,6 +1677,24 @@ def flow_confirm_cancel(event, text: str):
         )
         return
 
+    # --- 同步更新 Zendesk ticket：這筆 booking 已經取消，不用再提醒 ---
+    booking_id = appt.get("id") or appt_id
+    if booking_id:
+        try:
+            ticket = find_zendesk_ticket_by_booking_id(booking_id)
+            if ticket:
+                ticket_id = ticket.get("id")
+                mark_zendesk_ticket_cancelled(ticket_id)
+            else:
+                app.logger.info(
+                    f"[flow_confirm_cancel] 找不到對應 booking_id={booking_id} 的 ticket，略過同步。"
+                )
+        except Exception as e:
+            app.logger.error(f"[flow_confirm_cancel] 更新 Zendesk ticket 失敗: {e}")
+    else:
+        app.logger.warning("[flow_confirm_cancel] 這筆 appt 沒有 id，無法同步 Zendesk ticket")
+
+    # === 回覆給使用者 ===
     display_date = local_start.strftime("%Y/%m/%d")
     display_time = local_start.strftime("%H:%M")
     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
@@ -1500,7 +1725,6 @@ def flow_confirm_cancel(event, text: str):
     return
 
 
-
 def flow_confirm_visit(event, text: str):
     """
     Flow：處理「確認回診 {id}」
@@ -1508,13 +1732,27 @@ def flow_confirm_visit(event, text: str):
     - 只允許看診日前 < 3 天確認
     - serviceNotes 已含 CONFIRM_NOTE_KEYWORD → 不再 PATCH，只回「已確認」
     - 第一次確認時，寫入一行 `Confirmed via LINE on ...`
+    並同步更新 Zendesk Ticket 狀態（success + solved）
     """
     parts = text.split(maxsplit=1)
     appt_id = parts[1].strip() if len(parts) >= 2 else ""
 
-    # 沒帶 id → DEMO：抓最近一筆 future 預約
+    # 先拿 LINE userId（給「沒帶 id」的 fallback 用）
+    line_user_id = None
+    if event.source and hasattr(event.source, "user_id"):
+        line_user_id = event.source.user_id
+
+    # 沒帶 id → 用這個 LINE 使用者的最近一筆 future 預約
     if not appt_id:
-        appt, local_start = get_next_upcoming_appointment_for_line_user()
+        if not line_user_id:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="暫時無法取得您的身分，請稍後再試或重新點選「約診查詢」。")]
+                )
+            )
+            return
+        appt, local_start = get_next_upcoming_appointment_for_line_user(line_user_id)
     else:
         appt, local_start = get_appointment_by_id(appt_id)
 
@@ -1594,11 +1832,29 @@ def flow_confirm_visit(event, text: str):
     else:
         merged_notes = new_line
 
+    # 先試著更新 Bookings 備註（失敗只記 log，不擋流程）
     try:
         update_booking_service_notes(appt_id, merged_notes)
     except Exception as e:
         app.logger.error(f"更新 Bookings 備註失敗: {e}")
         # 寫備註失敗不影響使用者體驗，只記 log
+
+    # --- 同步更新 Zendesk ticket 狀態 ---
+    booking_id = appt.get("id")
+    if booking_id:
+        try:
+            ticket = find_zendesk_ticket_by_booking_id(booking_id)
+            if ticket:
+                ticket_id = ticket.get("id")
+                mark_zendesk_ticket_confirmed(ticket_id)
+            else:
+                app.logger.info(
+                    f"[flow_confirm_visit] 找不到對應 booking_id={booking_id} 的 ticket，略過同步。"
+                )
+        except Exception as e:
+            app.logger.error(f"[flow_confirm_visit] 更新 Zendesk ticket 失敗: {e}")
+    else:
+        app.logger.warning("[flow_confirm_visit] 這筆 appt 沒有 id，無法同步 Zendesk ticket")
 
     # ====== 回 LINE 提醒文字＋位置導航按鈕 ======
     detail_text = (
