@@ -8,6 +8,8 @@ list_appointments_for_range,
 parse_booking_datetime_to_local
 )
 
+from config import PROFILE_STATUS_COMPLETE
+
 
 def normalize_phone(phone: str) -> str:
     """
@@ -134,15 +136,11 @@ def get_next_upcoming_appointment_for_line_user(line_user_id: str, max_days: int
 
     local_start, appt = matched[0]
     app.logger.info(
-        f"[get_next_for_line_range] 命中預約 id={appt.get('id')} local_start={local_start}"
+        f"[get_next_for_line_range] 找到預約 id={appt.get('id')} local_start={local_start}"
     )
     return appt, local_start
 
 def is_registered_patient(line_user_id: str) -> bool:
-    """
-    檢查這個 LINE user 在 Zendesk 是否已有病患資料
-    （未來你把 PENDING 拔掉，這裡也不用動邏輯，只改查 Zendesk 的方式就好）
-    """
     if not line_user_id:
         return False
 
@@ -152,4 +150,11 @@ def is_registered_patient(line_user_id: str) -> bool:
         app.logger.error(f"is_registered_patient 查詢 Zendesk 失敗: {e}")
         return False
 
-    return count == 1 and bool(user)
+    if count < 1 or not user:
+        return False
+
+    user_fields = user.get("user_fields") or {}
+    profile_status = user_fields.get("profile_status")
+    phone = user.get("phone") or ""
+
+    return (profile_status == PROFILE_STATUS_COMPLETE) or bool(phone)

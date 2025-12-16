@@ -1,4 +1,6 @@
-from flask import Flask, request, abort
+import requests
+
+from flask import Flask, request, abort,jsonify
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -16,7 +18,7 @@ from linebot.v3.webhooks import (
     PostbackEvent, 
 )
 
-from datetime import datetime, timedelta, date
+from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -34,9 +36,9 @@ from bookings_core import (
 
 from zendesk_core import (
     search_zendesk_user_by_line_id,
-    create_zendesk_user,
     upsert_zendesk_user_basic_profile,
     create_zendesk_appointment_ticket,
+    _build_zendesk_headers
 )
 
 from patient_core import (
@@ -59,7 +61,16 @@ from flows_slots import (
 
 from flows_reminders import(
     run_reminder_check,
+    #run_reminder_check_direct
 )
+
+from queue_core import voice_call_queue
+from flows_voice_calls import process_voice_call_task
+
+# Demo 測試用
+from voice_demo import trigger_voice_demo
+
+from flows_voice_webhook import handle_livehub_webhook
 
 
 app = Flask(__name__)
@@ -79,7 +90,8 @@ from config import (
     ZENDESK_SUBDOMAIN,
     ZENDESK_EMAIL,
     ZENDESK_API_TOKEN,
-    ZENDESK_CF_LINE_USER_ID,
+    ZENDESK_UF_LINE_USER_ID_KEY,
+    ZENDESK_UF_PROFILE_STATUS_KEY,
     ZENDESK_CF_BOOKING_ID,
     ZENDESK_CF_APPOINTMENT_DATE,
     ZENDESK_CF_APPOINTMENT_TIME,
@@ -283,6 +295,8 @@ def handle_message(event: MessageEvent):
                         phone=None,
                         profile_status=PROFILE_STATUS_NEED_PHONE,
                     )
+                    if user and user.get("id"):
+                        state["zendesk_user_id"] = user.get("id")
                     if not user:
                         app.logger.warning("[handle_message] 寫入 Zendesk 姓名失敗，但仍繼續問手機")
                 except Exception as e:
@@ -303,7 +317,7 @@ def handle_message(event: MessageEvent):
             )
             return
 
-                # 0-2. 問手機
+        # 0-2. 問手機
         elif step == "ask_phone":
             phone_raw = text.strip()
             digits = "".join(ch for ch in phone_raw if ch.isdigit())
@@ -320,8 +334,37 @@ def handle_message(event: MessageEvent):
             name = state.get("name") or "未填姓名"
 
             # 寫進 Zendesk：phone + profile_status=complete
+                        # 寫進 Zendesk：phone + profile_status=complete
             user = None
-            if line_user_id_for_state:
+            zendesk_user_id = state.get("zendesk_user_id")
+
+            # ✅ 優先：直接更新剛剛那一筆（不靠 search）
+            if line_user_id_for_state and zendesk_user_id:
+                base_url, headers = _build_zendesk_headers()
+                url = f"{base_url}/api/v2/users/{zendesk_user_id}.json"
+
+                payload = {
+                    "user": {
+                        "name": name,
+                        "phone": digits,
+                        "user_fields": {
+                            ZENDESK_UF_LINE_USER_ID_KEY: line_user_id_for_state,
+                            ZENDESK_UF_PROFILE_STATUS_KEY: PROFILE_STATUS_COMPLETE,
+                        },
+                    }
+                }
+
+                try:
+                    resp = requests.put(url, headers=headers, json=payload, timeout=10)
+                    resp.raise_for_status()
+                    user = (resp.json() or {}).get("user")
+                    app.logger.info(f"[ask_phone] 更新 Zendesk user_id={zendesk_user_id} 成功")
+                except Exception as e:
+                    app.logger.error(f"[ask_phone] 更新 Zendesk user_id={zendesk_user_id} 失敗: {e}")
+                    user = None
+
+            # 🔒 保險：真的失敗才退回 upsert
+            if not user and line_user_id_for_state:
                 try:
                     user = upsert_zendesk_user_basic_profile(
                         line_user_id=line_user_id_for_state,
@@ -332,6 +375,8 @@ def handle_message(event: MessageEvent):
                 except Exception as e:
                     app.logger.error(f"[handle_message] 更新 Zendesk user 手機失敗: {e}")
                     user = None
+
+           
 
             if not user:
                 line_bot_api.reply_message(
@@ -991,7 +1036,6 @@ def handle_message(event: MessageEvent):
                     line_display_name=line_display_name,
                     line_user_id=line_user_id,
                 )
-
                 appt_id = created.get("id", "（沒有取得 ID）")
 
                 try:
@@ -1181,6 +1225,8 @@ def handle_message(event: MessageEvent):
     else:
         app.logger.info("非線上約診相關指令，請聯繫客服")
 
+
+
 @handler.add(PostbackEvent)
 def handle_postback(event):
     data = event.postback.data or ""
@@ -1223,7 +1269,7 @@ def handle_postback(event):
 
 @app.route("/cron/run-reminder", methods=["GET"])
 def cron_run_reminder():
-    days_str = request.args.get("days")  # 例如 ?days=1
+    days_str = request.args.get("days")  # Ex: "?days=1"
     custom_days = None
     if days_str is not None:
         try:
@@ -1233,6 +1279,90 @@ def cron_run_reminder():
 
     count = run_reminder_check(days_before=custom_days)
     return {"status": "ok", "processed": count}, 200
+
+
+@app.route("/demo/voice-call")
+def demo_voice_call():
+    phone = "0988000000"
+    name = "王小明"
+
+    trigger_voice_demo(phone, name)
+
+    return "Voice demo triggered.", 200
+
+
+@app.route("/demo/enqueue-voice-call")
+def demo_enqueue_voice_call():
+    """
+    Demo：手動丟一筆「外撥任務」進 Redis queue，交給 worker_voice.py 處理。
+
+    目前 task 裡的資料是寫死的，
+    未來正式版會從 Booking / Zendesk 撈資料動態塞進去。
+    """
+    task = {
+        "phone": "0903891615",         # 測試時可以改成你自己的手機
+        "patient_name": "王小明",
+        "appointments": [
+            {
+                "booking_id": "DEMO-BOOKING-ID-123",
+                "local_time": "2025-12-20 09:30",
+                "service_name": "一般門診",
+            }
+        ],
+        "zendesk_ticket_id": 1053,
+        "line_user_id": "Uxxxxxxxx",
+        "reminder_type": "D2",
+    }
+
+    job = voice_call_queue.enqueue(
+        process_voice_call_task,
+        task,
+    )
+
+    app.logger.info(f"[VOICE DEMO] 已 enqueue 外撥 job_id={job.id}, task={task}")
+
+    return {
+        "status": "queued",
+        "job_id": job.id,
+        "task": task,
+    }, 200
+
+from queue_core import voice_call_queue
+
+@app.route("/demo/enqueue-voice-call-group")
+def demo_enqueue_voice_call_group():
+    # Demo：同一人同一天的多張票，只打一通
+    line_user_id = "Uxxxx"
+    appt_date_str = "2025-12-17"
+    ticket_ids = [1123,1124]   # 先放你測試用的
+
+    job = voice_call_queue.enqueue(
+        "flows_voice_calls.process_voice_call_group",
+        line_user_id,
+        appt_date_str,
+        ticket_ids
+    )
+    return {
+        "job_id": job.id,
+        "status": job.get_status(),
+        "line_user_id": line_user_id,
+        "appt_date": appt_date_str,
+        "ticket_ids": ticket_ids
+    }, 200
+
+
+
+@app.route("/webhook/livehub", methods=["POST"])
+def webhook_livehub():
+    data = request.get_json(silent=True) or {}
+    app.logger.info(f"[livehub_webhook] received: {data}")
+
+    try:
+        handle_livehub_webhook(data)
+    except Exception as e:
+        app.logger.error(f"[livehub_webhook] handle failed: {e}")
+
+    return jsonify({"status": "ok"}), 200
 
 
 

@@ -27,6 +27,7 @@ from config import (
     ZENDESK_REMINDER_STATE_SUCCESS,
     ZENDESK_REMINDER_STATE_FAILED,
     ZENDESK_REMINDER_STATE_CANCELLED,
+    ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE,
     APPOINTMENT_DURATION_MINUTES,
 
 )
@@ -124,10 +125,150 @@ def create_zendesk_user(line_user_id: str, name: str, phone: str):
     app.logger.info(f"[create_zendesk_user] 建立成功, id={user.get('id')}")
     return user
 
+def get_zendesk_ticket_by_id(ticket_id: int) -> dict | None:
+    base_url, headers = _build_zendesk_headers()
+    url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("ticket")
+    except Exception as e:
+        app.logger.error(f"[get_zendesk_ticket_by_id] failed ticket_id={ticket_id}: {e}")
+        return None
+    
+def extract_phone_from_zendesk_user(user: dict) -> str | None:
+    if not user:
+        return None
+
+    # 最常見：user.phone
+    phone = user.get("phone")
+    if phone:
+        return str(phone).strip()
+
+    # 次常見：user_fields 裡
+    uf = user.get("user_fields") or {}
+    for k in ["phone", "mobile", "mobile_phone", "customer_phone"]:
+        v = uf.get(k)
+        if v:
+            return str(v).strip()
+
+    return None
+
+
+def extract_phone_from_zendesk_user(user: dict) -> str | None:
+    if not user:
+        return None
+
+    # 最常見：user.phone
+    phone = user.get("phone")
+    if phone:
+        return str(phone).strip()
+
+    # 次常見：user_fields 裡
+    uf = user.get("user_fields") or {}
+    for k in ["phone", "mobile", "mobile_phone", "customer_phone"]:
+        v = uf.get(k)
+        if v:
+            return str(v).strip()
+
+    return None
+
+
+# def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profile_status=None):
+#     """
+#     依 line_user_id 建立或更新一個 Zendesk user：
+#     - 若已存在 → 更新 name / phone / profile_status（有給才更新）
+#     - 若不存在 → 建立新的 end-user
+#     回傳 user dict 或 None。
+#     """
+#     if not line_user_id:
+#         app.logger.warning("[upsert_zendesk_user_basic_profile] 缺少 line_user_id")
+#         return None
+
+#     try:
+#         count, user = search_zendesk_user_by_line_id(line_user_id)
+#     except Exception as e:
+#         app.logger.error(f"[upsert_zendesk_user_basic_profile] 搜尋 user 失敗: {e}")
+#         count, user = 0, None
+
+#     base_url, headers = _build_zendesk_headers()
+
+#     # === 已存在 → update ===
+#     if user and count == 1:
+#         user_id = user.get("id")
+#         if not user_id:
+#             return user
+
+#         url = f"{base_url}/api/v2/users/{user_id}.json"
+
+#         user_payload = {}
+#         if name is not None:
+#             user_payload["name"] = name
+#         if phone is not None:
+#             user_payload["phone"] = phone
+
+#         user_fields = user.get("user_fields") or {}
+#         if line_user_id:
+#             user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
+#         if profile_status is not None:
+#             user_fields[ZENDESK_UF_PROFILE_STATUS_KEY] = profile_status
+
+#         if user_fields:
+#             user_payload["user_fields"] = user_fields
+
+#         if not user_payload:
+#             return user  # 沒東西要更新
+
+#         payload = {"user": user_payload}
+
+#         try:
+#             resp = requests.put(url, headers=headers, json=payload, timeout=10)
+#             resp.raise_for_status()
+#             data = resp.json()
+#             updated = data.get("user") or user
+#             app.logger.info(f"[upsert_zendesk_user_basic_profile] 更新 user_id={updated.get('id')} 成功")
+#             return updated
+#         except Exception as e:
+#             app.logger.error(f"[upsert_zendesk_user_basic_profile] 更新 user 失敗: {e}")
+#             return user
+
+#     # === 找不到 → create ===
+#     url = f"{base_url}/api/v2/users.json"
+
+#     user_fields = {}
+#     if line_user_id:
+#         user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
+#     if profile_status is not None:
+#         user_fields[ZENDESK_UF_PROFILE_STATUS_KEY] = profile_status
+
+#     user_body = {
+#         "role": "end-user",
+#         "verified": True,
+#     }
+#     if name is not None:
+#         user_body["name"] = name
+#     if phone is not None:
+#         user_body["phone"] = phone
+#     if user_fields:
+#         user_body["user_fields"] = user_fields
+
+#     payload = {"user": user_body}
+
+#     try:
+#         resp = requests.post(url, headers=headers, json=payload, timeout=10)
+#         resp.raise_for_status()
+#         data = resp.json()
+#         created = data.get("user") or {}
+#         app.logger.info(f"[upsert_zendesk_user_basic_profile] 建立新 user 成功 id={created.get('id')}")
+#         return created
+#     except Exception as e:
+#         app.logger.error(f"[upsert_zendesk_user_basic_profile] 建立 user 失敗: {e}")
+#         return None
+
 def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profile_status=None):
     """
     依 line_user_id 建立或更新一個 Zendesk user：
-    - 若已存在 → 更新 name / phone / profile_status（有給才更新）
+    - 若已存在（count>=1）→ 更新 name / phone / profile_status（有給才更新）
     - 若不存在 → 建立新的 end-user
     回傳 user dict 或 None。
     """
@@ -143,8 +284,8 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
 
     base_url, headers = _build_zendesk_headers()
 
-    # === 已存在 → update ===
-    if user and count == 1:
+    # ✅ 只要找到任一筆，就 update（不要限制 count==1）
+    if user and count >= 1:
         user_id = user.get("id")
         if not user_id:
             return user
@@ -158,6 +299,8 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
             user_payload["phone"] = phone
 
         user_fields = user.get("user_fields") or {}
+
+        # 確保 line_user_id 有寫回去（雖然 fieldvalue 已經能查到，但你欄位還是要正確）
         if line_user_id:
             user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
         if profile_status is not None:
@@ -167,7 +310,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
             user_payload["user_fields"] = user_fields
 
         if not user_payload:
-            return user  # 沒東西要更新
+            return user
 
         payload = {"user": user_payload}
 
@@ -194,6 +337,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
     user_body = {
         "role": "end-user",
         "verified": True,
+        "external_id": line_user_id, 
     }
     if name is not None:
         user_body["name"] = name
@@ -214,6 +358,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
     except Exception as e:
         app.logger.error(f"[upsert_zendesk_user_basic_profile] 建立 user 失敗: {e}")
         return None
+
 
 
 def get_zendesk_user_by_id(user_id: int) -> dict | None:
@@ -296,25 +441,65 @@ def get_line_user_id_from_ticket(ticket: dict, appt: dict | None = None) -> str 
     return None
 
 
+# def search_zendesk_user_by_line_id(line_user_id: str):
+#     """
+#     給一個 LINE userId，去 Zendesk 搜尋 user_fields.line_user_id = 這個值 的使用者。
+
+#     回傳：
+#         - count: 幾筆 (int)
+#         - user: 若 count == 1，回傳那一個 dict，否則 None
+#     """
+#     if not line_user_id:
+#         return 0, None
+
+#     # 共用 helper 拿 base_url + headers
+#     base_url, headers = _build_zendesk_headers()
+#     search_url: str = f"{base_url}/api/v2/search.json"
+
+#     # query 語法：type:user line_user_id:<xxx>
+#     params: dict = {
+#         "query": f"type:user line_user_id:{line_user_id}"
+#     }
+
+#     try:
+#         resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+#         resp.raise_for_status()
+#     except Exception as e:
+#         app.logger.error(f"Zendesk 搜尋失敗: {e}")
+#         return 0, None
+
+#     data: dict = resp.json()
+#     count: int = data.get("count", 0)
+#     results: list = data.get("results") or []
+
+#     if count >= 1 and results:
+#         if count > 1:
+#             app.logger.warning(
+#                 f"[search_zendesk_user_by_line_id] line_user_id={line_user_id} 有 {count} 筆結果，僅使用第一筆 id={results[0].get('id')}"
+#             )
+#         return count, results[0]
+#     # 完全沒有結果
+#     return 0, None
+
 def search_zendesk_user_by_line_id(line_user_id: str):
     """
-    給一個 LINE userId，去 Zendesk 搜尋 user_fields.line_user_id = 這個值 的使用者。
+    給一個 LINE userId，去 Zendesk 搜尋 user_fields 中含有該值的使用者（用 fieldvalue）。
 
     回傳：
         - count: 幾筆 (int)
-        - user: 若 count == 1，回傳那一個 dict，否則 None
+        - user: 若 count >= 1，回傳「挑選後」那一筆 dict，否則 None
     """
     if not line_user_id:
         return 0, None
 
-    # 共用 helper 拿 base_url + headers
     base_url, headers = _build_zendesk_headers()
     search_url: str = f"{base_url}/api/v2/search.json"
 
-    # query 語法：type:user line_user_id:<xxx>
+    # ✅ 改成 fieldvalue:"xxx"
     params: dict = {
-        "query": f"type:user line_user_id:{line_user_id}"
+        "query": f'type:user external_id:"{line_user_id}"'
     }
+
 
     try:
         resp = requests.get(search_url, headers=headers, params=params, timeout=10)
@@ -328,12 +513,25 @@ def search_zendesk_user_by_line_id(line_user_id: str):
     results: list = data.get("results") or []
 
     if count >= 1 and results:
+        # ✅ 若多筆：挑一筆「最像主檔」的
+        def score(u: dict):
+            phone = (u.get("phone") or "").strip()
+            # 有 phone 的優先（通常是 complete 那筆）
+            s = 100 if phone else 0
+            # updated_at 越新越好（字串可比大小，ISO 格式通常OK）
+            s += 1 if u.get("updated_at") else 0
+            return s
+
+        picked = sorted(results, key=score, reverse=True)[0]
+
         if count > 1:
             app.logger.warning(
-                f"[search_zendesk_user_by_line_id] line_user_id={line_user_id} 有 {count} 筆結果，僅使用第一筆 id={results[0].get('id')}"
+                f"[search_zendesk_user_by_line_id] fieldvalue 命中 {count} 筆，"
+                f"picked id={picked.get('id')} (phone={'Y' if (picked.get('phone') or '').strip() else 'N'})"
             )
-        return count, results[0]
-    # 完全沒有結果
+
+        return count, picked
+
     return 0, None
 
     
@@ -652,7 +850,7 @@ def search_zendesk_tickets_for_reminder():
     data = resp.json() or {}
     results = data.get("results") or []
     app.logger.info(
-        f"[search_zendesk_tickets_for_reminder] 命中 {len(results)} 筆候選 ticket（reminder_state = pending）"
+        f"[search_zendesk_tickets_for_reminder] 找到 {len(results)} 筆候選 ticket（reminder_state = pending）"
     )
 
     if results:
@@ -663,3 +861,79 @@ def search_zendesk_tickets_for_reminder():
         )
 
     return results
+
+def mark_zendesk_ticket_voice_attempted(
+    ticket_id: int,
+    call_id: str,
+    call_status: str,
+    attempted_date: str,
+) -> bool:
+    """
+    webhook 回來後更新 Zendesk（v1）：
+    - 防重送：同 call_id 只處理一次
+    - attempts + 1
+    - last_voice_attempt_date = attempted_date (YYYY-MM-DD)
+    - last_call_id = call_id
+    - internal note 留存
+    """
+    if not ticket_id:
+        return False
+
+    base_url, headers = _build_zendesk_headers()
+    url_get = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+    url_put = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+
+    # 1) 先 GET ticket 拿到現有欄位（為了防重送、attempts+1）
+    try:
+        resp = requests.get(url_get, headers=headers, timeout=10)
+        resp.raise_for_status()
+        ticket = resp.json().get("ticket", {})
+    except Exception as e:
+        app.logger.error(f"[mark_voice_attempted] GET ticket failed ticket_id={ticket_id}: {e}")
+        return False
+
+    # 2) 防重送：last_call_id 一樣就跳過
+    last_call_id = _get_ticket_cf_value(ticket, ZENDESK_CF_LAST_CALL_ID, "") or ""
+    if str(last_call_id) == str(call_id):
+        app.logger.info(f"[mark_voice_attempted] duplicate webhook ignored ticket_id={ticket_id} call_id={call_id}")
+        return True
+
+    # 3) attempts + 1
+    attempts = _get_ticket_cf_value(ticket, ZENDESK_CF_REMINDER_ATTEMPTS, 0) or 0
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 0
+    attempts += 1
+
+    note_body = (
+        f"[Voice v1] 已收到 LiveHub 回呼\n"
+        f"- callId: {call_id}\n"
+        f"- status: {call_status}\n"
+        f"- attempted_date: {attempted_date}\n"
+        f"- attempts: {attempts}\n"
+    )
+
+    payload = {
+        "ticket": {
+            "comment": {
+                "body": note_body,
+                "public": False,
+            },
+            "custom_fields": [
+                {"id": ZENDESK_CF_LAST_CALL_ID, "value": str(call_id)},
+                {"id": ZENDESK_CF_REMINDER_ATTEMPTS, "value": attempts},
+                {"id": ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE, "value": attempted_date},
+            ],
+        }
+    }
+
+    try:
+        app.logger.info(f"[mark_voice_attempted] PUT payload={json.dumps(payload, ensure_ascii=False)}")
+        resp2 = requests.put(url_put, headers=headers, json=payload, timeout=10)
+        resp2.raise_for_status()
+        app.logger.info(f"[mark_voice_attempted] updated ticket_id={ticket_id} attempts={attempts}")
+        return True
+    except Exception as e:
+        app.logger.error(f"[mark_voice_attempted] PUT failed ticket_id={ticket_id}: {e}")
+        return False
