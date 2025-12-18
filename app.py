@@ -67,6 +67,8 @@ from flows_reminders import(
 from queue_core import voice_call_queue
 from flows_voice_calls import process_voice_call_task
 
+from flows_voice_scheduler import build_voice_groups_and_enqueue
+
 # Demo 測試用
 from voice_demo import trigger_voice_demo
 
@@ -341,12 +343,14 @@ def handle_message(event: MessageEvent):
             # ✅ 優先：直接更新剛剛那一筆（不靠 search）
             if line_user_id_for_state and zendesk_user_id:
                 base_url, headers = _build_zendesk_headers()
+                app.logger.info(f"[ask_phone] will update zendesk_user_id={zendesk_user_id} line_user_id={line_user_id_for_state}")
                 url = f"{base_url}/api/v2/users/{zendesk_user_id}.json"
 
                 payload = {
                     "user": {
                         "name": name,
                         "phone": digits,
+                        "external_id": line_user_id_for_state,
                         "user_fields": {
                             ZENDESK_UF_LINE_USER_ID_KEY: line_user_id_for_state,
                             ZENDESK_UF_PROFILE_STATUS_KEY: PROFILE_STATUS_COMPLETE,
@@ -356,6 +360,7 @@ def handle_message(event: MessageEvent):
 
                 try:
                     resp = requests.put(url, headers=headers, json=payload, timeout=10)
+                    app.logger.info(f"[ask_phone][PUT] status={resp.status_code} body={resp.text[:300]}")
                     resp.raise_for_status()
                     user = (resp.json() or {}).get("user")
                     app.logger.info(f"[ask_phone] 更新 Zendesk user_id={zendesk_user_id} 成功")
@@ -566,6 +571,14 @@ def handle_message(event: MessageEvent):
                 )
             )
             return
+        
+        app.logger.info(
+        f"[線上約診][debug] line_user_id={line_user_id} count={count} "
+        f"user_none={user is None} user_id={(user or {}).get('id')} "
+        f"uf_line={((user or {}).get('user_fields') or {}).get(ZENDESK_UF_LINE_USER_ID_KEY)} "
+        f"profile_status={((user or {}).get('user_fields') or {}).get(ZENDESK_UF_PROFILE_STATUS_KEY)} "
+        f"name={(user or {}).get('name')} phone={(user or {}).get('phone')}"
+        )
 
                 # 1-3 沒找到或拿不到 user → 視為新病患，啟動首次建檔流程（問姓名）
         if count == 0 or not user:
@@ -597,7 +610,7 @@ def handle_message(event: MessageEvent):
 
         # 1-4 找到一筆 user → 依 profile_status 決定要問什麼
         user_fields = user.get("user_fields") or {}
-        profile_status = user_fields.get("profile_status")
+        profile_status = user_fields.get(ZENDESK_UF_PROFILE_STATUS_KEY)
 
         # 後備判斷：舊資料可能還沒有 profile_status
         if not profile_status:
@@ -610,6 +623,9 @@ def handle_message(event: MessageEvent):
             else:
                 profile_status = PROFILE_STATUS_EMPTY
 
+        phone_raw = (user.get("phone") or "").strip()
+        if not phone_raw:
+            profile_status = PROFILE_STATUS_NEED_PHONE
         # 1-4-1 還沒留任何資料 → 當成新病患，問姓名
         if profile_status == PROFILE_STATUS_EMPTY:
             try:
@@ -644,6 +660,7 @@ def handle_message(event: MessageEvent):
             PENDING_REGISTRATIONS[line_user_id] = {
                 "step": "ask_phone",
                 "name": name,
+                "zendesk_user_id": user.get("id"),
             }
 
             reply_text = (
@@ -666,8 +683,34 @@ def handle_message(event: MessageEvent):
 
         # 1-4-3 已完整建檔 → 老病患流程（沿用你原本的 code）
         if profile_status == PROFILE_STATUS_COMPLETE:
-            name = user.get("name") or "貴賓"
-            phone = user.get("phone") or "（未留電話）"
+            name = (user.get("name") or "貴賓").strip()
+            phone_raw = (user.get("phone") or "").strip()
+
+            # ✅ complete 但 phone 空 → 視為缺手機
+            if not phone_raw:
+                PENDING_REGISTRATIONS[line_user_id] = {
+                    "step": "ask_phone",
+                    "name": name,
+                    "zendesk_user_id": user.get("id"),
+                }
+
+                reply_text = (
+                    f"{name} 您好，系統中已有您的姓名，尚未留下手機號碼。\n"
+                    "請先完成建檔再使用「線上預約」功能\n\n"
+                    "請輸入您的手機號碼（格式：09xxxxxxxx）：\n\n"
+                    "如需取消填寫資料，請輸入「取消建檔」"
+                )
+
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
+                )
+                return
+
+            # phone 有值，才真的放行
+            phone = phone_raw
 
             info_text = (
                 f"{name} 您好，系統中已有您的資料：\n"
@@ -699,6 +742,7 @@ def handle_message(event: MessageEvent):
                 )
             )
             return
+
 
         # 1-5 其他異常狀況（理論上不太會進來）
         warn_text = (
@@ -1327,7 +1371,7 @@ def demo_enqueue_voice_call():
         "task": task,
     }, 200
 
-from queue_core import voice_call_queue
+
 
 @app.route("/demo/enqueue-voice-call-group")
 def demo_enqueue_voice_call_group():
@@ -1363,6 +1407,43 @@ def webhook_livehub():
         app.logger.error(f"[livehub_webhook] handle failed: {e}")
 
     return jsonify({"status": "ok"}), 200
+
+#demo zendesk串到copilot
+@app.route("/demo/enqueue-voice-from-zendesk")
+def demo_enqueue_voice_from_zendesk():
+    # 例：/demo/enqueue-voice-from-zendesk?ticketIds=1123,1124
+    ticket_ids_str = request.args.get("ticketIds", "")
+    ticket_ids = []
+    for x in ticket_ids_str.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ticket_ids.append(int(x))
+
+    if not ticket_ids:
+        return {"error": "missing ticketIds, e.g. ?ticketIds=1123,1124"}, 400
+
+    # 這裡先假設同一人同一天（你目前設計就是 group）
+    line_user_id = "U_demo"  # 先不靠 line_user_id 也沒關係
+    appt_date_str = "unknown"  # 先讓 worker 從 ticket 取日期
+
+    job = voice_call_queue.enqueue(
+        "flows_voice_calls.process_voice_call_demo_from_zendesk",
+        line_user_id,
+        appt_date_str,
+        ticket_ids
+    )
+
+    return {"status": "queued", "job_id": job.id, "ticket_ids": ticket_ids}, 200
+
+
+
+@app.route("/cron/run-voice-reminder", methods=["GET"])
+def cron_run_voice_reminder():
+    # 預設一天前 D1
+    days = int(request.args.get("days", "1"))
+    result = build_voice_groups_and_enqueue(days=days)
+    return result, 200
+
 
 
 

@@ -29,7 +29,6 @@ from config import (
     ZENDESK_REMINDER_STATE_CANCELLED,
     ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE,
     APPOINTMENT_DURATION_MINUTES,
-
 )
 
 from bookings_core import (
@@ -106,8 +105,6 @@ def create_zendesk_user(line_user_id: str, name: str, phone: str):
             },
         }
     }
-
-
     app.logger.info(
         f"[create_zendesk_user] 建立新 Zendesk user, name={name}, phone={phone}, line_user_id={line_user_id}"
     )
@@ -153,26 +150,6 @@ def extract_phone_from_zendesk_user(user: dict) -> str | None:
             return str(v).strip()
 
     return None
-
-
-def extract_phone_from_zendesk_user(user: dict) -> str | None:
-    if not user:
-        return None
-
-    # 最常見：user.phone
-    phone = user.get("phone")
-    if phone:
-        return str(phone).strip()
-
-    # 次常見：user_fields 裡
-    uf = user.get("user_fields") or {}
-    for k in ["phone", "mobile", "mobile_phone", "customer_phone"]:
-        v = uf.get(k)
-        if v:
-            return str(v).strip()
-
-    return None
-
 
 # def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profile_status=None):
 #     """
@@ -298,6 +275,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         if phone is not None:
             user_payload["phone"] = phone
 
+        user_payload["external_id"] = line_user_id
         user_fields = user.get("user_fields") or {}
 
         # 確保 line_user_id 有寫回去（雖然 fieldvalue 已經能查到，但你欄位還是要正確）
@@ -483,50 +461,45 @@ def get_line_user_id_from_ticket(ticket: dict, appt: dict | None = None) -> str 
 
 def search_zendesk_user_by_line_id(line_user_id: str):
     """
-    給一個 LINE userId，去 Zendesk 搜尋 user_fields 中含有該值的使用者（用 fieldvalue）。
-
+    用 external_id 精準查 Zendesk user（比 /search.json 穩定）。
     回傳：
-        - count: 幾筆 (int)
-        - user: 若 count >= 1，回傳「挑選後」那一筆 dict，否則 None
+        - count: 幾筆
+        - user: 第一筆 user（若有），否則 None
     """
     if not line_user_id:
         return 0, None
 
     base_url, headers = _build_zendesk_headers()
-    search_url: str = f"{base_url}/api/v2/search.json"
+    url = f"{base_url}/api/v2/users/search.json"
 
-    # ✅ 改成 fieldvalue:"xxx"
-    params: dict = {
-        "query": f'type:user external_id:"{line_user_id}"'
-    }
-
+    # ✅ 用 external_id 查（不加 type:user，因為這支 endpoint 本來就只搜 users）
+    params = {"query": f'external_id:{line_user_id}'}
 
     try:
-        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
     except Exception as e:
-        app.logger.error(f"Zendesk 搜尋失敗: {e}")
+        app.logger.error(f"[search_zendesk_user_by_line_id] Users Search 失敗: {e}")
         return 0, None
 
-    data: dict = resp.json()
-    count: int = data.get("count", 0)
-    results: list = data.get("results") or []
+    data = resp.json() or {}
+    users = data.get("users") or []
+    count = len(users)
 
-    if count >= 1 and results:
-        # ✅ 若多筆：挑一筆「最像主檔」的
+    if count >= 1:
+        # ✅ 若多筆：保留你原本「有 phone 優先」的想法（但對 users list 做）
         def score(u: dict):
             phone = (u.get("phone") or "").strip()
-            # 有 phone 的優先（通常是 complete 那筆）
             s = 100 if phone else 0
-            # updated_at 越新越好（字串可比大小，ISO 格式通常OK）
+            # updated_at 越新越好（有值加分；你要更嚴謹可改成 parse datetime）
             s += 1 if u.get("updated_at") else 0
             return s
 
-        picked = sorted(results, key=score, reverse=True)[0]
+        picked = sorted(users, key=score, reverse=True)[0]
 
         if count > 1:
             app.logger.warning(
-                f"[search_zendesk_user_by_line_id] fieldvalue 命中 {count} 筆，"
+                f"[search_zendesk_user_by_line_id] external_id 命中 {count} 筆，"
                 f"picked id={picked.get('id')} (phone={'Y' if (picked.get('phone') or '').strip() else 'N'})"
             )
 
@@ -862,6 +835,42 @@ def search_zendesk_tickets_for_reminder():
 
     return results
 
+def search_zendesk_tickets_for_voice_reminder(state: str):
+    """
+    專供「語音外撥」使用：
+    - 使用預約表單
+    - reminder_state = 指定狀態（通常 queued）
+    - status != solved
+    """
+    base_url, headers = _build_zendesk_headers()
+    search_url = f"{base_url}/api/v2/search.json"
+
+    field_key = f"custom_field_{ZENDESK_CF_REMINDER_STATE}"
+    query = (
+        f"type:ticket "
+        f"ticket_form_id:{ZENDESK_APPOINTMENT_FORM_ID} "
+        f"-status:solved "
+        f"{field_key}:{state}"
+    )
+
+    params = {"query": query}
+
+    try:
+        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+        app.logger.info(f"[search_zendesk_tickets_for_voice_reminder] URL = {resp.url}")
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.error(f"[search_zendesk_tickets_for_voice_reminder] 失敗: {e}")
+        return []
+
+    data = resp.json() or {}
+    results = data.get("results") or []
+    app.logger.info(
+        f"[search_zendesk_tickets_for_voice_reminder] 找到 {len(results)} 筆 ticket（state={state}）"
+    )
+    return results
+
+# voice 回寫webhook相關
 def mark_zendesk_ticket_voice_attempted(
     ticket_id: int,
     call_id: str,
@@ -936,4 +945,150 @@ def mark_zendesk_ticket_voice_attempted(
         return True
     except Exception as e:
         app.logger.error(f"[mark_voice_attempted] PUT failed ticket_id={ticket_id}: {e}")
+        return False
+
+# voice 回寫webhook相關 
+def mark_zendesk_ticket_voice_succeeded(
+    ticket_id: int,
+    call_id: str,
+    call_status: str,
+    attempted_date: str,
+) -> bool:
+    """
+    webhook 回來後更新 Zendesk（success）：
+    - 防重送：同 call_id 只處理一次
+    - reminder_state = SUCCESS
+    - ticket status = solved（你要不要 solved 都行，但 success 通常就可以 solved）
+    - attempts + 1
+    - last_voice_attempt_date / last_call_id
+    - internal note 留存
+    """
+    if not ticket_id:
+        return False
+
+    base_url, headers = _build_zendesk_headers()
+    url_get = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+    url_put = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+
+    try:
+        resp = requests.get(url_get, headers=headers, timeout=10)
+        resp.raise_for_status()
+        ticket = resp.json().get("ticket", {})
+    except Exception as e:
+        app.logger.error(f"[mark_voice_success] GET ticket failed ticket_id={ticket_id}: {e}")
+        return False
+
+    last_call_id = _get_ticket_cf_value(ticket, ZENDESK_CF_LAST_CALL_ID, "") or ""
+    if str(last_call_id) == str(call_id):
+        app.logger.info(f"[mark_voice_success] duplicate webhook ignored ticket_id={ticket_id} call_id={call_id}")
+        return True
+
+    attempts = _get_ticket_cf_value(ticket, ZENDESK_CF_REMINDER_ATTEMPTS, 0) or 0
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 0
+    attempts += 1
+
+    note_body = (
+        f"[Voice v1] LiveHub 回呼：SUCCESS\n"
+        f"- callId: {call_id}\n"
+        f"- status: {call_status}\n"
+        f"- attempted_date: {attempted_date}\n"
+        f"- attempts: {attempts}\n"
+    )
+
+    payload = {
+        "ticket": {
+            "status": "solved",
+            "comment": {"body": note_body, "public": False},
+            "custom_fields": [
+                {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_SUCCESS},
+                {"id": ZENDESK_CF_LAST_CALL_ID, "value": str(call_id)},
+                {"id": ZENDESK_CF_REMINDER_ATTEMPTS, "value": attempts},
+                {"id": ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE, "value": attempted_date},
+            ],
+        }
+    }
+
+    try:
+        app.logger.info(f"[mark_voice_success] PUT payload={json.dumps(payload, ensure_ascii=False)}")
+        resp2 = requests.put(url_put, headers=headers, json=payload, timeout=10)
+        resp2.raise_for_status()
+        app.logger.info(f"[mark_voice_success] updated ticket_id={ticket_id} attempts={attempts}")
+        return True
+    except Exception as e:
+        app.logger.error(f"[mark_voice_success] PUT failed ticket_id={ticket_id}: {e}")
+        return False
+
+# voice 回寫webhook相關
+def mark_zendesk_ticket_voice_failed(
+    ticket_id: int,
+    call_id: str,
+    call_status: str,
+    attempted_date: str,
+) -> bool:
+    """
+    webhook 回來後更新 Zendesk（failed/no_answer/busy/error）：
+    - 防重送：同 call_id 只處理一次
+    - reminder_state = FAILED
+    - attempts + 1
+    - last_voice_attempt_date / last_call_id
+    - internal note 留存
+    """
+    if not ticket_id:
+        return False
+
+    base_url, headers = _build_zendesk_headers()
+    url_get = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+    url_put = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+
+    try:
+        resp = requests.get(url_get, headers=headers, timeout=10)
+        resp.raise_for_status()
+        ticket = resp.json().get("ticket", {})
+    except Exception as e:
+        app.logger.error(f"[mark_voice_failed] GET ticket failed ticket_id={ticket_id}: {e}")
+        return False
+
+    last_call_id = _get_ticket_cf_value(ticket, ZENDESK_CF_LAST_CALL_ID, "") or ""
+    if str(last_call_id) == str(call_id):
+        app.logger.info(f"[mark_voice_failed] duplicate webhook ignored ticket_id={ticket_id} call_id={call_id}")
+        return True
+
+    attempts = _get_ticket_cf_value(ticket, ZENDESK_CF_REMINDER_ATTEMPTS, 0) or 0
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 0
+    attempts += 1
+
+    note_body = (
+        f"[Voice v1] LiveHub 回呼：FAILED\n"
+        f"- callId: {call_id}\n"
+        f"- status: {call_status}\n"
+        f"- attempted_date: {attempted_date}\n"
+        f"- attempts: {attempts}\n"
+    )
+
+    payload = {
+        "ticket": {
+            "comment": {"body": note_body, "public": False},
+            "custom_fields": [
+                {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_FAILED},
+                {"id": ZENDESK_CF_LAST_CALL_ID, "value": str(call_id)},
+                {"id": ZENDESK_CF_REMINDER_ATTEMPTS, "value": attempts},
+                {"id": ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE, "value": attempted_date},
+            ],
+        }
+    }
+
+    try:
+        app.logger.info(f"[mark_voice_failed] PUT payload={json.dumps(payload, ensure_ascii=False)}")
+        resp2 = requests.put(url_put, headers=headers, json=payload, timeout=10)
+        resp2.raise_for_status()
+        app.logger.info(f"[mark_voice_failed] updated ticket_id={ticket_id} attempts={attempts}")
+        return True
+    except Exception as e:
+        app.logger.error(f"[mark_voice_failed] PUT failed ticket_id={ticket_id}: {e}")
         return False
