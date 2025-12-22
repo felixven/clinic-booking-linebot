@@ -472,7 +472,7 @@ def search_zendesk_user_by_line_id(line_user_id: str):
     base_url, headers = _build_zendesk_headers()
     url = f"{base_url}/api/v2/users/search.json"
 
-    # ✅ 用 external_id 查（不加 type:user，因為這支 endpoint 本來就只搜 users）
+    # 用 external_id 查（不加 type:user，因為這支 endpoint 本來就只搜 users）
     params = {"query": f'external_id:{line_user_id}'}
 
     try:
@@ -487,7 +487,7 @@ def search_zendesk_user_by_line_id(line_user_id: str):
     count = len(users)
 
     if count >= 1:
-        # ✅ 若多筆：保留你原本「有 phone 優先」的想法（但對 users list 做）
+        # 若多筆：保留原本「有 phone 優先」的想法（但對 users list 做）
         def score(u: dict):
             phone = (u.get("phone") or "").strip()
             s = 100 if phone else 0

@@ -1,4 +1,5 @@
 import requests
+import json, uuid, time
 
 from flask import Flask, request, abort,jsonify
 from linebot.v3 import WebhookHandler
@@ -132,88 +133,6 @@ from config import (
 
 # PENDING_REGISTRATIONS = {}
 
-
-# DEMO 測試的
-# def get_next_upcoming_appointment_for_demo():
-#     """
-#     取得患者「最近一筆未來的約診」。（DEMO）
-#     - startDateTime > 現在
-#     - 只看 Bookings 裡 customerEmailAddress == DEMO_CUSTOMER_EMAIL 的預約
-#     - 如果沒有符合條件，回傳 (None, None)
-#     - 如果有，回傳 (appointment_dict, local_start_dt)
-#     """
-#     token = get_graph_token()
-#     business_id = os.environ.get("BOOKING_BUSINESS_ID")
-
-#     if not business_id:
-#         raise Exception("缺 BOOKING_BUSINESS_ID，請在終端機 export")
-
-#     url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
-#     headers = {
-#         "Authorization": f"Bearer {token}"
-#     }
-
-#     resp = requests.get(url, headers=headers)
-#     app.logger.info(
-#         f"APPOINTMENTS (for upcoming demo) STATUS: {resp.status_code}, BODY: {resp.text}")
-#     resp.raise_for_status()
-
-#     all_appts = resp.json().get("value", [])
-
-#     now_local = datetime.now()
-#     best_appt = None
-#     best_local_start = None
-
-#     for a in all_appts:
-#         # 如果 Bookings 有 isCancelled 之類的欄位，可以在這裡排除
-#         if a.get("isCancelled") is True:
-#             continue
-
-#         # 只看 DEMO 患者的預約（用 email 過濾）
-#         customer_email = (a.get("customerEmailAddress") or "").lower()
-#         if customer_email != DEMO_CUSTOMER_EMAIL.lower():
-#             continue
-
-#         start_info = a.get("startDateTime", {})
-#         local_dt = parse_booking_datetime_to_local(start_info.get("dateTime"))
-#         if not local_dt:
-#             continue
-
-#         # 只看未來的預約
-#         if local_dt <= now_local:
-#             continue
-
-#         # 找最近的一筆（時間最早）
-#         if best_local_start is None or local_dt < best_local_start:
-#             best_local_start = local_dt
-#             best_appt = a
-
-#     return best_appt, best_local_start
-
-# def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
-#     """
-#     將 Bookings 的 startDateTime.dateTime (UTC) 字串轉成「台北時間 datetime」。
-#     例如 "2025-11-20T06:00:00.0000000Z" → 2025-11-20 14:00:00 (UTC+8)
-#     """
-#     if not start_dt_str:
-#         return None
-
-#     try:
-#         s = start_dt_str
-#         if s.endswith("Z"):
-#             s = s[:-1]
-#         s = s.split(".")[0]
-#         utc_dt = datetime.fromisoformat(s)
-#     except Exception as e:
-#         app.logger.error(
-#             f"解讀 Bookings dateTime 失敗: {start_dt_str}, error: {e}")
-#         return None
-
-#     # 轉成台北時間（UTC+8）
-#     local_dt = utc_dt + timedelta(hours=8)
-#     return local_dt
-
-
 # ========= Webhook 入口 =========
 
 @app.route("/callback", methods=['POST'])
@@ -223,6 +142,31 @@ def callback():
 
     # get request body as text
     body = request.get_data(as_text=True)
+
+    # --- DEBUG TRACE (minimal) ---
+    req_id = uuid.uuid4().hex[:8]
+    evt_id = None
+    msg_id = None
+    evt_ts = None
+    try:
+        payload = json.loads(body)
+        events = payload.get("events") or []
+        if events:
+            e0 = events[0]
+            evt_id = e0.get("webhookEventId")
+            evt_ts = e0.get("timestamp")
+            msg = e0.get("message") or {}
+            msg_id = msg.get("id")
+    except Exception as e:
+        app.logger.warning(f"[TRACE][{req_id}] json parse fail: {e}")
+
+    app.logger.info(
+        f"[TRACE][{req_id}] incoming webhook "
+        f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts} "
+        f"len_body={len(body)}"
+    )
+    # --- END TRACE ---
+
     app.logger.info("Request body: " + body)
 
     # handle webhook body
@@ -239,8 +183,18 @@ def callback():
 # ======================================
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
-    text = event.message.text.strip()
-    app.logger.info(f"收到使用者訊息: {text}")
+    text = (event.message.text or "").strip()
+
+    evt_id = getattr(event, "webhook_event_id", None) or getattr(event, "webhookEventId", None)
+    msg_id = getattr(event.message, "id", None)
+    ts = getattr(event, "timestamp", None)
+    uid = None
+    if event.source and hasattr(event.source, "user_id"):
+        uid = event.source.user_id
+
+    app.logger.info(
+        f"[HANDLE] evt_id={evt_id} msg_id={msg_id} ts={ts} uid={uid} text={text}"
+    )
 
     # === 0. 檢查是否處於首次建檔流程 ===
     line_user_id_for_state = None
@@ -276,7 +230,6 @@ def handle_message(event: MessageEvent):
         step = state.get("step")
 
         # 0-1. 問姓名
-                # 0-1. 問姓名
         if step == "ask_name":
             name = text.strip()
             if not name:
@@ -288,7 +241,7 @@ def handle_message(event: MessageEvent):
                 )
                 return
 
-            # 先把姓名寫進 Zendesk，並標記 profile_status = need_phone
+            # 先把姓名寫進 Zendesk，同時標記 profile_status = need_phone
             if line_user_id_for_state:
                 try:
                     user = upsert_zendesk_user_basic_profile(
@@ -336,11 +289,10 @@ def handle_message(event: MessageEvent):
             name = state.get("name") or "未填姓名"
 
             # 寫進 Zendesk：phone + profile_status=complete
-                        # 寫進 Zendesk：phone + profile_status=complete
             user = None
             zendesk_user_id = state.get("zendesk_user_id")
 
-            # ✅ 優先：直接更新剛剛那一筆（不靠 search）
+            # 優先：直接更新剛剛那一筆（不靠 search）
             if line_user_id_for_state and zendesk_user_id:
                 base_url, headers = _build_zendesk_headers()
                 app.logger.info(f"[ask_phone] will update zendesk_user_id={zendesk_user_id} line_user_id={line_user_id_for_state}")
@@ -368,7 +320,7 @@ def handle_message(event: MessageEvent):
                     app.logger.error(f"[ask_phone] 更新 Zendesk user_id={zendesk_user_id} 失敗: {e}")
                     user = None
 
-            # 🔒 保險：真的失敗才退回 upsert
+            # 保險：真的失敗才退回 upsert
             if not user and line_user_id_for_state:
                 try:
                     user = upsert_zendesk_user_basic_profile(
@@ -485,10 +437,7 @@ def handle_message(event: MessageEvent):
             )
         return
 
-    # === 預約 YYYY-MM-DD：顯示 Carousel ===
-
-
-        # === 預約 YYYY-MM-DD：顯示 Carousel（需限制三週內＋需已建檔） ===
+    # === 預約 YYYY-MM-DD：顯示 Carousel（限制三週內＋需已建檔）
     elif text.startswith("預約 "):
         date_str = text.replace("預約", "").strip()
 
@@ -686,7 +635,7 @@ def handle_message(event: MessageEvent):
             name = (user.get("name") or "貴賓").strip()
             phone_raw = (user.get("phone") or "").strip()
 
-            # ✅ complete 但 phone 空 → 視為缺手機
+            # complete 但 phone 空 → 視為缺手機
             if not phone_raw:
                 PENDING_REGISTRATIONS[line_user_id] = {
                     "step": "ask_phone",
@@ -883,7 +832,6 @@ def handle_message(event: MessageEvent):
         show_dates_for_week(3, event)
         return
 
-    # === ④ 我想預約 YYYY-MM-DD HH:MM ===
     # === 我想預約 YYYY-MM-DD HH:MM（需限制三週內＋需已建檔） ===
     elif text.startswith("我想預約"):
         payload = text.replace("我想預約", "").strip()
@@ -1395,7 +1343,7 @@ def demo_enqueue_voice_call_group():
     }, 200
 
 
-
+#外撥回寫
 @app.route("/webhook/livehub", methods=["POST"])
 def webhook_livehub():
     data = request.get_json(silent=True) or {}

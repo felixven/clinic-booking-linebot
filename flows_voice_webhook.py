@@ -7,6 +7,10 @@ from zendesk_core import (
     mark_zendesk_ticket_voice_failed,
 )
 
+from utils import(
+    parse_ticket_ids
+)
+
 def _get_metadata(data: dict) -> dict:
     m = data.get("metadata")
     if isinstance(m, dict):
@@ -60,23 +64,38 @@ def handle_livehub_webhook(data: dict):
     - 舊版單筆：metadata.ticketId = 123
     """
     call_id = (
-    data.get("callId")
-    or data.get("call_id")
-    or data.get("sessionId")
-    or data.get("id")
-    or (data.get("call") or {}).get("id")
+        data.get("callId")
+        or data.get("call_id")
+        or data.get("sessionId")
+        or data.get("id")
+        or data.get("conversationId")   # <--- 加這個
+        or (data.get("call") or {}).get("id")
     )
+
 
     call_status = data.get("callStatus") or data.get("status") or data.get("call_status")
     result = _normalize_status(call_status)
 
     metadata = _get_metadata(data)
 
+    raw_ticket_ids = (
+        (metadata.get("ticketIds") if isinstance(metadata, dict) else None)
+        or (metadata.get("ticketId") if isinstance(metadata, dict) else None)
+        or (metadata.get("zendesk_ticket_id") if isinstance(metadata, dict) else None)
+    )
 
-    ticket_ids = _normalize_ticket_ids(metadata.get("ticketIds"))
+    if not raw_ticket_ids:
+        bod = data.get("botOperationData") or {}
+        if isinstance(bod, dict):
+            raw_ticket_ids = (
+                bod.get("ticketIds") or bod.get("ticketids")
+                or bod.get("ticketId") or bod.get("ticketid")
+            )
+
+    ticket_ids = parse_ticket_ids(raw_ticket_ids)
     if not ticket_ids:
         single = metadata.get("ticketId") or metadata.get("zendesk_ticket_id")
-        ticket_ids = _normalize_ticket_ids(single)
+        ticket_ids = parse_ticket_ids(single)
 
 
     if not call_id or not ticket_ids:
@@ -89,22 +108,28 @@ def handle_livehub_webhook(data: dict):
         if not tid:
             continue
         try:
-            if result == "success":
-                mark_zendesk_ticket_voice_succeeded(
-                    ticket_id=int(tid),
-                    call_id=str(call_id),
-                    call_status=str(call_status or ""),
-                    attempted_date=today_str,
-                )
-            elif result == "failed":
-                mark_zendesk_ticket_voice_failed(
-                    ticket_id=int(tid),
-                    call_id=str(call_id),
-                    call_status=str(call_status or ""),
-                    attempted_date=today_str,
-                )
-            else:
-                mark_zendesk_ticket_voice_attempted(
+            # if result == "success":
+            #     mark_zendesk_ticket_voice_succeeded(
+            #         ticket_id=int(tid),
+            #         call_id=str(call_id),
+            #         call_status=str(call_status or ""),
+            #         attempted_date=today_str,
+            #     )
+            # elif result == "failed":
+            #     mark_zendesk_ticket_voice_failed(
+            #         ticket_id=int(tid),
+            #         call_id=str(call_id),
+            #         call_status=str(call_status or ""),
+            #         attempted_date=today_str,
+            #     )
+            # else:
+            #     mark_zendesk_ticket_voice_attempted(
+            #         ticket_id=int(tid),
+            #         call_id=str(call_id),
+            #         call_status=str(call_status or ""),
+            #         attempted_date=today_str,
+            #     )
+             mark_zendesk_ticket_voice_attempted(
                     ticket_id=int(tid),
                     call_id=str(call_id),
                     call_status=str(call_status or ""),

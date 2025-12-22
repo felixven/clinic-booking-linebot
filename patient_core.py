@@ -148,11 +148,11 @@ def is_registered_patient(line_user_id: str) -> bool:
         count, user = search_zendesk_user_by_line_id(line_user_id)
     except Exception as e:
         app.logger.error(f"[is_registered_patient] 查詢 Zendesk 失敗: {e}")
-        # ✅ 查詢失敗不要硬說未建檔，避免流程最後一刻打回
+        # 查詢失敗不要硬說未建檔，避免流程最後一刻打回
         # 這裡建議回 False，但要搭配呼叫端顯示「系統查詢異常，請稍後再試」
         return False
 
-    # ✅ count>0 但 user=None → 這是「查詢異常」，不是「未建檔」
+    # count>0 但 user=None → 這是「查詢異常」，不是「未建檔」
     if count >= 1 and not user:
         app.logger.error(f"[is_registered_patient] count={count} 但 user=None，疑似 Zendesk search 解析/索引延遲 line_user_id={line_user_id}")
         return False
@@ -160,7 +160,7 @@ def is_registered_patient(line_user_id: str) -> bool:
     if count < 1 or not user:
         return False
 
-    # ✅ 統一標準：要能預約 = name + phone 都有（避免半套資料混入預約流程）
+    # 統一標準：要能預約 = name + phone 都有（避免半套資料混入預約流程）
     name = (user.get("name") or "").strip()
     phone = (user.get("phone") or "").strip()
 
