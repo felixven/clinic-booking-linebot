@@ -42,8 +42,15 @@ from patient_core import (
 from config import (
     CONFIRM_NOTE_KEYWORD,
     DEMO_CUSTOMER_NAME,
+    CONFIRM_OPEN_DAYS_BEFORE, # 原本 2，現在 +1
+    CANCEL_DEADLINE_DAYS_BEFORE,
     DEMO_CUSTOMER_EMAIL,
     DEMO_CUSTOMER_PHONE,
+)
+
+from utils import(
+    can_confirm,
+    can_cancel
 )
 
 def get_days_until(local_dt: datetime) -> int:
@@ -153,7 +160,7 @@ def flow_query_next_appointment(event, text: str):
             )
 
         # ②-1 距離看診 >= 3 天 → 可取消
-        elif days_left >= 3:
+        elif can_cancel(local_start):
             text_body = f"{customer_name}\n距離看診還有 {days_left} 天，可取消。"
             actions.append(
                 PostbackAction(
@@ -171,7 +178,7 @@ def flow_query_next_appointment(event, text: str):
 
         # ②-2 距離看診 < 3 天 → 不能取消，只能確認
         else:
-            text_body = f"{customer_name}\n距離看診少於 3 天，請確認是否回診。"
+            text_body = f"{customer_name}\n距離看診少於 {CANCEL_DEADLINE_DAYS_BEFORE} 天，請確認是否回診。"
             actions.append(
                 PostbackAction(
                     label="確認回診",
@@ -273,9 +280,9 @@ def flow_cancel_request(event, text: str):
 
     # ④ 判斷距離看診日
     days_left = get_days_until(local_start)
-    if days_left < 3:
+    if not can_cancel(local_start):
         msg = (
-            "距離看診日已少於三天，無法透過 LINE 取消約診。\n"
+            f"距離看診日已少於 {CANCEL_DEADLINE_DAYS_BEFORE} 天，無法透過 LINE 取消約診。\n"
             "如有特殊狀況請致電診所。"
         )
         line_bot_api.reply_message(
@@ -365,9 +372,10 @@ def flow_confirm_cancel(event, text: str):
         return
 
     days_left = get_days_until(local_start)
-    if days_left < 3:
+    if not can_cancel(local_start):
         msg = (
-            "距離看診日已少於三天，無法透過 LINE 取消約診。\n"
+            f"距離看診日已少於 {CANCEL_DEADLINE_DAYS_BEFORE} 天，"
+            "無法透過 LINE 取消約診。\n"
             "如有特殊狀況請電話聯繫診所。"
         )
         line_bot_api.reply_message(
@@ -503,10 +511,10 @@ def flow_confirm_visit(event, text: str):
     appt_id = appt.get("id", "")
 
     # ① 太早確認（≥ 3 天） → 擋掉
-    if days_left >= 3:
+    if not can_confirm(local_start):
         msg = (
-            "目前距離看診日仍大於三天，暫不開放線上確認回診。\n"
-            "可於看診前三天內再透過 LINE 進行確認。"
+            f"目前距離看診日仍大於 {CONFIRM_OPEN_DAYS_BEFORE} 天，暫不開放線上確認回診。\n"
+            f"可於看診前 {CONFIRM_OPEN_DAYS_BEFORE} 天內再透過 LINE 進行確認。"
         )
         line_bot_api.reply_message(
             ReplyMessageRequest(

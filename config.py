@@ -21,7 +21,22 @@ ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
 # Profile 狀態判斷
 PROFILE_STATUS_EMPTY = "empty"
 PROFILE_STATUS_NEED_PHONE = "need_phone"
+PROFILE_STATUS_NEED_NAME = "need_name"
 PROFILE_STATUS_COMPLETE = "complete"
+PLACEHOLDER_NAMES = {"未填姓名", "貴賓"}
+def is_valid_name(name: str) -> bool:
+    if not name:
+        return False
+    s = str(name).strip()
+
+    if not s:
+        return False
+    if s in INVALID_NAME_PLACEHOLDERS:
+        return False
+    if len(s) < 2:
+        return False
+
+    return True
 
 ZENDESK_UF_LINE_USER_ID = 14416308078351
 ZENDESK_UF_LINE_USER_ID_KEY = "line_user_id"
@@ -72,6 +87,15 @@ CONFIRM_NOTE_KEYWORD = "Confirmed via LINE"
 
 # 暫存「首次建檔」流程的狀態（key = line_user_id）
 PENDING_REGISTRATIONS = {}
+
+CONFIRM_OPEN_DAYS_BEFORE = 3  # 原本 2，現在 +1
+CANCEL_DEADLINE_DAYS_BEFORE = 4  # 原本 3，現在 +1
+
+INVALID_NAME_PLACEHOLDERS = {
+    "未填姓名", "貴賓", "您好", "病患", "訪客", "客人",
+    "unknown", "Unknown", "N/A", "NA", "-", "—", "null", "None", "（未填）"
+}
+
 
 # ======== DEMO 患者資料 ========
 DEMO_CUSTOMER_NAME = "LINE 使用者"

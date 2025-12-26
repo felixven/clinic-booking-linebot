@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import os
 import requests
+import re
 from flask import current_app as app  # 用 app.logger
 
 from config import (
@@ -362,6 +363,10 @@ def create_booking_appointment(
     service_notes_lines: list = []
     if line_user_id:
         service_notes_lines.append(f"[LINE_USER] {line_user_id}")
+
+    if zendesk_customer_id:
+        service_notes_lines.append(f"[ZD_USER] {zendesk_customer_id}")
+
     service_notes: str = "\n".join(service_notes_lines) if service_notes_lines else None
 
     # URL 和 Duration 常數
@@ -431,4 +436,16 @@ def create_booking_appointment(
 
 
     return created_booking
+
+def extract_zd_user_id_from_service_notes(service_notes: str | None) -> int | None:
+    if not service_notes:
+        return None
+    m = re.search(r"\[ZD_USER\]\s*(\d+)", service_notes)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
 

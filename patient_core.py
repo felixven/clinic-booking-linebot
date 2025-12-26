@@ -8,7 +8,10 @@ list_appointments_for_range,
 parse_booking_datetime_to_local
 )
 
-from config import PROFILE_STATUS_COMPLETE
+from config import (
+    PROFILE_STATUS_COMPLETE,
+    is_valid_name
+    )
 
 
 def normalize_phone(phone: str) -> str:
@@ -164,9 +167,9 @@ def is_registered_patient(line_user_id: str) -> bool:
     name = (user.get("name") or "").strip()
     phone = (user.get("phone") or "").strip()
 
-    if not name:
-        return False
     if not phone:
+        return False
+    if not is_valid_name(name):
         return False
 
     return True

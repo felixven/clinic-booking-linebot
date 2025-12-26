@@ -1,6 +1,8 @@
 import base64
 import json
 import requests
+import time
+
 from flask import current_app as app
 
 
@@ -61,6 +63,22 @@ def _get_ticket_cf_value(ticket: dict, field_id: int, default=None):
         if cf.get("id") == field_id:
             return cf.get("value")
     return default
+
+def search_zendesk_users_by_phone(phone_digits: str):
+    base_url, headers = _build_zendesk_headers()
+    q = f'phone:"{phone_digits}"'
+    url = f"{base_url}/api/v2/users/search.json"
+
+    app.logger.info(f"[ZD_SEARCH_PHONE][REQ] url={url} query={q}")
+    resp = requests.get(url, headers=headers, params={"query": q}, timeout=10)
+    app.logger.info(f"[ZD_SEARCH_PHONE][RESP] status={resp.status_code} body={resp.text[:300]}")
+    resp.raise_for_status()
+
+    data = resp.json() or {}
+    users = data.get("users") or []
+    app.logger.info(f"[ZD_SEARCH_PHONE][HIT] count={len(users)} phone={phone_digits}")
+    return users
+
 
 def create_zendesk_user(line_user_id: str, name: str, phone: str):
     """
@@ -254,7 +272,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         return None
 
     try:
-        count, user = search_zendesk_user_by_line_id(line_user_id)
+        count, user = search_zendesk_user_by_line_id(line_user_id,retries=1)
     except Exception as e:
         app.logger.error(f"[upsert_zendesk_user_basic_profile] 搜尋 user 失敗: {e}")
         count, user = 0, None
@@ -297,7 +315,12 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
             resp.raise_for_status()
             data = resp.json()
             updated = data.get("user") or user
-            app.logger.info(f"[upsert_zendesk_user_basic_profile] 更新 user_id={updated.get('id')} 成功")
+            uf = (updated.get("user_fields") or {})
+            app.logger.info(
+                f"[upsert_zendesk_user_basic_profile] 更新 user_id={updated.get('id')} 成功 "
+                f"phone={updated.get('phone')} external_id={updated.get('external_id')} "
+                f"uf_profile_status={uf.get(ZENDESK_UF_PROFILE_STATUS_KEY)} uf_line={uf.get(ZENDESK_UF_LINE_USER_ID_KEY)}"
+            )
             return updated
         except Exception as e:
             app.logger.error(f"[upsert_zendesk_user_basic_profile] 更新 user 失敗: {e}")
@@ -314,7 +337,6 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
 
     user_body = {
         "role": "end-user",
-        "verified": True,
         "external_id": line_user_id, 
     }
     if name is not None:
@@ -334,7 +356,52 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         app.logger.info(f"[upsert_zendesk_user_basic_profile] 建立新 user 成功 id={created.get('id')}")
         return created
     except Exception as e:
-        app.logger.error(f"[upsert_zendesk_user_basic_profile] 建立 user 失敗: {e}")
+        # ✅ 422 自救：外部 id 可能已存在（你前面 search 剛好沒抓到）
+        try:
+            status = getattr(resp, "status_code", None)
+            body = getattr(resp, "text", "")[:300]
+        except Exception:
+            status, body = None, ""
+
+        app.logger.error(f"[upsert_zendesk_user_basic_profile] 建立 user 失敗: status={status} body={body} err={e}")
+
+        if status == 422:
+            try:
+                c2, u2 = search_zendesk_user_by_line_id(line_user_id, retries=1)
+            except Exception as e2:
+                app.logger.error(f"[upsert_zendesk_user_basic_profile][422] re-search failed: {e2}")
+                return None
+
+            if u2 and u2.get("id"):
+                # ✅ 改走 update（把你原本 update 那段重用）
+                user_id = u2["id"]
+                put_url = f"{base_url}/api/v2/users/{user_id}.json"
+
+                user_payload = {}
+                if name is not None:
+                    user_payload["name"] = name
+                if phone is not None:
+                    user_payload["phone"] = phone
+
+                # 注意：如果這筆已經有 external_id，就不用硬塞（但塞同值也OK）
+                user_payload["external_id"] = line_user_id
+
+                user_fields = (u2.get("user_fields") or {})
+                user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
+                if profile_status is not None:
+                    user_fields[ZENDESK_UF_PROFILE_STATUS_KEY] = profile_status
+                user_payload["user_fields"] = user_fields
+
+                try:
+                    r2 = requests.put(put_url, headers=headers, json={"user": user_payload}, timeout=10)
+                    r2.raise_for_status()
+                    updated = (r2.json() or {}).get("user") or u2
+                    app.logger.info(f"[upsert_zendesk_user_basic_profile][422] 改用 PUT 更新成功 user_id={updated.get('id')}")
+                    return updated
+                except Exception as e3:
+                    app.logger.error(f"[upsert_zendesk_user_basic_profile][422] PUT update failed: {e3}")
+                    return None
+
         return None
 
 
@@ -459,53 +526,127 @@ def get_line_user_id_from_ticket(ticket: dict, appt: dict | None = None) -> str 
 #     # 完全沒有結果
 #     return 0, None
 
-def search_zendesk_user_by_line_id(line_user_id: str):
+def search_zendesk_user_by_line_id(line_user_id: str, retries: int = 3, sleep_sec: float = 0.8):
     """
     用 external_id 精準查 Zendesk user（比 /search.json 穩定）。
     回傳：
         - count: 幾筆
-        - user: 第一筆 user（若有），否則 None
+        - user: 若有，回傳挑選後那一筆 dict，否則 None
+
+    retry 策略：
+    - 只有在「查到 0 筆」時才重試（處理 Zendesk search 索引延遲）
+    - 若 requests / HTTP error：直接回 0, None（避免卡太久），並帶 attempt log
     """
     if not line_user_id:
         return 0, None
-
+    
     base_url, headers = _build_zendesk_headers()
+    
+    try:
+        url = f"{base_url}/api/v2/users/show_many.json"
+        resp = requests.get(url, headers=headers, params={"external_ids": line_user_id}, timeout=10)
+        resp.raise_for_status()
+        users = (resp.json() or {}).get("users") or []
+        users = [u for u in users if u.get("active") is True]  # 避免 inactive 造成後續 422
+        if users:
+            return len(users), users[0]
+    except Exception as e:
+        app.logger.warning(f"[ZD_SHOW_MANY][ERROR] external_id={line_user_id} err={e}")
+
     url = f"{base_url}/api/v2/users/search.json"
 
-    # 用 external_id 查（不加 type:user，因為這支 endpoint 本來就只搜 users）
-    params = {"query": f'external_id:{line_user_id}'}
+    query = f"external_id:{line_user_id}"
+    params = {"query": query}
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-    except Exception as e:
-        app.logger.error(f"[search_zendesk_user_by_line_id] Users Search 失敗: {e}")
-        return 0, None
+    # 最少 1 次
+    tries = max(1, int(retries))
 
-    data = resp.json() or {}
-    users = data.get("users") or []
-    count = len(users)
+    for attempt in range(1, tries + 1):
+        app.logger.info(
+            f"[ZD_SEARCH][REQ] external_id={line_user_id} "
+            f"url={url} query={query} attempt={attempt}/{tries}"
+        )
 
-    if count >= 1:
-        # 若多筆：保留原本「有 phone 優先」的想法（但對 users list 做）
-        def score(u: dict):
-            phone = (u.get("phone") or "").strip()
-            s = 100 if phone else 0
-            # updated_at 越新越好（有值加分；你要更嚴謹可改成 parse datetime）
-            s += 1 if u.get("updated_at") else 0
-            return s
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            resp.raise_for_status()
+        except Exception as e:
+            app.logger.error(
+                f"[ZD_SEARCH][ERROR] external_id={line_user_id} attempt={attempt}/{tries} err={e}"
+            )
+            return 0, None
 
-        picked = sorted(users, key=score, reverse=True)[0]
+        data = resp.json() or {}
+        users = data.get("users") or []
+        users = [u for u in users if u.get("active") is True]
 
-        if count > 1:
-            app.logger.warning(
-                f"[search_zendesk_user_by_line_id] external_id 命中 {count} 筆，"
-                f"picked id={picked.get('id')} (phone={'Y' if (picked.get('phone') or '').strip() else 'N'})"
+
+        app.logger.info(
+            f"[ZD_SEARCH][LIST] external_id={line_user_id} users_len={len(users)} attempt={attempt}/{tries}"
+        )
+        for u in users[:10]:
+            uf = u.get("user_fields") or {}
+            app.logger.info(
+                f"[ZD_SEARCH][ROW] id={u.get('id')} active={u.get('active')} "
+                f"external_id={u.get('external_id')} name={u.get('name')} phone={u.get('phone')} "
+                f"uf_line={uf.get(ZENDESK_UF_LINE_USER_ID_KEY)} "
+                f"uf_profile_status={uf.get(ZENDESK_UF_PROFILE_STATUS_KEY)}"
             )
 
-        return count, picked
+        count = len(users)
 
-    return 0, None
+        app.logger.info(
+            f"[ZD_SEARCH][RESP] external_id={line_user_id} count={count} attempt={attempt}/{tries}"
+        )
+
+        if count >= 1:
+            # 若多筆：有 phone 優先，其次 updated_at
+            def score(u: dict):
+                phone = (u.get("phone") or "").strip()
+                s = 100 if phone else 0
+                s += 1 if u.get("updated_at") else 0
+                return s
+
+            picked = sorted(users, key=score, reverse=True)[0]
+            uf = (picked.get("user_fields") or {})
+
+            if count > 1:
+                app.logger.warning(
+                    f"[ZD_SEARCH][WARN] external_id 命中 {count} 筆，"
+                    f"picked id={picked.get('id')} (phone={'Y' if (picked.get('phone') or '').strip() else 'N'})"
+                )
+
+            app.logger.info(
+                f"[ZD_SEARCH][HIT] external_id={line_user_id} "
+                f"user_id={picked.get('id')} "
+                f"name={picked.get('name')} "
+                f"phone={picked.get('phone')} "
+                f"external_id_in_user={picked.get('external_id')} "
+                f"uf_line={uf.get(ZENDESK_UF_LINE_USER_ID_KEY)} "
+                f"uf_profile_status={uf.get(ZENDESK_UF_PROFILE_STATUS_KEY)} "
+                f"uf_profile_status_raw={uf.get('profile_status')}"
+            )
+
+            # ✅ 成功就回傳（不重試）
+            if attempt > 1:
+                app.logger.info(
+                    f"[ZD_SEARCH][RETRY_SUCCESS] external_id={line_user_id} attempt={attempt}/{tries}"
+                )
+            return count, picked
+
+        # count == 0：才重試
+        if attempt < tries:
+            app.logger.info(
+                f"[ZD_SEARCH][RETRY] external_id={line_user_id} "
+                f"attempt={attempt}/{tries} not_found -> sleep {sleep_sec}s"
+            )
+            if sleep_sec and sleep_sec > 0:
+                time.sleep(sleep_sec)
+            continue
+
+        # 已最後一次仍找不到
+        return 0, None
+
 
     
 
