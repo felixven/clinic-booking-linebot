@@ -24,7 +24,7 @@ from config import is_valid_name
 
 from flask import current_app as app
 
-from state_store import clear_state
+from state_store import set_state, get_state, clear_state
 
 
 def parse_ticket_ids(raw_ticket_ids):
@@ -90,14 +90,17 @@ def reply_consent_input(*, line_bot_api, event, title: str, text: str, ok_data: 
         )
     )
 
-def enter_input_step(*, line_bot_api, pending_dict: dict, event, line_user_id: str, step: str, prompt_text: str, extra_state: dict | None = None):
+def enter_input_step(*, line_bot_api, event, line_user_id: str, step: str, prompt_text: str, extra_state: dict | None = None):
     """
     進入某個輸入 step，並立刻回一則文字提示「可以開始輸入」。
+    狀態改存 Redis（state_store），不再用記憶體 dict。
     """
     state = {"step": step}
     if extra_state:
         state.update(extra_state)
-    pending_dict[line_user_id] = state
+
+    # 存進 Redis（有 TTL）
+    set_state(line_user_id, state)
 
     app.logger.info(f"[enter_input_step] uid={line_user_id} step={step} extra={bool(extra_state)}")
 

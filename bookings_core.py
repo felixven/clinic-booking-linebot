@@ -5,13 +5,20 @@ import re
 from flask import current_app as app  # 用 app.logger
 
 from config import (
-    BOOKING_BUSINESS_ID,
     BOOKING_DEMO_SERVICE_ID,
     BOOKING_DEMO_STAFF_ID,
-    APPOINTMENT_DURATION_MINUTES,
+    BOOKING_BUSINESS_ID,
     SLOT_INTERVAL_MINUTES,
-    SLOT_START,             # 看診起始時間（第一個）
-    SLOT_END
+    APPOINTMENT_DURATION_MINUTES,
+    MORNING_START, 
+    MORNING_END,
+    AFTERNOON_START,
+    AFTERNOON_END,
+    FRI_MORNING_START, 
+    FRI_MORNING_END,
+    SAT_MORNING_START, 
+    SAT_MORNING_END,
+    CLOSED_WEEKDAYS,
 )
 
 # ======== 跟 Entra 拿 Microsoft Graph 的 access token ========
@@ -273,52 +280,147 @@ def update_booking_service_notes(appt_id: str, notes_text: str):
         f"PATCH APPT SERVICE NOTES {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
     resp.raise_for_status()
 
+def _get_day_intervals(date_str: str):
+    """
+    回傳當天可預約的門診區間（多段）
+    """
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    wd = d.weekday()  # 0=Mon ... 6=Sun
+
+    # 週三、週日休診
+    if wd in CLOSED_WEEKDAYS:
+        return []
+
+    # 週一、週二、週四
+    if wd in (0, 1, 3):
+        return [
+            (MORNING_START, MORNING_END),
+            (AFTERNOON_START, AFTERNOON_END),
+        ]
+
+    # 週五
+    if wd == 4:
+        return [(FRI_MORNING_START, FRI_MORNING_END)]
+
+    # 週六
+    if wd == 5:
+        return [(SAT_MORNING_START, SAT_MORNING_END)]
+
+    return []
+
+# def _get_day_hours(date_str: str) -> tuple[str | None, str | None]:
+#     """
+#     依日期回傳當天可預約的 start/end（HH:MM）。
+#     end 定義為「門診結束時間」（不是最後一格開始時間）。
+#     """
+#     d = datetime.strptime(date_str, "%Y-%m-%d").date()
+#     wd = d.weekday()  # 0=Mon ... 6=Sun
+
+#     if wd in CLOSED_WEEKDAYS:
+#         return None, None
+
+#     # 週六半天
+#     if wd == 5:
+#         return SLOT_START, SAT_END
+
+#     # 週三早上不看
+#     if wd == 2:
+#         return WED_START, SLOT_END
+
+#     # 週一、二、四、五
+#     return SLOT_START, SLOT_END
+
+
 def get_available_slots_for_date(date_str: str) -> list:
     """
-    回傳指定日期「可預約」的時段列表，例如：
-    ["09:00", "09:30", "10:00", ...]
-    規則：SLOT_START–SLOT_END，每 SLOT_INTERVAL_MINUTES 分鐘，排除當天已被預約的開始時段。
+    回傳指定日期「可預約」的時段列表（20 分鐘一格）
     """
-    appts: list = list_appointments_for_date(date_str)
+    intervals = _get_day_intervals(date_str)
+    if not intervals:
+        return []
 
-    booked_times: set = set()
+    # 取得當天已存在的 Bookings 預約
+    appts = list_appointments_for_date(date_str)
+
+    booked_times = set()
     for appt in appts:
-        start_info: dict = appt.get("startDateTime", {})
-        # "2025-11-20T06:00:00.0000000Z"
-        start_dt_str: str = start_info.get("dateTime")
-        if not start_dt_str:
+        start_info = appt.get("startDateTime", {})
+        s = start_info.get("dateTime")
+        if not s:
             continue
-
         try:
-            s: str = start_dt_str
             if s.endswith("Z"):
                 s = s[:-1]
-            s = s.split(".")[0]
-            utc_dt: datetime = datetime.fromisoformat(s)
-        except Exception as e:
-            app.logger.error(
-                f"解讀 startDateTime 失敗（get_available_slots）：{start_dt_str}, error: {e}")
+            if "." in s:
+                s = s.split(".", 1)[0]
+            utc_dt = datetime.fromisoformat(s)
+            local_dt = utc_dt + timedelta(hours=8)
+            booked_times.add(local_dt.strftime("%H:%M"))
+        except Exception:
             continue
 
-        local_dt: datetime = utc_dt + timedelta(hours=8)
-        hhmm: str = local_dt.strftime("%H:%M")  # 例如 "14:00"
-        booked_times.add(hhmm)
+    slots = []
+    duration = APPOINTMENT_DURATION_MINUTES
 
-    # SLOT_START ~ SLOT_END，每 SLOT_INTERVAL_MINUTES 分鐘一格
-    # 這裡假設日期是今天，只取時間部分
-    start_dt_only: datetime = datetime.strptime(SLOT_START, "%H:%M").replace(year=2000, month=1, day=1)
-    end_dt_only: datetime = datetime.strptime(SLOT_END, "%H:%M").replace(year=2000, month=1, day=1)
+    for start_hhmm, end_hhmm in intervals:
+        cur = datetime.strptime(start_hhmm, "%H:%M")
+        end_dt = datetime.strptime(end_hhmm, "%H:%M")
 
-
-    slots: list = []
-    cur: datetime = start_dt_only
-    while cur <= end_dt_only:
-        hhmm: str = cur.strftime("%H:%M")
-        if hhmm not in booked_times:
-            slots.append(hhmm)
-        cur += timedelta(minutes=SLOT_INTERVAL_MINUTES)
+        while cur + timedelta(minutes=duration) <= end_dt:
+            hhmm = cur.strftime("%H:%M")
+            if hhmm not in booked_times:
+                slots.append(hhmm)
+            cur += timedelta(minutes=SLOT_INTERVAL_MINUTES)
 
     return slots
+
+
+# def get_available_slots_for_date(date_str: str) -> list:
+#     """
+#     回傳指定日期「可預約」的時段列表，例如：
+#     ["09:00", "09:30", "10:00", ...]
+#     規則：SLOT_START–SLOT_END，每 SLOT_INTERVAL_MINUTES 分鐘，排除當天已被預約的開始時段。
+#     """
+#     appts: list = list_appointments_for_date(date_str)
+
+#     booked_times: set = set()
+#     for appt in appts:
+#         start_info: dict = appt.get("startDateTime", {})
+#         # "2025-11-20T06:00:00.0000000Z"
+#         start_dt_str: str = start_info.get("dateTime")
+#         if not start_dt_str:
+#             continue
+
+#         try:
+#             s: str = start_dt_str
+#             if s.endswith("Z"):
+#                 s = s[:-1]
+#             s = s.split(".")[0]
+#             utc_dt: datetime = datetime.fromisoformat(s)
+#         except Exception as e:
+#             app.logger.error(
+#                 f"解讀 startDateTime 失敗（get_available_slots）：{start_dt_str}, error: {e}")
+#             continue
+
+#         local_dt: datetime = utc_dt + timedelta(hours=8)
+#         hhmm: str = local_dt.strftime("%H:%M")  # 例如 "14:00"
+#         booked_times.add(hhmm)
+
+#     # SLOT_START ~ SLOT_END，每 SLOT_INTERVAL_MINUTES 分鐘一格
+#     # 這裡假設日期是今天，只取時間部分
+#     start_dt_only: datetime = datetime.strptime(SLOT_START, "%H:%M").replace(year=2000, month=1, day=1)
+#     end_dt_only: datetime = datetime.strptime(SLOT_END, "%H:%M").replace(year=2000, month=1, day=1)
+
+
+#     slots: list = []
+#     cur: datetime = start_dt_only
+#     while cur <= end_dt_only:
+#         hhmm: str = cur.strftime("%H:%M")
+#         if hhmm not in booked_times:
+#             slots.append(hhmm)
+#         cur += timedelta(minutes=SLOT_INTERVAL_MINUTES)
+
+#     return slots
 
 def create_booking_appointment(
     date_str: str,
@@ -353,6 +455,11 @@ def create_booking_appointment(
     utc_dt: datetime = local_dt - timedelta(hours=8)
     utc_iso: str = utc_dt.isoformat() + "Z"
 
+    #Booking UI 顯示的資料
+    hh, mm = time_str.split(":")
+    display_time = f"{int(hh)}：{mm}"
+    display_title = f"{customer_name} {display_time}"
+
     # 要寫進 Bookings 的姓名
     if line_display_name:
         booking_customer_name: str = f"{customer_name}（{line_display_name}）"
@@ -378,7 +485,7 @@ def create_booking_appointment(
         "customerEmailAddress": None,
         "customerPhone": customer_phone,
         "serviceId": BOOKING_DEMO_SERVICE_ID,
-        "serviceName": "一般門診",
+        "serviceName": display_title,
         "startDateTime": { "dateTime": utc_iso, "timeZone": "UTC" },
         "endDateTime": {
             "dateTime": (utc_dt + timedelta(minutes=duration)).isoformat() + "Z",

@@ -80,7 +80,9 @@ from utils import (
     is_binding_complete
     )
 
-from state_store import get_state, set_state,clear_state
+from state_store import get_state, set_state, clear_state
+
+from dedupe_store import check_and_mark_webhook
 
 
 
@@ -124,17 +126,6 @@ from config import (
     PROFILE_STATUS_COMPLETE,
     PROFILE_STATUS_NEED_NAME,
     is_valid_name,
-    ZENDESK_REMINDER_STATE_PENDING,
-    ZENDESK_REMINDER_STATE_QUEUED,
-    ZENDESK_REMINDER_STATE_SUCCESS,
-    ZENDESK_REMINDER_STATE_FAILED,
-    ZENDESK_REMINDER_STATE_CANCELLED,
-    REMINDER_DAYS_BEFORE,
-    SLOT_START,         # 看診起始時間（第一個）
-    SLOT_END,       # 看診結束時間（最後一個）
-    SLOT_INTERVAL_MINUTES,      # 每一格 slot 間隔（目前半小時）
-    APPOINTMENT_DURATION_MINUTES, # 實際預約時長（要跟 Bookings duration 對齊）
-    WEEKDAY_ZH,
     CLINIC_IMAGE_URL,
     CLINIC_NAME, 
     CLINIC_ADDRESS,
@@ -188,7 +179,7 @@ def callback():
     # get request body as text
     body = request.get_data(as_text=True)
 
-    # --- DEBUG TRACE (minimal) ---
+    # --- DEBUG TRACE (最小追蹤變數！) ---
     req_id = uuid.uuid4().hex[:8]
     evt_id = None
     msg_id = None
@@ -285,14 +276,16 @@ def handle_message(event: MessageEvent):
         return
 
 
-    if line_user_id_for_state and line_user_id_for_state in PENDING_REGISTRATIONS:
-        state = PENDING_REGISTRATIONS[line_user_id_for_state]
-        step = state.get("step")
+    state = get_state(line_user_id_for_state) if line_user_id_for_state else {}
+    step = state.get("step")
+
+    if line_user_id_for_state and step:
         # ===== 流程中保護：避免把「線上約診/取消預約...」當成姓名或手機 =====
         flow_commands = {
             "線上約診", "約診查詢", "取消預約", "取消預約流程", "查詢診所位置",
             "我要預約本週", "我要預約下週", "我要預約兩週後", "我要預約三週後", "其他日期",
         }
+
         if text in flow_commands:
             line_bot_api.reply_message(
                 ReplyMessageRequest(
@@ -343,7 +336,7 @@ def handle_message(event: MessageEvent):
 
             state["name"] = name
             state["step"] = "ask_phone"
-            PENDING_REGISTRATIONS[line_user_id_for_state] = state
+            set_state(line_user_id_for_state, state)
 
             reply_text = f"{name} 您好，請輸入您的手機號碼（格式：09xxxxxxxx）："
 
@@ -371,7 +364,7 @@ def handle_message(event: MessageEvent):
             if not zendesk_user_id:
                 # 保守：如果意外沒有 user_id，就回到問手機重新走
                 state["step"] = "ask_phone"
-                PENDING_REGISTRATIONS[line_user_id_for_state] = state
+                set_state(line_user_id_for_state, state)
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
@@ -410,7 +403,7 @@ def handle_message(event: MessageEvent):
                 return
 
             # 成功 → 清狀態 → 進入選日期範圍（跟你原本完成建檔一致）
-            del PENDING_REGISTRATIONS[line_user_id_for_state]
+            clear_state(line_user_id_for_state)
 
             phone_display = state.get("phone") or "（已留存）"
             info_text = (
@@ -443,6 +436,7 @@ def handle_message(event: MessageEvent):
         #     if text == "不是我":
         #         # 回到輸入手機
         #         PENDING_REGISTRATIONS[line_user_id_for_state] = {"step": "ask_phone"}
+        #         set_state(line_user_id, {"step": "ask_phone"}) #可能要換成這行
         #         line_bot_api.reply_message(
         #             ReplyMessageRequest(
         #                 reply_token=event.reply_token,
@@ -537,7 +531,7 @@ def handle_message(event: MessageEvent):
             found_name = (state.get("found_name") or "").strip()
 
             if not zendesk_user_id:
-                del PENDING_REGISTRATIONS[line_user_id_for_state]
+                clear_state(line_user_id_for_state)
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
@@ -550,7 +544,7 @@ def handle_message(event: MessageEvent):
             if text == "我要修改姓名":
                 state["step"] = "ask_name_after_phone"
                 # ask_name_after_phone 會負責把 name + phone + external_id 一次寫入 Zendesk
-                PENDING_REGISTRATIONS[line_user_id_for_state] = state
+                set_state(line_user_id_for_state, state)
 
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
@@ -592,7 +586,7 @@ def handle_message(event: MessageEvent):
                 )
                 return
 
-            del PENDING_REGISTRATIONS[line_user_id_for_state]
+            clear_state(line_user_id_for_state)
 
             info_text = (
                 f"{found_name or '貴賓'} 您好，已為您完成身分綁定。\n"
@@ -631,7 +625,7 @@ def handle_message(event: MessageEvent):
 
             if len(matched) == 1:
                 if mode == "already_bound":
-                    del PENDING_REGISTRATIONS[line_user_id_for_state]
+                    clear_state(line_user_id_for_state)
                     line_bot_api.reply_message(
                         ReplyMessageRequest(
                             reply_token=event.reply_token,
@@ -645,12 +639,12 @@ def handle_message(event: MessageEvent):
 
                 # ✅ 姓名 placeholder → 直接補姓名
                 if not is_valid_name(found_name):
-                    PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                    set_state(line_user_id_for_state, {
                         "step": "ask_name_after_phone",
                         "zendesk_user_id": found.get("id"),
                         "phone": phone,
                         "found_name": found_name,
-                    }
+                    })
                     line_bot_api.reply_message(
                         ReplyMessageRequest(
                             reply_token=event.reply_token,
@@ -660,12 +654,12 @@ def handle_message(event: MessageEvent):
                     return
 
                 # ✅ 姓名有效 → 進入確認姓名
-                PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                set_state(line_user_id_for_state,{
                     "step": "confirm_name_after_claim",
                     "zendesk_user_id": found.get("id"),
                     "phone": phone,
                     "found_name": found_name,
-                }
+                })
 
                 buttons_template = ButtonsTemplate(
                     title="確認姓名",
@@ -686,7 +680,7 @@ def handle_message(event: MessageEvent):
 
             if len(matched) == 0:
                 if mode == "already_bound":
-                    del PENDING_REGISTRATIONS[line_user_id_for_state]
+                    clear_state(line_user_id_for_state)
                     line_bot_api.reply_message(
                         ReplyMessageRequest(
                             reply_token=event.reply_token,
@@ -753,11 +747,11 @@ def handle_message(event: MessageEvent):
                 # ✅ 若 profile_status 不是 complete（例如 need_name）→ 直接導向補姓名（不要走認領）
                 bound_name = (bound_user.get("name") or "").strip()
                 if bound_profile != PROFILE_STATUS_COMPLETE or (not is_valid_name(bound_name)):
-                    PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                    set_state(line_user_id_for_state,  {
                         "step": "wait_consent_name_after_phone",
                         "zendesk_user_id": bound_user.get("id"),
                         "phone": (bound_phone or digits),
-                    }
+                    })
                     reply_consent_input(
                         line_bot_api=line_bot_api,
                         event=event,
@@ -792,11 +786,11 @@ def handle_message(event: MessageEvent):
 
                     # ✅ Case 1：姓名是 placeholder → 直接補姓名（要同意開關）
                     if not is_valid_name(found_name):
-                        PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                        set_state(line_user_id_for_state, {
                             "step": "wait_consent_name_after_phone",
                             "zendesk_user_id": found.get("id"),
                             "phone": digits,
-                        }
+                        })
                         reply_consent_input(
                             line_bot_api=line_bot_api,
                             event=event,
@@ -809,12 +803,12 @@ def handle_message(event: MessageEvent):
 
 
                     # ✅ Case 2：姓名有效 → 進入「確認姓名是否正確」的按鈕
-                    PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                    set_state(line_user_id_for_state, {
                         "step": "confirm_name_after_claim",
                         "zendesk_user_id": found.get("id"),
                         "phone": digits,
                         "found_name": found_name,
-                    }
+                    })
 
                     buttons_template = ButtonsTemplate(
                         title="確認姓名",
@@ -835,14 +829,14 @@ def handle_message(event: MessageEvent):
 
                 if len(unbound) > 1:
                     # 進入「多筆資料 → 輸入姓名縮小範圍」
-                    PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                    set_state(line_user_id_for_state, {
                         "step": "ask_name_for_multi_claim",
                         "phone": digits,
                         "candidates": [
                             {"id": u.get("id"), "name": u.get("name") or ""}
                             for u in unbound
                         ],
-                    }
+                    })
                     line_bot_api.reply_message(
                         ReplyMessageRequest(
                             reply_token=event.reply_token,
@@ -869,12 +863,12 @@ def handle_message(event: MessageEvent):
 
                         # 姓名不完整 → 走補姓名（之後會寫回並綁定）
                         if not is_valid_name(found_name):
-                            PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                            set_state(line_user_id_for_state, {
                                 "step": "ask_name_after_phone",
                                 "zendesk_user_id": found.get("id"),
                                 "phone": found_phone,
                                 "found_name": found_name,
-                            }
+                            })
                             line_bot_api.reply_message(
                                 ReplyMessageRequest(
                                     reply_token=event.reply_token,
@@ -888,12 +882,12 @@ def handle_message(event: MessageEvent):
                         return
 
                     # 不是綁到自己（或多筆混雜）→ 依規格：先輸入姓名比對，失敗才叫客服
-                    PENDING_REGISTRATIONS[line_user_id_for_state] = {
+                    set_state(line_user_id_for_state, {
                         "step": "ask_name_for_multi_claim",
                         "phone": digits,
                         "candidates": [{"id": u.get("id"), "name": u.get("name") or "", "external_id": (u.get("external_id") or "")} for u in candidates],
                         "mode": "already_bound",  # 用來讓後續分支知道這是「已綁走」情境
-                    }
+                    })
                     line_bot_api.reply_message(
                         ReplyMessageRequest(
                             reply_token=event.reply_token,
@@ -970,7 +964,7 @@ def handle_message(event: MessageEvent):
                 state["zendesk_user_id"] = user.get("id") or state.get("zendesk_user_id")
                 state["phone"] = digits
                 state["step"] = "wait_consent_name_after_phone"
-                PENDING_REGISTRATIONS[line_user_id_for_state] = state
+                set_state(line_user_id_for_state, state)
 
                 reply_consent_input(
                     line_bot_api=line_bot_api,
@@ -984,7 +978,7 @@ def handle_message(event: MessageEvent):
 
 
             # 姓名有效 → 清狀態 → 放行選日期範圍
-            del PENDING_REGISTRATIONS[line_user_id_for_state]
+            clear_state(line_user_id_for_state)
 
             info_text = (
                 "已為您完成基本資料建檔\n"
@@ -998,7 +992,7 @@ def handle_message(event: MessageEvent):
 
         # 0-3. 例外 step → reset
         else:
-            del PENDING_REGISTRATIONS[line_user_id_for_state]
+            clear_state(line_user_id_for_state)
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
@@ -1164,11 +1158,11 @@ def handle_message(event: MessageEvent):
 
             # ✅ Case 1：已經有 phone（已確認）但 name 需要補（need_name / placeholder）
             if phone_ok and (not name_ok or profile_status == PROFILE_STATUS_NEED_NAME):
-                PENDING_REGISTRATIONS[line_user_id] = {
+                set_state(line_user_id_for_state, {
                     "step": "ask_name_after_phone",
                     "zendesk_user_id": user.get("id"),
                     "phone": phone_digits,
-                }
+                })
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
@@ -1188,7 +1182,7 @@ def handle_message(event: MessageEvent):
                 return
 
         # ✅ Case 3：其餘（查不到、沒有 phone、未綁、等等）→ 才走 consent → ask_phone
-        PENDING_REGISTRATIONS[line_user_id] = {"step": "wait_consent_phone"}
+        set_state(line_user_id, {"step": "wait_consent_phone"})
 
         reply_consent_input(
             line_bot_api=line_bot_api,
@@ -1301,11 +1295,11 @@ def handle_message(event: MessageEvent):
             app.logger.error(f"取得 LINE Profile 失敗: {e}")
             # 拿不到就維持預設「您好」
 
-        # 3. 把狀態記在 PENDING_REGISTRATIONS 裡，進入 ask_name 流程
-        PENDING_REGISTRATIONS[line_user_id] = {
+        # 3. 把狀態記在 state 裡，進入 ask_name 流程
+        set_state(line_user_id_for_state, {
             "step": "ask_name",
             "display_name": display_name,
-        }
+        })
 
         reply_text = (
             f"{display_name} 您好，歡迎使用線上預約服務。\n"
@@ -1774,7 +1768,9 @@ def handle_message(event: MessageEvent):
     # === fallback：使用者直接輸入手機，但尚未進入任何流程 ===
     if uid:
         digits = normalize_phone(text)
-        if len(digits) == 10 and digits.startswith("09") and uid not in PENDING_REGISTRATIONS:
+        # ✅ Redis：若目前沒有任何 pending state，才走 fallback-phone
+        st = get_state(uid)
+        if len(digits) == 10 and digits.startswith("09") and (not st or not st.get("step")):
             app.logger.info(f"[fallback-phone] uid={uid} digits={digits}")
             line_bot_api.reply_message(
                 ReplyMessageRequest(
@@ -1822,7 +1818,6 @@ def handle_postback(event):
             return
         enter_input_step(
             line_bot_api=line_bot_api,
-            pending_dict=PENDING_REGISTRATIONS,
             event=event,
             line_user_id=line_user_id,
             step="ask_phone",
@@ -1830,20 +1825,51 @@ def handle_postback(event):
         )
         return
     
+    # ===== 同意開始輸入姓名（手機已確認後補姓名）=====
     if data == "CONSENT_NAME_AFTER_PHONE":
         if not line_user_id:
             return
 
-        state = get_state(line_user_id)
-        step = state.get("step")
+        state = get_state(line_user_id) or {}
+
+        # state 不見也能重建（避免 bad_state / Redis TTL / worker restart）
+        if not state:
+            try:
+                count, user = search_zendesk_user_by_line_id(line_user_id, retries=1)
+            except Exception as e:
+                app.logger.error(
+                    f"[CONSENT_NAME_AFTER_PHONE][fallback] search failed uid={line_user_id} err={e}"
+                )
+                user = None
+
+            if user:
+                state = {
+                    "step": "wait_consent_name_after_phone",
+                    "zendesk_user_id": user.get("id"),
+                    "phone": normalize_phone(user.get("phone") or ""),
+                }
+                set_state(line_user_id, state)
+                app.logger.info(
+                    f"[CONSENT_NAME_AFTER_PHONE][fallback] rebuilt uid={line_user_id} "
+                    f"user_id={state.get('zendesk_user_id')} phone={state.get('phone')}"
+                )
+            else:
+                app.logger.warning(f"[CONSENT_NAME_AFTER_PHONE] fallback_not_found uid={line_user_id}")
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="找不到您的資料，請重新輸入「線上約診」。")]
+                    )
+                )
+                return
+
+        step = (state.get("step") or "").strip()
 
         # 允許兩種狀態：
         # 1) wait_consent_name_after_phone：按同意後才開始輸入
-        # 2) ask_name_after_phone：代表已經進入輸入狀態了（就不要再改 state，只提示他輸入）
+        # 2) ask_name_after_phone：代表已進入輸入狀態了（不要重設 state，只提醒他輸入）
         if step not in {"wait_consent_name_after_phone", "ask_name_after_phone"}:
-            app.logger.warning(
-                f"[CONSENT_NAME_AFTER_PHONE] bad_state uid={line_user_id} state={state}"
-            )
+            app.logger.warning(f"[CONSENT_NAME_AFTER_PHONE] bad_state uid={line_user_id} state={state}")
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
@@ -1852,7 +1878,7 @@ def handle_postback(event):
             )
             return
 
-        # 已經在 ask_name_after_phone，就只提醒輸入姓名，不要重設 state
+        # 已經在 ask_name_after_phone：只提醒輸入姓名，不要重設 state
         if step == "ask_name_after_phone":
             line_bot_api.reply_message(
                 ReplyMessageRequest(
@@ -1868,80 +1894,6 @@ def handle_postback(event):
 
         enter_input_step(
             line_bot_api=line_bot_api,
-            pending_dict=PENDING_REGISTRATIONS,
-            event=event,
-            line_user_id=line_user_id,
-            step="ask_name_after_phone",
-            prompt_text="好的，請輸入您的真實姓名（全名）：",
-            extra_state={
-                "zendesk_user_id": zendesk_user_id,
-                "phone": phone,
-            },
-        )
-        return
-    
-    if data == "CONSENT_NAME_AFTER_PHONE":
-        if not line_user_id:
-            return
-
-        state = PENDING_REGISTRATIONS.get(line_user_id) or {}
-
-        # ✅ fallback：state 不見也能重建（避免 bad_state）
-        if not state:
-            try:
-                count, user = search_zendesk_user_by_line_id(line_user_id, retries=1)
-            except Exception as e:
-                app.logger.error(f"[CONSENT_NAME_AFTER_PHONE][fallback] search failed uid={line_user_id} err={e}")
-                user = None
-
-            if user:
-                state = {
-                    "step": "wait_consent_name_after_phone",  # 讓你下面流程吃得到
-                    "zendesk_user_id": user.get("id"),
-                    "phone": normalize_phone(user.get("phone") or ""),
-                }
-                PENDING_REGISTRATIONS[line_user_id] = state
-                app.logger.info(
-                    f"[CONSENT_NAME_AFTER_PHONE][fallback] rebuilt uid={line_user_id} "
-                    f"user_id={state.get('zendesk_user_id')} phone={state.get('phone')}"
-                )
-            else:
-                app.logger.warning(f"[CONSENT_NAME_AFTER_PHONE] fallback_not_found uid={line_user_id}")
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="找不到您的資料，請重新輸入「線上約診」。")]
-                    )
-                )
-                return
-
-        step = state.get("step")
-
-        if step not in {"wait_consent_name_after_phone", "ask_name_after_phone"}:
-            app.logger.warning(f"[CONSENT_NAME_AFTER_PHONE] bad_state uid={line_user_id} state={state}")
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text="流程狀態異常，請重新輸入「線上約診」。")]
-                )
-            )
-            return
-
-        if step == "ask_name_after_phone":
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text="好的，請直接輸入您的真實姓名（全名）：")]
-                )
-            )
-            return
-
-        zendesk_user_id = state.get("zendesk_user_id")
-        phone = state.get("phone")
-
-        enter_input_step(
-            line_bot_api=line_bot_api,
-            pending_dict=PENDING_REGISTRATIONS,
             event=event,
             line_user_id=line_user_id,
             step="ask_name_after_phone",
@@ -1949,6 +1901,125 @@ def handle_postback(event):
             extra_state={"zendesk_user_id": zendesk_user_id, "phone": phone},
         )
         return
+
+    
+    # if data == "CONSENT_NAME_AFTER_PHONE":
+    #     if not line_user_id:
+    #         return
+
+    #     state = get_state(line_user_id)
+    #     step = state.get("step")
+
+    #     # 允許兩種狀態：
+    #     # 1) wait_consent_name_after_phone：按同意後才開始輸入
+    #     # 2) ask_name_after_phone：代表已經進入輸入狀態了（就不要再改 state，只提示他輸入）
+    #     if step not in {"wait_consent_name_after_phone", "ask_name_after_phone"}:
+    #         app.logger.warning(
+    #             f"[CONSENT_NAME_AFTER_PHONE] bad_state uid={line_user_id} state={state}"
+    #         )
+    #         line_bot_api.reply_message(
+    #             ReplyMessageRequest(
+    #                 reply_token=event.reply_token,
+    #                 messages=[TextMessage(text="流程狀態異常，請重新輸入「線上約診」。")]
+    #             )
+    #         )
+    #         return
+
+    #     # 已經在 ask_name_after_phone，就只提醒輸入姓名，不要重設 state
+    #     if step == "ask_name_after_phone":
+    #         line_bot_api.reply_message(
+    #             ReplyMessageRequest(
+    #                 reply_token=event.reply_token,
+    #                 messages=[TextMessage(text="好的，請直接輸入您的真實姓名（全名）：")]
+    #             )
+    #         )
+    #         return
+
+    #     # step == wait_consent_name_after_phone → 正常進入輸入
+    #     zendesk_user_id = state.get("zendesk_user_id")
+    #     phone = state.get("phone")
+
+    #     enter_input_step(
+    #         line_bot_api=line_bot_api,
+    #         event=event,
+    #         line_user_id=line_user_id,
+    #         step="ask_name_after_phone",
+    #         prompt_text="好的，請輸入您的真實姓名（全名）：",
+    #         extra_state={
+    #             "zendesk_user_id": zendesk_user_id,
+    #             "phone": phone,
+    #         },
+    #     )
+    #     return
+    
+    # if data == "CONSENT_NAME_AFTER_PHONE":
+    #     if not line_user_id:
+    #         return
+
+    #     state = get_state(line_user_id)
+
+    #     # ✅ fallback：state 不見也能重建（避免 bad_state）
+    #     if not state:
+    #         try:
+    #             count, user = search_zendesk_user_by_line_id(line_user_id, retries=1)
+    #         except Exception as e:
+    #             app.logger.error(f"[CONSENT_NAME_AFTER_PHONE][fallback] search failed uid={line_user_id} err={e}")
+    #             user = None
+
+    #         if user:
+    #             state = {
+    #                 "step": "wait_consent_name_after_phone",  # 讓你下面流程吃得到
+    #                 "zendesk_user_id": user.get("id"),
+    #                 "phone": normalize_phone(user.get("phone") or ""),
+    #             }
+    #             set_state(line_user_id, state)
+    #             app.logger.info(
+    #                 f"[CONSENT_NAME_AFTER_PHONE][fallback] rebuilt uid={line_user_id} "
+    #                 f"user_id={state.get('zendesk_user_id')} phone={state.get('phone')}"
+    #             )
+    #         else:
+    #             app.logger.warning(f"[CONSENT_NAME_AFTER_PHONE] fallback_not_found uid={line_user_id}")
+    #             line_bot_api.reply_message(
+    #                 ReplyMessageRequest(
+    #                     reply_token=event.reply_token,
+    #                     messages=[TextMessage(text="找不到您的資料，請重新輸入「線上約診」。")]
+    #                 )
+    #             )
+    #             return
+
+    #     step = state.get("step")
+
+    #     if step not in {"wait_consent_name_after_phone", "ask_name_after_phone"}:
+    #         app.logger.warning(f"[CONSENT_NAME_AFTER_PHONE] bad_state uid={line_user_id} state={state}")
+    #         line_bot_api.reply_message(
+    #             ReplyMessageRequest(
+    #                 reply_token=event.reply_token,
+    #                 messages=[TextMessage(text="流程狀態異常，請重新輸入「線上約診」。")]
+    #             )
+    #         )
+    #         return
+
+    #     if step == "ask_name_after_phone":
+    #         line_bot_api.reply_message(
+    #             ReplyMessageRequest(
+    #                 reply_token=event.reply_token,
+    #                 messages=[TextMessage(text="好的，請直接輸入您的真實姓名（全名）：")]
+    #             )
+    #         )
+    #         return
+
+    #     zendesk_user_id = state.get("zendesk_user_id")
+    #     phone = state.get("phone")
+
+    #     enter_input_step(
+    #         line_bot_api=line_bot_api,
+    #         event=event,
+    #         line_user_id=line_user_id,
+    #         step="ask_name_after_phone",
+    #         prompt_text="好的，請輸入您的真實姓名（全名）：",
+    #         extra_state={"zendesk_user_id": zendesk_user_id, "phone": phone},
+    #     )
+    #     return
 
 
 
@@ -2126,10 +2197,6 @@ def cron_run_voice_reminder():
     days = int(request.args.get("days", "1"))
     result = build_voice_groups_and_enqueue(days=days)
     return result, 200
-
-
-
-
 
 # 本機用5001，Azure則用賦予的port
 if __name__ == "__main__":

@@ -87,6 +87,11 @@ def show_dates_for_week(offset: int, event: MessageEvent):
     # --- 每個日期，如果有可預約時段，就變成一個 column ---
     for d in candidate_dates:
         date_str = d.isoformat()  # YYYY-MM-DD
+
+        ok, _ = validate_appointment_date(date_str)
+        if not ok:
+            continue
+
         available_slots = get_available_slots_for_date(date_str)
         if not available_slots:
             continue  # 沒有任何時段就略過
@@ -306,8 +311,11 @@ def validate_appointment_date(date_str: str) -> tuple[bool, str]:
     except ValueError:
         return False, "日期格式錯誤，請使用 YYYY-MM-DD，例如：2025-12-03"
 
-    today = datetime.today().date()
-    latest = today + timedelta(days=21)
+    # today = datetime.today().date()
+    # latest = today + timedelta(days=21)
+    today = datetime.now().date()
+    monday = today - timedelta(days=today.weekday())  # 本週一
+    latest = monday + timedelta(days=26)              # 第 4 週的週六
 
     if appt_date < today:
         return False, "目前無法預約過去的日期，請重新選擇預約日期。"

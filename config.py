@@ -64,11 +64,38 @@ REMINDER_DAYS_BEFORE = int(os.environ.get("REMINDER_DAYS_BEFORE", "3"))
 
 
 # ======== 預約時段相關設定（之後要改時段只改這裡） ========
-SLOT_START = "09:00"             # 看診起始時間（第一個）
-SLOT_END = "21:00"               # 看診結束時間（最後一個）
-SLOT_INTERVAL_MINUTES = 30       # 每一格 slot 間隔（目前半小時）
-APPOINTMENT_DURATION_MINUTES = 30  # 實際預約時長（要跟 Bookings duration 對齊）
-WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]# 禮拜幾
+# SLOT_START = "09:00"             # 看診起始時間（第一個）
+# SLOT_END = "21:00"               # 看診結束時間（最後一個）
+# SLOT_INTERVAL_MINUTES = 20       # 每一格 slot 間隔（目前半小時）
+# APPOINTMENT_DURATION_MINUTES = 20  # 實際預約時長（要跟 Bookings duration 對齊）
+
+# #每週例外規則
+# WED_START = "12:00"    # 週三從中午開始
+# SAT_END = "12:00"      # 週六只到中午
+# CLOSED_WEEKDAYS = {6}  # 週日不看（0=Mon ... 6=Sun）
+
+# WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]# 禮拜幾
+
+SLOT_MINUTES = 20
+SLOT_INTERVAL_MINUTES = SLOT_MINUTES
+APPOINTMENT_DURATION_MINUTES = SLOT_MINUTES
+
+MORNING_START = "09:00"
+MORNING_END   = "12:20"
+
+AFTERNOON_START = "16:30"
+AFTERNOON_END   = "19:50"
+
+FRI_MORNING_START = MORNING_START
+FRI_MORNING_END   = MORNING_END
+
+SAT_MORNING_START = MORNING_START
+SAT_MORNING_END   = MORNING_END
+
+CLOSED_WEEKDAYS = {2, 6}  # 週三、週日
+
+WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]
+
 
 
 # ======== 診所資料（ ========
