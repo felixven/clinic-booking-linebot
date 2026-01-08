@@ -6,7 +6,8 @@ import json, os
 
 import requests
 
-from flask import current_app as app
+# from flask import current_app as app
+from flask_app import app 
 
 from line_client import line_bot_api
 from linebot.v3.messaging import (
@@ -31,6 +32,7 @@ from zendesk_core import (
     mark_zendesk_ticket_queued,
     get_line_user_id_from_ticket,
     _get_ticket_cf_value,
+    increment_reminder_attempts,
 )
 
 from config import (
@@ -83,7 +85,7 @@ from linebot.v3.messaging import (
 
 
 
-# 正式好版本
+# 正式好版本 #0102已經被廢除
 def send_line_reminder(line_user_id: str, appt: dict):
     """
     純粹負責發 LINE 回診提醒（push，不是 reply）。
@@ -291,7 +293,7 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
 
 
 
-#正常正式版
+#正常正式版 #0102已經被廢除
 def send_line_reminder_and_log(ticket: dict, appt: dict, days_before: int | None) -> bool:
     """
     整合流程：
@@ -501,57 +503,68 @@ def process_reminder_group(
     - 把這組裡所有 ticket 的 reminder_state 改成 queued 並寫入備註
     """
 
-    app.logger.info(f"[process_reminder_group] START job for line_user_id={line_user_id} items={len(items)}")
-
-    if not items:
+    with app.app_context():
         app.logger.info(
-            f"[process_reminder_group] line_user_id={line_user_id}, date={appt_date_str} items 為空，略過"
+                f"[process_reminder_group] START job for line_user_id={line_user_id} items={len(items)}"
+            )
+        # app.logger.info(f"[process_reminder_group] START job for line_user_id={line_user_id} items={len(items)}")
+
+        if not items:
+            app.logger.info(
+                f"[process_reminder_group] line_user_id={line_user_id}, date={appt_date_str} items 為空，略過"
+            )
+            return 0
+
+        app.logger.info(
+            f"[process_reminder_group] 開始處理 line_user_id={line_user_id}, "
+            f"date={appt_date_str}, days_before={days_before}, tickets_in_group={len(items)}"
         )
-        return 0
 
-    app.logger.info(
-        f"[process_reminder_group] 開始處理 line_user_id={line_user_id}, "
-        f"date={appt_date_str}, days_before={days_before}, tickets_in_group={len(items)}"
-    )
-
-    # 1) 先推播一次（只用 items 的 appt 組 carousel）
-    try:
-        appts = [appt for (_, appt) in items if appt]
-        send_line_reminder_with_appts(line_user_id, appts)
-    except Exception as e:
-        app.logger.error(
-            f"[process_reminder_group] 推播 LINE 失敗，整組不更新（避免狀態不同步）: {e}"
-        )
-        return 0
-
-    # 2) 推播成功後：把整組 tickets 都 queued + note
-    processed = 0
-    for ticket, appt in items:
-        ticket_id = ticket.get("id") if ticket else None
-        if not ticket_id:
-            continue
-
+        # 1) 先推播一次（只用 items 的 appt 組 carousel）
         try:
-            mark_zendesk_ticket_queued(ticket_id, ticket)
+            appts = [appt for (_, appt) in items if appt]
+            send_line_reminder_with_appts(line_user_id, appts)
         except Exception as e:
             app.logger.error(
-                f"[process_reminder_group] ticket_id={ticket_id} 更新 reminder_state=queued 失敗: {e}"
+                f"[process_reminder_group] 推播 LINE 失敗，整組不更新（避免狀態不同步）: {e}"
             )
+            return 0
 
-        try:
-            add_zendesk_reminder_comment(ticket_id, appt, days_before)
-        except Exception as e:
-            app.logger.error(
-                f"[process_reminder_group] ticket_id={ticket_id} 新增提醒備註失敗: {e}"
-            )
+        # 2) 推播成功後：把整組 tickets 都 queued + note
+        processed = 0
+        for ticket, appt in items:
+            ticket_id = ticket.get("id") if ticket else None
+            if not ticket_id:
+                continue
 
-        processed += 1
+            try:
+                mark_zendesk_ticket_queued(ticket_id, ticket)
+            except Exception as e:
+                app.logger.error(
+                    f"[process_reminder_group] ticket_id={ticket_id} 更新 reminder_state=queued 失敗: {e}"
+                )
 
-    app.logger.info(
-        f"[process_reminder_group] 完成 line_user_id={line_user_id}, date={appt_date_str}, "
-        f"days_before={days_before}，共處理 {processed} 張 ticket"
-    )
-    return processed
+            try:
+                increment_reminder_attempts(ticket_id, reason="msg_callback_sent")
+            except Exception as e:
+                app.logger.error(
+                    f"[process_reminder_group] ticket_id={ticket_id} attempts+1 失敗: {e}"
+                )
+
+            try:
+                add_zendesk_reminder_comment(ticket_id, appt, days_before)
+            except Exception as e:
+                app.logger.error(
+                    f"[process_reminder_group] ticket_id={ticket_id} 新增提醒備註失敗: {e}"
+                )
+
+            processed += 1
+
+        app.logger.info(
+            f"[process_reminder_group] 完成 line_user_id={line_user_id}, date={appt_date_str}, "
+            f"days_before={days_before}，共處理 {processed} 張 ticket"
+        )
+        return processed
 
 
 

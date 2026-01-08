@@ -53,6 +53,26 @@ from utils import(
     can_cancel
 )
 
+def safe_reply(event, messages, *, uid=None, where="", appt_id=""):
+    """
+    最小止血：reply_message 超時/失敗時不炸 webhook，不讓 worker 被拖死。
+    - uid / where / appt_id 用來 log
+    """
+    try:
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=messages
+            )
+        )
+        return True
+    except Exception as e:
+        app.logger.error(
+            f"[LINE_REPLY_FAIL] where={where} uid={uid} appt_id={appt_id} err={repr(e)}"
+        )
+        return False
+
+
 def get_days_until(local_dt: datetime) -> int:
     """
     傳入「台北時間的預約起始 datetime」，回傳「距離今天還有幾天」（用日曆天數）。
@@ -478,31 +498,53 @@ def flow_confirm_visit(event, text: str):
     # else:
     #     appt, local_start = get_appointment_by_id(appt_id)
 
+    uid = getattr(getattr(event, "source", None), "user_id", None)
+
     parts = text.split(maxsplit=1)
     appt_id = parts[1].strip() if len(parts) >= 2 else ""
 
-    # ✅ 現在：沒有 appt_id 就直接擋掉，不再幫他抓「下一筆預約」
+    # 現在：沒有 appt_id 就直接擋掉，不再幫他抓「下一筆預約」
+    # if not appt_id:
+    #     line_bot_api.reply_message(
+    #         ReplyMessageRequest(
+    #             reply_token=event.reply_token,
+    #             messages=[TextMessage(text="請先點選「約診查詢」中的列表按鈕進行回診確認。")]
+    #         )
+    #     )
+    #     return
     if not appt_id:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="請先點選「約診查詢」中的列表按鈕進行回診確認。")]
-            )
+        safe_reply(
+            event,
+            [TextMessage(text="請先點選「約診查詢」中的列表按鈕進行回診確認。")],
+            uid=uid,
+            where="flow_confirm_visit:missing_appt_id",
+            appt_id=appt_id,
         )
         return
+
 
     # 有帶 id 才會真的去撈那一筆預約
     appt, local_start = get_appointment_by_id(appt_id)
 
 
+    # if not appt or not local_start:
+    #     line_bot_api.reply_message(
+    #         ReplyMessageRequest(
+    #             reply_token=event.reply_token,
+    #             messages=[TextMessage(text="找不到需要確認的約診，請先使用「約診查詢」確認預約狀態。")]
+    #         )
+    #     )
+    #     return
     if not appt or not local_start:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="找不到需要確認的約診，請先使用「約診查詢」確認預約狀態。")]
-            )
+        safe_reply(
+            event,
+            [TextMessage(text="找不到需要確認的約診，請先使用「約診查詢」確認預約狀態。")],
+            uid=uid,
+            where="flow_confirm_visit:appt_not_found",
+            appt_id=appt_id,
         )
         return
+
 
     days_left = get_days_until(local_start)
     display_date = local_start.strftime("%Y/%m/%d")
@@ -516,11 +558,18 @@ def flow_confirm_visit(event, text: str):
             f"目前距離看診日仍大於 {CONFIRM_OPEN_DAYS_BEFORE} 天，暫不開放線上確認回診。\n"
             f"可於看診前 {CONFIRM_OPEN_DAYS_BEFORE} 天內再透過 LINE 進行確認。"
         )
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=msg)]
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[TextMessage(text=msg)]
+        #     )
+        # )
+        safe_reply(
+            event,
+            [TextMessage(text=msg)],
+            uid=uid,
+            where="flow_confirm_visit:too_early",
+            appt_id=appt_id,
         )
         return
 
@@ -554,13 +603,20 @@ def flow_confirm_visit(event, text: str):
             template=buttons_template
         )
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[detail_message, template_message]
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[detail_message, template_message]
+        #     )
+        # )
+        safe_reply(
+            event,
+            [detail_message, template_message],
+            uid=uid,
+            where="flow_confirm_visit:already_confirmed",
+            appt_id=appt_id,
         )
-        return  # ⬅ 一定要 return，避免下面再 PATCH
+        return  # 一定要 return，避免下面再 PATCH
 
     # ③ 尚未確認 → 這裡才會真的 PATCH，一次寫入 Confirmed via LINE
     now_local = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
@@ -620,10 +676,18 @@ def flow_confirm_visit(event, text: str):
         template=buttons_template
     )
 
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[detail_message, template_message]
-        )
+    # line_bot_api.reply_message(
+    #     ReplyMessageRequest(
+    #         reply_token=event.reply_token,
+    #         messages=[detail_message, template_message]
+    #     )
+    # )
+    safe_reply(
+        event,
+        [detail_message, template_message],
+        uid=uid,
+        where="flow_confirm_visit:confirmed",
+        appt_id=appt_id,
     )
+
     return

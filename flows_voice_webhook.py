@@ -68,13 +68,26 @@ def handle_livehub_webhook(data: dict):
         or data.get("call_id")
         or data.get("sessionId")
         or data.get("id")
-        or data.get("conversationId")   # <--- 加這個
+        or data.get("conversationId")
         or (data.get("call") or {}).get("id")
     )
 
 
     call_status = data.get("callStatus") or data.get("status") or data.get("call_status")
     result = _normalize_status(call_status)
+    status_lc= (call_status or "").strip().lower()
+
+    if status_lc in ("answered", "ringing", "connecting"):
+        app.logger.info(f"[voice_webhook] skip status={call_status} (wait for completed)")
+        return
+
+    reason_code = data.get("reasonCode") or ""
+    call_duration = data.get("callDuration")  # 可能是 float/int/None
+
+    if call_duration is None:
+        call_duration_str = ""
+    else:
+        call_duration_str = str(call_duration)
 
     metadata = _get_metadata(data)
 
@@ -132,8 +145,10 @@ def handle_livehub_webhook(data: dict):
              mark_zendesk_ticket_voice_attempted(
                     ticket_id=int(tid),
                     call_id=str(call_id),
-                    call_status=str(call_status or ""),
+                    call_status=f"{call_status or ''}|{result}".strip("|"),
                     attempted_date=today_str,
+                    reason_code=reason_code,
+                    call_duration=call_duration_str,
                 )
         except Exception as e:
             app.logger.error(f"[voice_webhook] update ticket failed tid={tid}: {e}")

@@ -15,6 +15,10 @@ configuration = Configuration(
 )
 configuration.ssl_ca_cert = certifi.where()
 
+configuration.connection_timeout = 5   # 連線最多等 5 秒
+configuration.read_timeout = 5         # 讀 response 最多等 5 秒
+
+
 api_client = ApiClient(configuration)
 line_bot_api = MessagingApi(api_client)
 

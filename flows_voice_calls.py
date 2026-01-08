@@ -13,7 +13,10 @@ from zendesk_core import (
     mark_zendesk_ticket_queued,
     mark_zendesk_ticket_voice_attempted,
     _get_ticket_cf_value, #demo zendesk 串copilot
+    increment_reminder_attempts
 )
+
+from flask_app import app 
 
 from config import (
     PROFILE_STATUS_EMPTY,
@@ -26,7 +29,6 @@ from config import (
     ZENDESK_CF_APPOINTMENT_DATE,
     ZENDESK_CF_APPOINTMENT_TIME,
     ZENDESK_CF_REMINDER_STATE,
-    ZENDESK_CF_REMINDER_ATTEMPTS,
     ZENDESK_CF_LAST_CALL_ID,
     ZENDESK_UF_LINE_USER_ID_KEY,
     ZENDESK_UF_PROFILE_STATUS_KEY,
@@ -174,121 +176,131 @@ def process_voice_call_group(line_user_id: str, appt_date_str: str, ticket_ids: 
     - metadata 帶 ticketIds，讓 webhook 回來可以更新整組
     - Zendesk 更新（attempts/date/note）留給 webhook 處理
     """
-    if not LIVEHUB_BOT_ID or not LIVEHUB_NOTIFY_URL:
-        app.logger.error("[VOICE GROUP] 缺 bot ID 或 notifyUrl")
-        return
 
-    if not ticket_ids:
-        app.logger.warning("[VOICE GROUP] ticket_ids 為空，略過")
-        return
-    # 0) 外撥前先鎖票（queued）避免重複撥打
-    # 這裡會 attempts + 1（因為你的 mark_zendesk_ticket_queued 就是這樣設計）
-    for tid in ticket_ids:
-        if not tid:
-            continue
-        try:
-            # 用第一張 ticket 的資料可以算 attempts，但你這裡為了最小改動就不帶 ticket
-            mark_zendesk_ticket_queued(ticket_id=int(tid), ticket=None)
-        except Exception as e:
-            app.logger.error(f"[VOICE GROUP] lock queued failed tid={tid}: {e}")
+    with app.app_context():
+        if not LIVEHUB_BOT_ID or not LIVEHUB_NOTIFY_URL:
+            app.logger.error("[VOICE GROUP] 缺 bot ID 或 notifyUrl")
+            return
 
-
-    # 1) 用第一張 ticket 找 requester → phone/name
-    first_ticket_id = int(ticket_ids[0])
-    ticket = get_zendesk_ticket_by_id(first_ticket_id)
-    if not ticket:
-        app.logger.error(f"[VOICE GROUP] 取不到 ticket: {first_ticket_id}")
-        return
-
-    requester_id = ticket.get("requester_id")
-    if not requester_id:
-        app.logger.error(f"[VOICE GROUP] ticket_id={first_ticket_id} 缺 requester_id")
-        return
-
-    user = get_zendesk_user_by_id(int(requester_id))
-    patient_name = (user or {}).get("name") or "貴賓"
-    phone = extract_phone_from_zendesk_user(user)
+        if not ticket_ids:
+            app.logger.warning("[VOICE GROUP] ticket_ids 為空，略過")
+            return
+        # 0) 外撥前先鎖票（queued）避免重複撥打
     
-    # ✅ 測試模式：強制覆蓋電話（避免用假資料）
-    if VOICE_DEMO_MODE and VOICE_TEST_PHONE:
-        app.logger.warning(
-            "[VOICE DEMO] override phone %s -> %s",
-            phone,
-            VOICE_TEST_PHONE
-        )
-        phone = VOICE_TEST_PHONE
-
-    if not phone:
-        app.logger.error(
-            f"[VOICE GROUP] requester_id={requester_id} 找不到 phone，無法外撥 ticket_ids={ticket_ids}"
-        )
-        return
-    app.logger.warning("[VOICE GROUP] final phone=%r target=%r", phone, f"tel:{phone}")
-
-
-    target = f"tel:{phone}"
-
-    # 2) metadata：最關鍵是 ticketIds（整組）
-    metadata = {
-        # Copilot 會用的（一定要對齊）
-        "patientName": patient_name,
-        "appointmentDate": appt_date_str,
-        "appointmentCount": len(ticket_ids),
-
-        # 先留著，Copilot 不用
-        "lineUserId": line_user_id,
-        "ticketIds": ",".join(str(x) for x in ticket_ids),
-    }   
-    # metadata = {
-    #     "lineUserId": line_user_id,
-    #     "apptDate": appt_date_str,
-    #     "ticketIds": [int(x) for x in ticket_ids],
-    #     "patientName": patient_name,
-    #     "phone": phone,
-    # }
-
-    payload = {
-        "bot": LIVEHUB_BOT_ID,
-        "notifyUrl": LIVEHUB_NOTIFY_URL,
-        "machineDetection": "disconnect",
-        "voicemailEndTimeoutSec": 20,
-        "target": target,
-        "caller": LIVEHUB_CALLER,
-        "metadata": metadata,
-    }
-
-    url = LIVEHUB_BASE_URL + LIVEHUB_DIALOUT_PATH
-    headers = _build_livehub_headers()
-
-    app.logger.info(
-        "[VOICE] FINAL dialout payload = %s",
-        json.dumps(payload, ensure_ascii=False)
-    )
-
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        app.logger.warning("[VOICE GROUP] LiveHub status=%s body=%s", resp.status_code, (resp.text or "")[:300])
-        resp.raise_for_status()
-        data = resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text
-        app.logger.info(f"[VOICE GROUP] LiveHub response={data}")
-    except Exception as e:
-        app.logger.error(f"[VOICE GROUP] dialout 失敗: {e}")
-
-        # dialout 失敗也要回寫 Zendesk（避免隔天重跑一直打）
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        # 這裡會 attempts + 1（因為你的 mark_zendesk_ticket_queued 就是這樣設計）
         for tid in ticket_ids:
             if not tid:
                 continue
             try:
-                mark_zendesk_ticket_voice_attempted(
-                    ticket_id=int(tid),
-                    call_id="",
-                    call_status="dialout_failed",
-                    attempted_date=today_str,
-                )
-            except Exception as ee:
-                app.logger.error(f"[VOICE GROUP] update failed tid={tid}: {ee}")
-        return
+                # 用第一張 ticket 的資料可以算 attempts，但你這裡為了最小改動就不帶 ticket
+                mark_zendesk_ticket_queued(ticket_id=int(tid), ticket=None)
+            except Exception as e:
+                app.logger.error(f"[VOICE GROUP] lock queued failed tid={tid}: {e}")
+
+
+        # 1) 用第一張 ticket 找 requester → phone/name
+        first_ticket_id = int(ticket_ids[0])
+        ticket = get_zendesk_ticket_by_id(first_ticket_id)
+        if not ticket:
+            app.logger.error(f"[VOICE GROUP] 取不到 ticket: {first_ticket_id}")
+            return
+
+        requester_id = ticket.get("requester_id")
+        if not requester_id:
+            app.logger.error(f"[VOICE GROUP] ticket_id={first_ticket_id} 缺 requester_id")
+            return
+
+        user = get_zendesk_user_by_id(int(requester_id))
+        patient_name = (user or {}).get("name") or "貴賓"
+        phone = extract_phone_from_zendesk_user(user)
+    
+        # ✅ 測試模式：強制覆蓋電話（避免用假資料）
+        if VOICE_DEMO_MODE and VOICE_TEST_PHONE:
+            app.logger.warning(
+                "[VOICE DEMO] override phone %s -> %s",
+                phone,
+                VOICE_TEST_PHONE
+            )
+            phone = VOICE_TEST_PHONE
+
+        if not phone:
+            app.logger.error(
+                f"[VOICE GROUP] requester_id={requester_id} 找不到 phone，無法外撥 ticket_ids={ticket_ids}"
+            )
+            return
+        app.logger.warning("[VOICE GROUP] final phone=%r target=%r", phone, f"tel:{phone}")
+
+
+        target = f"tel:{phone}"
+
+        # 2) metadata：最關鍵是 ticketIds（整組）
+        metadata = {
+            # Copilot 會用的（一定要對齊）
+            "patientName": patient_name,
+            "appointmentDate": appt_date_str,
+            "appointmentCount": len(ticket_ids),
+
+            # 先留著，Copilot 不用
+            "lineUserId": line_user_id,
+            "ticketIds": ",".join(str(x) for x in ticket_ids),
+        }   
+        # metadata = {
+        #     "lineUserId": line_user_id,
+        #     "apptDate": appt_date_str,
+        #     "ticketIds": [int(x) for x in ticket_ids],
+        #     "patientName": patient_name,
+        #     "phone": phone,
+        # }
+
+        payload = {
+            "bot": LIVEHUB_BOT_ID,
+            "notifyUrl": LIVEHUB_NOTIFY_URL,
+            "machineDetection": "disconnect",
+            "voicemailEndTimeoutSec": 20,
+            "target": target,
+            "caller": LIVEHUB_CALLER,
+            "metadata": metadata,
+        }
+
+        url = LIVEHUB_BASE_URL + LIVEHUB_DIALOUT_PATH
+        headers = _build_livehub_headers()
+
+        app.logger.info(
+            "[VOICE] FINAL dialout payload = %s",
+            json.dumps(payload, ensure_ascii=False)
+        )
+
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+            app.logger.warning("[VOICE GROUP] LiveHub status=%s body=%s", resp.status_code, (resp.text or "")[:300])
+            resp.raise_for_status()
+            for tid in ticket_ids:
+                if not tid:
+                    continue
+                try:
+                    increment_reminder_attempts(int(tid), reason="voice_dialout_requested")
+                except Exception as ee:
+                    app.logger.error(f"[VOICE GROUP] attempts+1 failed tid={tid}: {ee}")
+            data = resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text
+            app.logger.info(f"[VOICE GROUP] LiveHub response={data}")
+        except Exception as e:
+            app.logger.error(f"[VOICE GROUP] dialout 失敗: {e}")
+
+            # dialout 失敗也要回寫 Zendesk（避免隔天重跑一直打）
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            for tid in ticket_ids:
+                if not tid:
+                    continue
+                try:
+                    mark_zendesk_ticket_voice_attempted(
+                        ticket_id=int(tid),
+                        call_id="",
+                        call_status="dialout_failed",
+                        attempted_date=today_str,
+                    )
+                except Exception as ee:
+                    app.logger.error(f"[VOICE GROUP] update failed tid={tid}: {ee}")
+            return
     
 #demo zendesk串到copilot
 def process_voice_call_demo_from_zendesk(line_user_id: str, appt_date_str: str, ticket_ids: list[int]):

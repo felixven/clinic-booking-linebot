@@ -2,6 +2,7 @@ import requests
 import json, uuid, time
 
 from flask import Flask, request, abort,jsonify
+from flask_app import app
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -41,7 +42,8 @@ from zendesk_core import (
     upsert_zendesk_user_basic_profile,
     create_zendesk_appointment_ticket,
     search_zendesk_users_by_phone,
-    _build_zendesk_headers
+    _build_zendesk_headers,
+    run_fail_queued_tickets
 )
 
 from patient_core import (
@@ -101,27 +103,8 @@ def health_check():
     return "OK", 200
 
 from config import (
-    WEEKDAY_ZH,
-    BOOKING_DEMO_SERVICE_ID,
-    BOOKING_DEMO_STAFF_ID,
-    BOOKING_BUSINESS_ID,
-    GRAPH_TENANT_ID,
-    GRAPH_CLIENT_ID,
-    GRAPH_CLIENT_SECRET,
-    ZENDESK_SUBDOMAIN,
-    ZENDESK_EMAIL,
-    ZENDESK_API_TOKEN,
     ZENDESK_UF_LINE_USER_ID_KEY,
     ZENDESK_UF_PROFILE_STATUS_KEY,
-    ZENDESK_CF_BOOKING_ID,
-    ZENDESK_CF_APPOINTMENT_DATE,
-    ZENDESK_CF_APPOINTMENT_TIME,
-    ZENDESK_CF_REMINDER_STATE,
-    ZENDESK_CF_REMINDER_ATTEMPTS,
-    ZENDESK_CF_LAST_CALL_ID,
-    ZENDESK_APPOINTMENT_FORM_ID,
-
-    PROFILE_STATUS_EMPTY, 
     PROFILE_STATUS_NEED_PHONE,
     PROFILE_STATUS_COMPLETE,
     PROFILE_STATUS_NEED_NAME,
@@ -132,10 +115,8 @@ from config import (
     CLINIC_LAT,
     CLINIC_LNG,
     WEEK_IMAGE_URL, 
-    CONFIRM_NOTE_KEYWORD,
     PENDING_REGISTRATIONS,
     DEMO_CUSTOMER_NAME,
-    DEMO_CUSTOMER_EMAIL,
     DEMO_CUSTOMER_PHONE
     )
 
@@ -173,10 +154,7 @@ def reply_date_range_buttons(event, info_text: str):
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    # get X-Line-Signature header value
     signature = request.headers['X-Line-Signature']
-
-    # get request body as text
     body = request.get_data(as_text=True)
 
     # --- DEBUG TRACE (最小追蹤變數！) ---
@@ -203,6 +181,35 @@ def callback():
     )
     # --- END TRACE ---
 
+    # ===== Webhook 入口去重（插在 handler.handle 之前）=====
+    decision = check_and_mark_webhook(
+        evt_id=evt_id,
+        msg_id=msg_id,
+        evt_ts=evt_ts,
+        body=body,
+        ttl_sec=6 * 60 * 60,  # 6小時
+    )
+
+    if decision is False:
+        app.logger.info(
+            f"[DEDUPE][{req_id}] HIT -> skip handler "
+            f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts}"
+        )
+        return "OK"
+
+    if decision is None:
+        # Redis timeout/exception → 三天版策略：fail-open 放行，但留 log
+        app.logger.warning(
+            f"[DEDUPE][{req_id}] FAIL-OPEN (redis error) "
+            f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts}"
+        )
+    else:
+        app.logger.info(
+            f"[DEDUPE][{req_id}] PASS "
+            f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts}"
+        )
+    # ===== End Dedupe =====
+
     app.logger.info("Request body: " + body)
 
     # handle webhook body
@@ -213,6 +220,7 @@ def callback():
         abort(400)
 
     return "OK"
+
 
 # ======================================
 #  LINE Event Handlers 區/訊息處理
@@ -1790,9 +1798,6 @@ def handle_message(event: MessageEvent):
     )
     return
 
-
-
-
 @handler.add(PostbackEvent)
 def handle_postback(event):
     data = event.postback.data or ""
@@ -2202,3 +2207,13 @@ def cron_run_voice_reminder():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/cron/run-reminder-fail", methods=["GET"])
+def cron_run_reminder_fail():
+    days = int(request.args.get("days", "1"))
+    min_attempts = int(request.args.get("min_attempts", "3"))
+    dry_run = request.args.get("dry_run", "0") in ("1", "true", "True", "yes", "Y")
+
+    result = run_fail_queued_tickets(days=days, min_attempts=min_attempts, dry_run=dry_run)
+    return result, 200
+
