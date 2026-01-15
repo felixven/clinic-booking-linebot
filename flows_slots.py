@@ -21,6 +21,10 @@ from bookings_core import (
     get_available_slots_for_date,
 )
 
+from line_send import(
+    send_line,
+)
+
 from config import (
     WEEKDAY_ZH,
 )
@@ -127,11 +131,17 @@ def show_dates_for_week(offset: int, event: MessageEvent):
                 "目前僅開放四週內預約，如需更後日期請聯繫診所。"
             )
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=no_text)]
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[TextMessage(text=no_text)]
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text=no_text)],
+            label="show_dates_for_week:no_columns",  # 可選
         )
         return
 
@@ -170,18 +180,31 @@ def show_dates_for_week(offset: int, event: MessageEvent):
     else:
         alt_text = "三週後可預約日期列表"
 
+    # carousel = CarouselTemplate(columns=columns)
+    # line_bot_api.reply_message(
+    #     ReplyMessageRequest(
+    #         reply_token=event.reply_token,
+    #         messages=[
+    #             TemplateMessage(
+    #                 alt_text=alt_text,
+    #                 template=carousel
+    #             )
+    #         ]
+    #     )
+    # )
     carousel = CarouselTemplate(columns=columns)
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[
-                TemplateMessage(
-                    alt_text=alt_text,
-                    template=carousel
-                )
-            ]
-        )
+    send_line(
+        line_bot_api,
+        event,
+        messages=[
+            TemplateMessage(
+                alt_text=alt_text,
+                template=carousel
+            )
+        ],
+        label=f"show_dates_for_week:carousel:{offset}",  # 可選
     )
+
 
 def build_slots_carousel(date_str: str, slots: list[str]) -> TemplateMessage:
     """

@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 from config import (
     PROFILE_STATUS_EMPTY,
@@ -856,6 +857,7 @@ def mark_zendesk_ticket_cancelled(ticket_id: int):
 
       - reminder_state 改成cancelled）
       - ticket 狀態改成 solved
+      - 新增 private note 記錄取消時間
 
     Args:
         ticket_id: Zendesk ticket id
@@ -867,15 +869,16 @@ def mark_zendesk_ticket_cancelled(ticket_id: int):
     base_url, headers = _build_zendesk_headers()
     url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
 
+    cancelled_at = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+    note = f"[已取消約診] 患者已於{cancelled_at}在 LINE 上取消預約"
+
     payload = {
         "ticket": {
             "status": "solved",
             "custom_fields": [
-                {
-                    "id": ZENDESK_CF_REMINDER_STATE,
-                    "value": ZENDESK_REMINDER_STATE_CANCELLED
-                }
-            ]
+                {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_CANCELLED}
+            ],
+            "comment": {"public": False, "body": note},
         }
     }
 
@@ -887,9 +890,7 @@ def mark_zendesk_ticket_cancelled(ticket_id: int):
     try:
         resp = requests.put(url, headers=headers, json=payload, timeout=10)
         resp.raise_for_status()
-        app.logger.info(
-            f"[mark_zendesk_ticket_cancelled] 更新成功 ticket_id={ticket_id}"
-        )
+        app.logger.info(f"[mark_zendesk_ticket_cancelled] 更新成功 ticket_id={ticket_id}")
     except Exception as e:
         app.logger.error(f"[mark_zendesk_ticket_cancelled] 更新失敗: {e}")
 
@@ -1002,30 +1003,7 @@ def increment_reminder_attempts(ticket_id: int, *, reason: str = "") -> int | No
     return None
 
 
-def mark_zendesk_ticket_queued(ticket_id: int, ticket: dict | None = None):
-    """
-    共用：只改狀態為 queued（不碰 attempts）
-    """
-    if not ticket_id:
-        return
 
-    base_url, headers = _build_zendesk_headers()
-    url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
-
-    payload = {
-        "ticket": {
-            "custom_fields": [
-                {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_QUEUED},
-            ]
-        }
-    }
-
-    try:
-        r = requests.put(url, headers=headers, json=payload, timeout=10)
-        r.raise_for_status()
-        logger.info(f"[queued] ticket_id={ticket_id}")
-    except Exception as e:
-        logger.error(f"[queued] failed ticket_id={ticket_id}: {e}")
 
 
 
@@ -1180,6 +1158,7 @@ def mark_zendesk_ticket_voice_attempted(
     - last_call_id = call_id
     - internal note 留存
     """
+    
     if not ticket_id:
         return False
 
@@ -1213,15 +1192,15 @@ def mark_zendesk_ticket_voice_attempted(
 
     # 從 call_status 末段抓 result tag（如果沒有就當 attempted）
     status_str = str(call_status or "")
-    tag = "CALL_ATTEMPTED"
+    tag = "已嘗試外撥"
     s_lower = status_str.lower()
     if "success" in s_lower:
-        tag = "CALL_OK"
+        tag = "外撥成功"
     elif "failed" in s_lower:
-        tag = "CALL_FAIL"
+        tag = "外撥失敗"
 
     note_body = (
-        f"[Voice v1] {tag} 已收到 LiveHub 回呼\n"
+        f"[語音提醒] {tag} 患者已收到通話\n"
         f"- callId: {call_id}\n"
         f"- status: {status_str}\n"
         f"- reasonCode: {reason_code}\n"
@@ -1243,16 +1222,43 @@ def mark_zendesk_ticket_voice_attempted(
             ],
         }
     }
-
     try:
         app.logger.info(f"[mark_voice_attempted] PUT payload={json.dumps(payload, ensure_ascii=False)}")
         resp2 = requests.put(url_put, headers=headers, json=payload, timeout=10)
+        app.logger.info(
+            f"[mark_voice_attempted] PUT resp status={resp2.status_code} body={(resp2.text or '')[:300]}"
+        )
         resp2.raise_for_status()
         app.logger.info(f"[mark_voice_attempted] updated ticket_id={ticket_id} attempts={attempts}")
         return True
     except Exception as e:
         app.logger.error(f"[mark_voice_attempted] PUT failed ticket_id={ticket_id}: {e}")
         return False
+
+def mark_zendesk_ticket_queued(ticket_id: int, ticket: dict | None = None):
+    """
+    共用：只改狀態為 queued（不碰 attempts）
+    """
+    if not ticket_id:
+        return
+
+    base_url, headers = _build_zendesk_headers()
+    url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+
+    payload = {
+        "ticket": {
+            "custom_fields": [
+                {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_QUEUED},
+            ]
+        }
+    }
+
+    try:
+        r = requests.put(url, headers=headers, json=payload, timeout=10)
+        r.raise_for_status()
+        logger.info(f"[queued] ticket_id={ticket_id}")
+    except Exception as e:
+        logger.error(f"[queued] failed ticket_id={ticket_id}: {e}")
 
 # voice 回寫webhook相關 
 def mark_zendesk_ticket_voice_succeeded(
@@ -1476,9 +1482,9 @@ def mark_zendesk_ticket_failed_timeout(*, ticket_id: int, appt_date: str, attemp
     url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
 
     note_body = (
-        f"[Reminder] FAILED_TIMEOUT（期限內未回覆是否確認回診，待人工處理）\n"
-        f"- appt_date: {appt_date}\n"
-        f"- attempts: {attempts}\n"
+        f"[提醒失敗] 期限內未回覆是否確認回診，待人工處理\n"
+        f"預約日期: {appt_date}\n"
+        f"提醒次數: {attempts}\n"
     )
 
     payload = {

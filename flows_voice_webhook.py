@@ -73,6 +73,7 @@ def handle_livehub_webhook(data: dict):
     )
 
 
+
     call_status = data.get("callStatus") or data.get("status") or data.get("call_status")
     result = _normalize_status(call_status)
     status_lc= (call_status or "").strip().lower()
@@ -97,6 +98,7 @@ def handle_livehub_webhook(data: dict):
         or (metadata.get("zendesk_ticket_id") if isinstance(metadata, dict) else None)
     )
 
+
     if not raw_ticket_ids:
         bod = data.get("botOperationData") or {}
         if isinstance(bod, dict):
@@ -106,6 +108,7 @@ def handle_livehub_webhook(data: dict):
             )
 
     ticket_ids = parse_ticket_ids(raw_ticket_ids)
+
     if not ticket_ids:
         single = metadata.get("ticketId") or metadata.get("zendesk_ticket_id")
         ticket_ids = parse_ticket_ids(single)

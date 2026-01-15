@@ -48,22 +48,24 @@ from config import (
     DEMO_CUSTOMER_PHONE,
 )
 
+from line_send import send_line
+
 from utils import(
     can_confirm,
     can_cancel
 )
-
-def safe_reply(event, messages, *, uid=None, where="", appt_id=""):
+def safe_reply(event, messages, *, uid=None, where="", appt_id="", timeout=(3, 10)):
     """
     最小止血：reply_message 超時/失敗時不炸 webhook，不讓 worker 被拖死。
     - uid / where / appt_id 用來 log
     """
     try:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=messages
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=messages,
+            timeout=timeout,
+            label=where or "safe_reply",
         )
         return True
     except Exception as e:
@@ -101,19 +103,14 @@ def flow_query_next_appointment(event, text: str):
             matched_list = []
     except Exception as e:
         app.logger.error(f"查詢約診失敗: {e}")
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="約診查詢失敗，請稍後再試")]
-            )
-        )
+        send_line(line_bot_api, event, messages=[TextMessage(text="約診查詢失敗，請稍後再試")])
         return
 
     # ① 沒有任何他的 future 預約，引導去線上約診（沿用原本行為）
     if not matched_list:
         buttons_template = ButtonsTemplate(
             title="目前沒有約診紀錄",
-            text="若需預約看診，請點擊「線上預約」。",
+            text="若需預約看診，請點擊「線上約診」。",
             actions=[
                 MessageAction(
                     label="線上約診",
@@ -127,12 +124,8 @@ def flow_query_next_appointment(event, text: str):
             template=buttons_template
         )
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[template_message]
-            )
-        )
+        send_line(line_bot_api, event, messages=[template_message])
+
         return
 
     # ② 有 future 預約 → 組成 Carousel
@@ -245,14 +238,19 @@ def flow_query_next_appointment(event, text: str):
         "請在約診紀錄選擇是否「確認回診」或「取消約診」。"
     )
 
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[
-                TextMessage(text=intro_text),
-                template_message
-            ]
-        )
+    # line_bot_api.reply_message(
+    #     ReplyMessageRequest(
+    #         reply_token=event.reply_token,
+    #         messages=[
+    #             TextMessage(text=intro_text),
+    #             template_message
+    #         ]
+    #     )
+    # )
+    send_line(
+        line_bot_api,
+        event,
+        messages=[TextMessage(text=intro_text), template_message]
     )
     return
 
@@ -274,11 +272,10 @@ def flow_cancel_request(event, text: str):
     if not appt_id:
         if not line_user_id:
             # 理論上不會發生，但防呆一下
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text="暫時無法取得您的身分，請稍後再試或重新點選「約診查詢」。")]
-                )
+            send_line(
+                line_bot_api,
+                event,
+                messages=[TextMessage(text="暫時無法取得您的身分，請稍後再試或重新點選「約診查詢」。")]
             )
             return
 
@@ -290,12 +287,13 @@ def flow_cancel_request(event, text: str):
 
     # ③ 找不到可取消的約診
     if not appt or not local_start:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="找不到可取消的約診，請先使用「約診查詢」。")]
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text="找不到可取消的約診，請先使用「約診查詢」。")],
+            label="flow_cancel_request:not_found",  # 可選
         )
+
         return
 
     # ④ 判斷距離看診日
@@ -305,11 +303,11 @@ def flow_cancel_request(event, text: str):
             f"距離看診日已少於 {CANCEL_DEADLINE_DAYS_BEFORE} 天，無法透過 LINE 取消約診。\n"
             "如有特殊狀況請致電診所。"
         )
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=msg)]
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text=msg)],
+            label="flow_cancel_request:cannot_cancel",
         )
         return
 
@@ -344,14 +342,13 @@ def flow_cancel_request(event, text: str):
         ],
     )
 
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[
-                TextMessage(text=detail_text),
-                TemplateMessage(alt_text="確認取消約診", template=buttons_template),
-            ]
-        )
+    send_line(
+        line_bot_api,
+        event,
+        messages=[
+            TextMessage(text=detail_text),
+            TemplateMessage(alt_text="確認取消約診", template=buttons_template),
+        ],
     )
     return
 
@@ -370,26 +367,26 @@ def flow_confirm_cancel(event, text: str):
 
     # ✅ 不再嘗試用 line_user_id 做 fallback，只允許「帶 id 的取消」
     if not appt_id:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(
-                    text="要取消的資訊不完整，請重新透過「約診查詢」列表中的按鈕進行操作。"
-                )]
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(
+                text="要取消的資訊不完整，請重新透過「約診查詢」列表中的按鈕進行操作。"
+            )],
         )
         return
+
 
     # 再查一次這筆約診（避免早就被改時間或取消）
     appt, local_start = get_appointment_by_id(appt_id)
     if not appt or not local_start:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="找不到這筆約診，請重新查詢。")]
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text="找不到這筆約診，請重新查詢。")],
         )
         return
+
 
     days_left = get_days_until(local_start)
     if not can_cancel(local_start):
@@ -398,11 +395,10 @@ def flow_confirm_cancel(event, text: str):
             "無法透過 LINE 取消約診。\n"
             "如有特殊狀況請電話聯繫診所。"
         )
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=msg)]
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text=msg)],
         )
         return
 
@@ -411,12 +407,12 @@ def flow_confirm_cancel(event, text: str):
         cancel_booking_appointment(appt_id)
     except Exception as e:
         app.logger.error(f"取消預約失敗: {e}")
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="取消時發生錯誤，請稍後再試")]
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text="取消時發生錯誤，請稍後再試")],
         )
+
         return
 
     # --- 同步更新 Zendesk ticket：這筆 booking 已經取消，不用再提醒 ---
@@ -455,14 +451,13 @@ def flow_confirm_cancel(event, text: str):
         ],
     )
 
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[
-                TextMessage(text=msg),
-                TemplateMessage(alt_text="約診已取消", template=buttons_template),
-            ]
-        )
+    send_line(
+        line_bot_api,
+        event,
+        messages=[
+            TextMessage(text=msg),
+            TemplateMessage(alt_text="約診已取消", template=buttons_template),
+        ],
     )
     return
 

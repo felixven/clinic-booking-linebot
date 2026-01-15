@@ -187,7 +187,6 @@ def process_voice_call_group(line_user_id: str, appt_date_str: str, ticket_ids: 
             return
         # 0) 外撥前先鎖票（queued）避免重複撥打
     
-        # 這裡會 attempts + 1（因為你的 mark_zendesk_ticket_queued 就是這樣設計）
         for tid in ticket_ids:
             if not tid:
                 continue

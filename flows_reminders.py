@@ -133,7 +133,7 @@ def send_line_reminder(line_user_id: str, appt: dict):
             f"{customer_name} 您好，\n"
             f"您在 {display_date} 有以下門診預約：\n"
             "請點選欲確認的時段進行回診確認。\n\n"
-            "若屆時無法前來，請致電診所取消，謝謝！"
+            "若無法前來，請提前致電診所取消，謝謝！"
         )
     )
 
@@ -233,7 +233,7 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
             f"{customer_name} 您好，\n"
             f"您在 {display_date} 有以下門診預約：\n"
             "請點選欲確認的時段進行回診確認。\n\n"
-            "若屆時無法前來，請致電診所取消，謝謝！"
+            "若無法前來，請提前致電診所取消，謝謝！"
         )
     )
 

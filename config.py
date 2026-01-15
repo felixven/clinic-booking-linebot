@@ -13,9 +13,9 @@ GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
 GRAPH_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
 
 # ===================== Zendesk 設定 =====================
-ZENDESK_SUBDOMAIN = "con-nwdemo" 
-ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL") or "tech_support@newwave.tw"
-ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")  
+# ZENDESK_SUBDOMAIN = "longyin" 
+# ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL") or "tech_support@newwave.tw"
+# ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")  
 
 # ===================== Zendesk 自訂欄位 ID =====================
 # Profile 狀態判斷
@@ -37,6 +37,31 @@ def is_valid_name(name: str) -> bool:
         return False
 
     return True
+# ZENDESK_UF_LINE_USER_ID = 54043434990489
+# ZENDESK_UF_LINE_USER_ID_KEY = "line_user_id"
+# ZENDESK_UF_PROFILE_STATUS_KEY = "profile_status"
+
+# ZENDESK_CF_BOOKING_ID = 54043597648537          # Booking ID (Text)
+# ZENDESK_CF_APPOINTMENT_DATE = 54043618333593    # Appointment Date (Date)
+# ZENDESK_CF_APPOINTMENT_TIME = 54043605240601    # Appointment Time (Text)
+# ZENDESK_CF_REMINDER_STATE = 54043678550809      # Reminder State (Dropdown)
+# ZENDESK_CF_REMINDER_ATTEMPTS = 54043616442009   # Reminder Attempts (Numeric)
+# ZENDESK_CF_LAST_CALL_ID = 54043719367065        # Last Call Id (text)
+# ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE=14623920927375 
+
+# ZENDESK_APPOINTMENT_FORM_ID=54043900272281
+
+# ZENDESK_REMINDER_STATE_PENDING = "待提醒"
+# ZENDESK_REMINDER_STATE_QUEUED = "已排入外撥"
+# ZENDESK_REMINDER_STATE_SUCCESS="已成功提醒"
+# ZENDESK_REMINDER_STATE_FAILED="提醒失敗"
+# ZENDESK_REMINDER_STATE_CANCELLED = "已取消預約"
+
+
+# ===================== Zendesk 設定（NewWave） =====================
+ZENDESK_SUBDOMAIN = "con-nwdemo" 
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL") or "tech_support@newwave.tw"
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")  
 
 ZENDESK_UF_LINE_USER_ID = 14416308078351
 ZENDESK_UF_LINE_USER_ID_KEY = "line_user_id"
@@ -58,24 +83,11 @@ ZENDESK_REMINDER_STATE_SUCCESS="已成功提醒"
 ZENDESK_REMINDER_STATE_FAILED="提醒失敗"
 ZENDESK_REMINDER_STATE_CANCELLED = "已取消預約"
 
+
 # 距離看診幾天前要發提醒（正式版可能是 3，測試可以先改）
 REMINDER_DAYS_BEFORE = int(os.environ.get("REMINDER_DAYS_BEFORE", "3"))
 
-
-
 # ======== 預約時段相關設定（之後要改時段只改這裡） ========
-# SLOT_START = "09:00"             # 看診起始時間（第一個）
-# SLOT_END = "21:00"               # 看診結束時間（最後一個）
-# SLOT_INTERVAL_MINUTES = 20       # 每一格 slot 間隔（目前半小時）
-# APPOINTMENT_DURATION_MINUTES = 20  # 實際預約時長（要跟 Bookings duration 對齊）
-
-# #每週例外規則
-# WED_START = "12:00"    # 週三從中午開始
-# SAT_END = "12:00"      # 週六只到中午
-# CLOSED_WEEKDAYS = {6}  # 週日不看（0=Mon ... 6=Sun）
-
-# WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]# 禮拜幾
-
 SLOT_MINUTES = 20
 SLOT_INTERVAL_MINUTES = SLOT_MINUTES
 APPOINTMENT_DURATION_MINUTES = SLOT_MINUTES
@@ -96,11 +108,9 @@ CLOSED_WEEKDAYS = {2, 6}  # 週三、週日
 
 WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]
 
-
-
 # ======== 診所資料（ ========
 CLINIC_IMAGE_URL = "https://res.cloudinary.com/drbhr7kmb/image/upload/v1763351663/benyamin-bohlouli-B_sK_xgzwVA-unsplash_n6jy9m.jpg"
-CLINIC_NAME = "中醫診所"
+CLINIC_NAME = "龍吟中醫診所"
 CLINIC_ADDRESS = "臺中市西屯區青海路二段242之32號"
 CLINIC_LAT = 24.1718527355441
 CLINIC_LNG = 120.64402133835931
@@ -128,8 +138,3 @@ INVALID_NAME_PLACEHOLDERS = {
 DEMO_CUSTOMER_NAME = "LINE 使用者"
 DEMO_CUSTOMER_EMAIL = "test@example.com"
 DEMO_CUSTOMER_PHONE = "0912345678"
-
-DEMO_FAIL_TICKET_ID_NO_RQ = os.getenv("DEMO_FAIL_TICKET_ID_NO_RQ")
-DEMO_FAIL_TICKET_ID_RQ = os.getenv("DEMO_FAIL_TICKET_ID_RQ")
-
-print(f"[CONFIG DEMO] NO_RQ={DEMO_FAIL_TICKET_ID_NO_RQ!r}, RQ={DEMO_FAIL_TICKET_ID_RQ!r}")

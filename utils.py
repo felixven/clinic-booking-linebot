@@ -7,6 +7,7 @@ from linebot.v3.messaging import (
 )
 
 from line_client import line_bot_api
+
 from config import (
     PENDING_REGISTRATIONS,
     CONFIRM_OPEN_DAYS_BEFORE, # 原本 2，現在 +1
@@ -25,6 +26,8 @@ from config import is_valid_name
 from flask import current_app as app
 
 from state_store import set_state, get_state, clear_state
+
+from line_send import send_line
 
 
 def parse_ticket_ids(raw_ticket_ids):
@@ -83,11 +86,11 @@ def reply_consent_input(*, line_bot_api, event, title: str, text: str, ok_data: 
             PostbackAction(label="取消預約", data=cancel_data),
         ],
     )
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TemplateMessage(alt_text=title, template=buttons)],
-        )
+    send_line(
+        line_bot_api,
+        event,
+        messages=[TemplateMessage(alt_text=title, template=buttons)],
+        label="reply_consent_input",
     )
 
 def enter_input_step(*, line_bot_api, event, line_user_id: str, step: str, prompt_text: str, extra_state: dict | None = None):
