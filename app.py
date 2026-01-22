@@ -1,5 +1,8 @@
 import requests
 import json, uuid, time
+import sys
+import threading
+
 
 from flask import Flask, request, abort, jsonify
 from flask_app import app
@@ -83,7 +86,7 @@ from utils import (
     is_binding_complete,
 )
 
-from state_store import get_state, set_state, clear_state
+from state_store import get_state, set_state, clear_state, acquire_lock
 
 from dedupe_store import check_and_mark_webhook
 
@@ -155,37 +158,6 @@ def reply_date_range_buttons(event, info_text: str):
         # timeout 不傳 -> 用 line_send.py 預設 (3,30)
     )
 
-def build_recovery_message(event) -> str:
-    # 1) 文字訊息：直接引用使用者剛剛打的字（最精準）
-    try:
-        if getattr(event, "message", None) and getattr(event.message, "text", None):
-            t = (event.message.text or "").strip()
-            if t:
-                return (
-                    "抱歉，系統剛剛忙碌中，這一步沒有完成。\n"
-                    f"請再送一次剛才那句「{t}」重試 🙏\n"
-                    "（或輸入「重來」回到主選單）"
-                )
-    except Exception:
-        pass
-
-    # 2) Postback：使用者其實是「按按鈕」不是打字
-    try:
-        if getattr(event, "postback", None) and getattr(event.postback, "data", None):
-            return (
-                "抱歉，系統剛剛忙碌中，剛才那個按鈕沒有完成。\n"
-                "請再點一次剛才的按鈕重試 🙏\n"
-                "（或輸入「重來」回到主選單）"
-            )
-    except Exception:
-        pass
-
-    # 3) 其他事件：給最通用的
-    return (
-        "抱歉，系統剛剛忙碌中，這一步沒有完成。\n"
-        "請稍後再試一次，或輸入「重來」回到主選單 🙏"
-    )
-
 
 # def reply_date_range_buttons(event, info_text: str):
 #     buttons_template = ButtonsTemplate(
@@ -212,20 +184,103 @@ def build_recovery_message(event) -> str:
 #         )
 #     )
 
+def _bg_handle_line_webhook(*, body: str, signature: str, req_id: str):
+    """
+    背景處理 handler.handle，但補齊 Flask 的 app/request context，
+    避免 Working outside of application context / request context。
+    """
+    t0 = time.time()
+
+    # 先在背景入口就把 evt_id/msg_id/ts 印出來（避免還沒進 handler 就炸你看不到）
+    evt_id = None
+    msg_id = None
+    evt_ts = None
+    try:
+        payload = json.loads(body or "{}")
+        events = payload.get("events") or []
+        if events:
+            e0 = events[0]
+            evt_id = e0.get("webhookEventId")
+            evt_ts = e0.get("timestamp")
+            msg = e0.get("message") or {}
+            msg_id = msg.get("id")
+    except Exception as e:
+        print(
+            f"[CB_BG_TRACE_PARSE_FAIL][{req_id}] err={repr(e)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    print(
+        f"[CB_BG_START][{req_id}] evt_id={evt_id} msg_id={msg_id} ts={evt_ts} body_len={len(body or '')}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    try:
+        with app.app_context():
+            with app.test_request_context(
+                "/callback",
+                method="POST",
+                data=body,
+                headers={"X-Line-Signature": signature},
+            ):
+                try:
+                    handler.handle(body, signature)
+                except InvalidSignatureError:
+                    print(f"[CB_BAD_SIG][{req_id}]", file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(
+                        f"[CB_HANDLE_ERROR][{req_id}] evt_id={evt_id} msg_id={msg_id} err={repr(e)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[CB_AFTER_HANDLE][{req_id}] evt_id={evt_id} msg_id={msg_id}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+    except Exception as e:
+        # 如果連 context 都炸了，至少要看到
+        print(
+            f"[CB_BG_CRASH][{req_id}] evt_id={evt_id} msg_id={msg_id} err={repr(e)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    finally:
+        print(
+            f"[CB_BG_DONE][{req_id}] evt_id={evt_id} msg_id={msg_id} elapsed={time.time()-t0:.3f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+
+
 
 # ========= Webhook 入口 =========
-
 
 @app.route("/callback", methods=["POST"])
 def callback():
 
     t0 = time.time()
-    print(f"[CB_HIT] ts={t0}", flush=True)
+    print(f"[CB_HIT] ts={t0}", file=sys.stderr, flush=True)
 
-    signature = request.headers["X-Line-Signature"]
-    body = request.get_data(as_text=True)
+    # signature = request.headers["X-Line-Signature"]
+    signature = request.headers.get("X-Line-Signature")
+    if not signature:
+        print("[CB_ERR] Missing X-Line-Signature", file=sys.stderr, flush=True)
+        return "Missing X-Line-Signature", 400
 
-    print(f"[CB_GOT] sig={bool(signature)} body_len={len(body)}", flush=True)
+    body = request.get_data(as_text=True) or ""
+
+    print(
+        f"[CB_GOT] sig={bool(signature)} body_len={len(body)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     # --- Debug Trace(最小追蹤變數) ---
     req_id = uuid.uuid4().hex[:8]
@@ -245,7 +300,9 @@ def callback():
         app.logger.warning(f"[TRACE][{req_id}] json parse fail: {e}")
 
     print(
-        f"[CB_TRACE][{req_id}] evt_id={evt_id} msg_id={msg_id} ts={evt_ts}", flush=True
+        f"[CB_TRACE][{req_id}] evt_id={evt_id} msg_id={msg_id} ts={evt_ts}",
+        file=sys.stderr,
+        flush=True,
     )
 
     app.logger.info(
@@ -266,17 +323,33 @@ def callback():
 
     # ✅ 4) dedupe 結果用 print（這個最關鍵）
     if decision is False:
-        print(f"[DEDUPE_HIT][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True)
+        # print(f"[DEDUPE_HIT][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True)
+        print(
+            f"[DEDUPE_HIT][{req_id}] evt_id={evt_id} msg_id={msg_id}",
+            file=sys.stderr,
+            flush=True,
+        )
         return "OK"
     elif decision is None:
+        # print(
+        #     f"[DEDUPE_FAIL_OPEN][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True
+        # )
         print(
-            f"[DEDUPE_FAIL_OPEN][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True
+            f"[DEDUPE_FAIL_OPEN][{req_id}] evt_id={evt_id} msg_id={msg_id}",
+            file=sys.stderr,
+            flush=True,
         )
     else:
-        print(f"[DEDUPE_PASS][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True)
+        # print(f"[DEDUPE_PASS][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True)
+        print(
+            f"[DEDUPE_PASS][{req_id}] evt_id={evt_id} msg_id={msg_id}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # ✅ 5) handler.handle 前後各釘一次（知道到底卡在 handle 前或 handle 內）
-    print(f"[CB_BEFORE_HANDLE][{req_id}]", flush=True)
+    # print(f"[CB_BEFORE_HANDLE][{req_id}]", flush=True)
+    print(f"[CB_BEFORE_HANDLE][{req_id}]", file=sys.stderr, flush=True)
 
     # if decision is False:
     #     app.logger.info(
@@ -300,25 +373,148 @@ def callback():
 
     app.logger.info("Request body: " + body)
 
-    # handle webhook body
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        # app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
-        print(f"[CB_BAD_SIG][{req_id}]", flush=True)
-        abort(400)
-    except Exception as e:
-        # ✅ 重要：任何非簽章錯誤都吞掉，仍回 200，避免 LINE 重送造成風暴
-        # app.logger.exception(
-        #     f"[CALLBACK_ERROR][{req_id}] evt_id={evt_id} msg_id={msg_id} err={repr(e)}"
-        # )
-        print(f"[CB_HANDLE_ERROR][{req_id}] err={repr(e)}", flush=True)
-        return "OK"
-    print(f"[CB_AFTER_HANDLE][{req_id}]", flush=True)
+    # ✅ 改：把 handler.handle 丟到背景跑，callback 先回 200 避免 LINE request_timeout
+    def _run_bg():
+        try:
+            _bg_handle_line_webhook(body=body, signature=signature, req_id=req_id)
+        finally:
+            # 讓你看得到背景處理總耗時（包含 handler.handle）
+            print(
+                f"[CB_DONE][{req_id}] elapsed={time.time()-t0:.3f}s",
+                file=sys.stderr,
+                flush=True,
+            )
 
-    print(f"[CB_DONE] elapsed={time.time()-t0:.3f}s", flush=True)
+    threading.Thread(target=_run_bg, daemon=True).start()
 
+    # ✅ 先回應 LINE（秒回）
+    print(
+        f"[CB_ACK][{req_id}] elapsed={time.time()-t0:.3f}s",
+        file=sys.stderr,
+        flush=True,
+    )
     return "OK"
+
+
+
+
+# @app.route("/callback", methods=["POST"])
+# def callback():
+
+#     t0 = time.time()
+#     print(f"[CB_HIT] ts={t0}", file=sys.stderr, flush=True)
+
+#     # signature = request.headers["X-Line-Signature"]
+#     signature = request.headers.get("X-Line-Signature")
+#     if not signature:
+#         print("[CB_ERR] Missing X-Line-Signature", file=sys.stderr, flush=True)
+#         return "Missing X-Line-Signature", 400
+    
+#     body = request.get_data(as_text=True)
+
+#     print(f"[CB_GOT] sig={bool(signature)} body_len={len(body)}",
+#           file=sys.stderr, flush=True)
+
+#     # --- Debug Trace(最小追蹤變數) ---
+#     req_id = uuid.uuid4().hex[:8]
+#     evt_id = None
+#     msg_id = None
+#     evt_ts = None
+#     try:
+#         payload = json.loads(body)
+#         events = payload.get("events") or []
+#         if events:
+#             e0 = events[0]
+#             evt_id = e0.get("webhookEventId")
+#             evt_ts = e0.get("timestamp")
+#             msg = e0.get("message") or {}
+#             msg_id = msg.get("id")
+#     except Exception as e:
+#         app.logger.warning(f"[TRACE][{req_id}] json parse fail: {e}")
+
+#     print(
+#         f"[CB_TRACE][{req_id}] evt_id={evt_id} msg_id={msg_id} ts={evt_ts}", flush=True
+#     )
+
+#     app.logger.info(
+#         f"[TRACE][{req_id}] incoming webhook "
+#         f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts} "
+#         f"len_body={len(body)}"
+#     )
+#     # --- END TRACE ---
+
+#     # ===== Webhook 入口去重（handler.handle 之前）=====
+#     decision = check_and_mark_webhook(
+#         evt_id=evt_id,
+#         msg_id=msg_id,
+#         evt_ts=evt_ts,
+#         body=body,
+#         ttl_sec=6 * 60 * 60,  # 6小時
+#     )
+
+#     # ✅ 4) dedupe 結果用 print（這個最關鍵）
+#     if decision is False:
+#         # print(f"[DEDUPE_HIT][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True)
+#         print(f"[DEDUPE_HIT][{req_id}] evt_id={evt_id} msg_id={msg_id}",
+#                 file=sys.stderr, flush=True)
+#         return "OK"
+#     elif decision is None:
+#         # print(
+#         #     f"[DEDUPE_FAIL_OPEN][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True
+#         # )
+#         print(f"[DEDUPE_FAIL_OPEN][{req_id}] evt_id={evt_id} msg_id={msg_id}",
+#             file=sys.stderr, flush=True)
+#     else:
+#         # print(f"[DEDUPE_PASS][{req_id}] evt_id={evt_id} msg_id={msg_id}", flush=True)
+#         print(f"[DEDUPE_PASS][{req_id}] evt_id={evt_id} msg_id={msg_id}",
+#             file=sys.stderr, flush=True)
+
+#     # ✅ 5) handler.handle 前後各釘一次（知道到底卡在 handle 前或 handle 內）
+#     # print(f"[CB_BEFORE_HANDLE][{req_id}]", flush=True)
+#     print(f"[CB_BEFORE_HANDLE][{req_id}]", file=sys.stderr, flush=True)
+
+
+#     # if decision is False:
+#     #     app.logger.info(
+#     #         f"[DEDUPE][{req_id}] HIT -> skip handler "
+#     #         f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts}"
+#     #     )
+#     #     return "OK"
+
+#     # if decision is None:
+#     #     # Redis timeout/exception → 三天版策略：fail-open 放行，但留 log
+#     #     app.logger.warning(
+#     #         f"[DEDUPE][{req_id}] FAIL-OPEN (redis error) "
+#     #         f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts}"
+#     #     )
+#     # else:
+#     #     app.logger.info(
+#     #         f"[DEDUPE][{req_id}] PASS "
+#     #         f"evt_id={evt_id} msg_id={msg_id} ts={evt_ts}"
+#     #     )
+#     # ===== End Dedupe =====
+
+#     app.logger.info("Request body: " + body)
+
+#     # handle webhook body
+#     try:
+#         handler.handle(body, signature)
+#     except InvalidSignatureError:
+#         # app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
+#         print(f"[CB_BAD_SIG][{req_id}]", flush=True)
+#         abort(400)
+#     except Exception as e:
+#         # 任何非簽章錯誤都吞掉，仍回 200，避免 LINE 重送造成風暴
+#         # app.logger.exception(
+#         #     f"[CALLBACK_ERROR][{req_id}] evt_id={evt_id} msg_id={msg_id} err={repr(e)}"
+#         # )
+#         print(f"[CB_HANDLE_ERROR][{req_id}] err={repr(e)}", flush=True)
+#         return "OK"
+#     print(f"[CB_AFTER_HANDLE][{req_id}]", flush=True)
+
+#     print(f"[CB_DONE] elapsed={time.time()-t0:.3f}s", flush=True)
+
+#     return "OK"
 
 
 # ======================================
@@ -343,7 +539,9 @@ def handle_message(event: MessageEvent):
     
 
     print(f"[HANDLE_ENTER] uid={uid} text={text}", flush=True)
-    
+
+
+
     # === 0. 檢查是否處於首次建檔流程 ===
     line_user_id_for_state = None
     if event.source and hasattr(event.source, "user_id"):
@@ -372,6 +570,7 @@ def handle_message(event: MessageEvent):
         #         )
         #     )
         # return
+
         cleared = clear_pending_state(line_user_id_for_state)
         app.logger.info(f"[取消建檔] uid={line_user_id_for_state} cleared={cleared}")
 
@@ -380,15 +579,57 @@ def handle_message(event: MessageEvent):
         else:
             msg = "目前沒有正在進行的流程。\n如需預約看診，請輸入「線上約診」。"
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token, messages=[TextMessage(text=msg)]
-            )
+        start_loading_animation(line_bot_api, uid, loading_seconds=30, timeout=(1, 2))
+
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text=msg)],
+            label="cancel_flow_result",
         )
         return
 
     state = get_state(line_user_id_for_state) if line_user_id_for_state else {}
     step = state.get("step")
+    print(f"[STATE] uid={line_user_id_for_state} step={step} state={state}", flush=True)
+
+    # === 非流程中：未知輸入先給短 loading，避免空等 ===
+    if line_user_id_for_state and not step:
+        known_commands = {
+            "線上約診",
+            "約診查詢",
+            "取消預約",
+            "取消預約流程",
+            "診所資訊",
+            "衛教資訊",
+            "查看地圖位置",
+            "查詢診所位置",
+            "測試token",
+            "測試身分",
+            "取消建檔",
+            "取消流程",
+            "取消",
+        }
+        known_prefix = (
+            "查 ",
+            "預約 ",
+            "我想預約",
+            "確認預約",
+            "取消約診",
+            "確認取消",
+            "確認回診",
+        )
+
+        if text and (text in known_commands or text.startswith(known_prefix)):
+            pass
+        else:
+            start_loading_animation(
+                line_bot_api,
+                line_user_id_for_state,
+                loading_seconds=10,
+                timeout=(1, 2),
+            )
+
 
     if line_user_id_for_state and step:
         # ===== 流程中保護：避免把「線上約診/取消預約...」當成姓名或手機 =====
@@ -403,18 +644,47 @@ def handle_message(event: MessageEvent):
             "我要預約兩週後",
             "我要預約三週後",
             "其他日期",
+            "測試token",
+            "測試身分",
+            "診所資訊",
+            "查看地圖位置",
         }
 
-        if text in flow_commands:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text="您目前正在填寫資料中。\n如要取消請按「取消」或輸入「取消建檔」。"
-                        )
-                    ],
-                )
+        is_command = (
+            text in flow_commands
+            or text.startswith("查 ")
+            or text.startswith("預約 ")
+            or text.startswith("我想預約")
+            or text.startswith("確認預約")
+            or text.startswith("取消約診")
+            or text.startswith("確認取消")
+            or text.startswith("確認回診")
+        )
+
+
+        if is_command:
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[
+            #             TextMessage(
+            #                 text="您目前正在填寫資料中。\n如要取消請按「取消」或輸入「取消建檔」。"
+            #             )
+            #         ],
+            #     )
+            # )
+
+            start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=30, timeout=(1, 2))
+
+            send_line(
+                line_bot_api,
+                event,
+                messages=[
+                    TextMessage(
+                        text="您目前正在填寫資料中。\n如要取消請按「取消」或輸入「取消建檔」。"
+                    )
+                ],
+                label="already_in_flow_warning",
             )
             return
 
@@ -424,15 +694,28 @@ def handle_message(event: MessageEvent):
             "wait_consent_name_after_phone",
             "wait_consent_phone",
         }:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text="請先按下方按鈕「好的，我要開始輸入」後再輸入。若要取消請輸入「取消」。"
-                        )
-                    ],
-                )
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[
+            #             TextMessage(
+            #                 text="請先按下方按鈕「好的，我要開始輸入」後再輸入。若要取消請輸入「取消」。"
+            #             )
+            #         ],
+            #     )
+            # )
+
+            start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
+
+            send_line(
+                line_bot_api,
+                event,
+                messages=[
+                    TextMessage(
+                        text="請先按下方按鈕「好的，我要開始輸入」後再輸入。若要取消請輸入「取消」。"
+                    )
+                ],
+                label="consent",
             )
             return
 
@@ -440,13 +723,27 @@ def handle_message(event: MessageEvent):
         if step == "ask_name":
             name = text.strip()
             if not name:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            TextMessage(text="姓名不能空白，請再次輸入您的姓名。")
-                        ],
-                    )
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[
+                #             TextMessage(text="姓名不能空白，請再次輸入您的姓名。")
+                #         ],
+                #     )
+                # )
+                # return
+                
+                start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
+
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[
+                        TextMessage(
+                            text="姓名不能空白，請再次輸入您的姓名。"
+                        )
+                    ],
+                    label="name_cannot_blank",
                 )
                 return
 
@@ -477,23 +774,42 @@ def handle_message(event: MessageEvent):
 
             reply_text = f"{name} 您好，請輸入您的手機號碼（格式：09xxxxxxxx）："
 
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)],
-                )
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[TextMessage(text=reply_text)],
+            #     )
+            # )
+            send_line(
+                line_bot_api,
+                event,
+                messages=[
+                    TextMessage(
+                        text=reply_text
+                    )
+                ],
+                label="enter_phone_number",
             )
             return
 
         # 0-1.5 問姓名（手機已經有了，補姓名用）
         elif step == "ask_name_after_phone":
+
+            print(f"[ASK_NAME_AFTER_PHONE] enter uid={uid} text={text} state={state}", flush=True)
+
+            start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=30, timeout=(1, 2))
+
             name = text.strip()
             if not is_valid_name(name):
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="請輸入您的真實姓名（不可空白）。")],
-                    )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[
+                        TextMessage(
+                            text="請輸入您的真實姓名（不可空白）。"
+                        )
+                    ],
+                    label="name_cannot_blank",
                 )
                 return
 
@@ -502,25 +818,27 @@ def handle_message(event: MessageEvent):
                 # 保守：如果意外沒有 user_id，就回到問手機重新走
                 state["step"] = "ask_phone"
                 set_state(line_user_id_for_state, state)
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            TextMessage(
-                                text="資料狀態異常，請重新輸入手機號碼（09xxxxxxxx）："
-                            )
-                        ],
-                    )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[
+                        TextMessage(
+                            text="資料狀態異常，請重新輸入手機號碼（09xxxxxxxx）："
+                        )
+                    ],
+                    label="phone_number_system_error",
                 )
                 return
 
+            phone = (state.get("phone") or "").strip()
             # 更新 Zendesk：name + profile_status=complete（手機已經有了）
             base_url, headers = _build_zendesk_headers()
             url = f"{base_url}/api/v2/users/{zendesk_user_id}.json"
+            
             payload = {
                 "user": {
                     "name": name,
-                    "phone": (state.get("phone") or "").strip(),
+                    "phone": phone,
                     "external_id": line_user_id_for_state,
                     "user_fields": {
                         ZENDESK_UF_LINE_USER_ID_KEY: line_user_id_for_state,
@@ -534,25 +852,38 @@ def handle_message(event: MessageEvent):
             }
 
             try:
+                print(f"[ASK_NAME_AFTER_PHONE] before_put uid={uid} zid={zendesk_user_id} phone={phone} name={name}", flush=True)
                 resp = requests.put(url, headers=headers, json=payload, timeout=10)
+                print(f"[ASK_NAME_AFTER_PHONE] after_put uid={uid} status={resp.status_code}", flush=True)
                 app.logger.info(
                     f"[ask_name_after_phone][PUT] status={resp.status_code} body={resp.text[:300]}"
                 )
                 resp.raise_for_status()
             except Exception as e:
+                print(f"[ASK_NAME_AFTER_PHONE] put EXC uid={uid} zid={zendesk_user_id} err={repr(e)}", flush=True)
                 app.logger.error(
                     f"[ask_name_after_phone] 更新 Zendesk 姓名失敗 user_id={zendesk_user_id}: {e}"
                 )
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="更新姓名時發生問題，請稍後再試。")],
-                    )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[
+                        TextMessage(
+                            text="更新姓名時發生問題，請稍後再試。"
+                        )
+                    ],
+                    label="name_system_error",
                 )
                 return
 
+            
+            print(f"[ASK_NAME_AFTER_PHONE] before_clear uid={line_user_id_for_state} state={state}", flush=True)
+            
             # 成功 → 清狀態 → 進入選日期範圍（跟你原本完成建檔一致）
             clear_state(line_user_id_for_state)
+
+            st_after = get_state(line_user_id_for_state) or {}
+            print(f"[ASK_NAME_AFTER_PHONE] after_clear uid={line_user_id_for_state} state_now={st_after}", flush=True)
 
             phone_display = state.get("phone") or "（已留存）"
             info_text = (
@@ -562,111 +893,18 @@ def handle_message(event: MessageEvent):
                 "接下來請選擇要預約的日期範圍："
             )
 
+            print(f"[ASK_NAME_AFTER_PHONE] before_reply_date_range uid={line_user_id_for_state}", flush=True)
             reply_date_range_buttons(event, info_text)
-
+            print(f"[ASK_NAME_AFTER_PHONE] after_reply_date_range uid={line_user_id_for_state}", flush=True)
             return
-
-        # elif step == "confirm_existing_by_phone":
-        #     # 期待使用者回覆：是我本人 / 不是我
-        #     if text not in {"是我本人", "不是我"}:
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="請點選按鈕確認：是我本人 / 不是我")]
-        #             )
-        #         )
-        #         return
-
-        #     # 取出狀態資料
-        #     zendesk_user_id = state.get("zendesk_user_id")
-        #     phone = state.get("phone")  # digits
-        #     found_name = (state.get("found_name") or "").strip()
-
-        #     if text == "不是我":
-        #         # 回到輸入手機
-        #         PENDING_REGISTRATIONS[line_user_id_for_state] = {"step": "ask_phone"}
-        #         set_state(line_user_id, {"step": "ask_phone"}) #可能要換成這行
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="了解，請重新輸入您的手機號碼（09xxxxxxxx）：")]
-        #             )
-        #         )
-        #         return
-
-        #     # === 是我本人：把這筆 Zendesk user 綁到此 LINE (external_id + user_fields.line_user_id) ===
-        #     if not zendesk_user_id or not phone:
-        #         del PENDING_REGISTRATIONS[line_user_id_for_state]
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="資料狀態異常，請重新輸入「線上約診」再試一次。")]
-        #             )
-        #         )
-        #         return
-
-        #     base_url, headers = _build_zendesk_headers()
-        #     url = f"{base_url}/api/v2/users/{zendesk_user_id}.json"
-
-        #     payload = {
-        #         "user": {
-        #             "external_id": line_user_id_for_state,
-        #             "user_fields": {
-        #                 ZENDESK_UF_LINE_USER_ID_KEY: line_user_id_for_state,
-        #                 # 狀態你想留就留，但放行不要靠它
-        #                 ZENDESK_UF_PROFILE_STATUS_KEY: (PROFILE_STATUS_COMPLETE if is_valid_name(found_name) else PROFILE_STATUS_NEED_NAME),
-        #             },
-        #         }
-        #     }
-
-        #     try:
-        #         resp = requests.put(url, headers=headers, json=payload, timeout=10)
-        #         app.logger.info(f"[claim][PUT] status={resp.status_code} body={resp.text[:300]}")
-        #         resp.raise_for_status()
-        #         updated = (resp.json() or {}).get("user") or {}
-        #     except Exception as e:
-        #         app.logger.error(f"[claim] bind failed user_id={zendesk_user_id}: {e}")
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="綁定資料時發生問題，請稍後再試或聯繫診所。")]
-        #             )
-        #         )
-        #         return
-
-        #     name_now = (updated.get("name") or "").strip()
-        #     phone_now = (updated.get("phone") or phone or "").strip()
-
-        #     # 若姓名仍是 placeholder → 要求補姓名
-        #     if not is_valid_name(name_now):
-        #         state["step"] = "ask_name_after_phone"
-        #         state["zendesk_user_id"] = zendesk_user_id
-        #         state["phone"] = phone_now
-
-        #         PENDING_REGISTRATIONS[line_user_id_for_state] = state
-        #         app.logger.info(f"[confirm_existing_by_phone] set step=ask_name_after_phone uid={line_user_id_for_state} zd_user_id={zendesk_user_id} phone={phone_now}")
-
-        #         line_bot_api.reply_message(
-        #             ReplyMessageRequest(
-        #                 reply_token=event.reply_token,
-        #                 messages=[TextMessage(text="手機已確認，請再輸入您的真實姓名（全名）：")]
-        #             )
-        #         )
-        #         return
-
-        #     # ✅ 姓名有效 → 清狀態 → 放行
-        #     del PENDING_REGISTRATIONS[line_user_id_for_state]
-        #     info_text = (
-        #         f"{name_now} 您好，已為您完成身分綁定。\n"
-        #         f"手機：{phone_now}\n\n"
-        #         "請選擇要預約的日期範圍："
-        #     )
-        #     reply_date_range_buttons(event, info_text)
-        #     return
 
         elif step == "confirm_name_after_claim":
             # 期待：姓名正確 / 我要修改姓名
+
+            print(f"[CONFIRM_CLAIM] enter uid={line_user_id_for_state} text={text} state={state}", flush=True)
+
             if text not in {"姓名正確", "我要修改姓名"}:
+                start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
                 send_line(
                     line_bot_api,
                     event,
@@ -674,6 +912,9 @@ def handle_message(event: MessageEvent):
                     label="confirm_name_after_claim_invalid_choice",
                 )
                 return
+
+
+            print(f"[CONFIRM_CLAIM] before_bind uid={line_user_id_for_state} zd_user_id={state.get('zendesk_user_id')} phone={state.get('phone')}", flush=True)
 
             zendesk_user_id = state.get("zendesk_user_id")
             phone = (state.get("phone") or "").strip()
@@ -693,6 +934,7 @@ def handle_message(event: MessageEvent):
 
             # 使用者選「我要修改姓名」→ 直接進入補姓名
             if text == "我要修改姓名":
+                start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
                 state["step"] = "ask_name_after_phone"
                 # ask_name_after_phone 會負責把 name + phone + external_id 一次寫入 Zendesk
                 set_state(line_user_id_for_state, state)
@@ -728,7 +970,7 @@ def handle_message(event: MessageEvent):
                 payload["user"]["phone"] = phone
 
             start_loading_animation(
-                line_bot_api, line_user_id_for_state, loading_seconds=30
+                line_bot_api, line_user_id_for_state, loading_seconds=30, timeout=(1, 2)
             )
 
             try:
@@ -741,11 +983,17 @@ def handle_message(event: MessageEvent):
                 app.logger.error(
                     f"[confirm_name_after_claim] bind failed user_id={zendesk_user_id}: {e}"
                 )
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="綁定資料時發生問題，請稍後再試。")],
-                    )
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[TextMessage(text="綁定資料時發生問題，請稍後再試。")],
+                #     )
+                # )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text="綁定資料時發生問題，請稍後再試。")],
+                    label="data_biding_error",
                 )
                 return
 
@@ -756,6 +1004,12 @@ def handle_message(event: MessageEvent):
                 f"手機：{phone or '（已確認）'}\n\n"
                 "請選擇要預約的日期範圍："
             )
+
+            print(f"[CONFIRM_CLAIM] before_reply uid={line_user_id_for_state}", flush=True)
+            start_loading_animation(
+                line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2)
+            )
+
             reply_date_range_buttons(event, info_text)
             return
 
@@ -861,15 +1115,25 @@ def handle_message(event: MessageEvent):
             if len(matched) == 0:
                 if mode == "already_bound":
                     clear_state(line_user_id_for_state)
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[
-                                TextMessage(
-                                    text="此手機號碼已綁定其他帳號，請聯繫診所客服協助處理。"
-                                )
-                            ],
-                        )
+                    # line_bot_api.reply_message(
+                    #     ReplyMessageRequest(
+                    #         reply_token=event.reply_token,
+                    #         messages=[
+                    #             TextMessage(
+                    #                 text="此手機號碼已綁定其他帳號，請聯繫診所客服協助處理。"
+                    #             )
+                    #         ],
+                    #     )
+                    # )
+                    send_line(
+                        line_bot_api,
+                        event,
+                        messages=[
+                            TextMessage(
+                                text="此手機號碼已綁定其他帳號，請聯繫診所客服協助處理。"
+                            )
+                        ],
+                        label="phone_multi_user_error",
                     )
                     return
 
@@ -901,7 +1165,13 @@ def handle_message(event: MessageEvent):
             phone_raw = text.strip()
             digits = normalize_phone(phone_raw)
 
+            print(f"[ASK_PHONE] enter uid={line_user_id_for_state} phone_raw={phone_raw} digits={digits}", flush=True)
+
+
             if not (len(digits) == 10 and digits.startswith("09")):
+
+                print(f"[ASK_PHONE] invalid uid={line_user_id_for_state} digits={digits}", flush=True)
+
                 send_line(
                     line_bot_api,
                     event,
@@ -914,6 +1184,7 @@ def handle_message(event: MessageEvent):
                 )
                 return
 
+            print(f"[ASK_PHONE] valid uid={line_user_id_for_state} digits={digits} -> start_loading", flush=True)
             start_loading_animation(
                 line_bot_api,
                 line_user_id_for_state,  # 你現成就有
@@ -924,11 +1195,14 @@ def handle_message(event: MessageEvent):
             # === A路線：先用手機找 Zendesk seed 老客，做認領 ===
             # 只有在「此 LINE 尚未綁定」時才做認領，避免老用戶更新資料時誤觸
 
+            print(f"[ASK_PHONE] before_search_by_line uid={line_user_id_for_state}", flush=True)
             try:
                 bound_count, bound_user = search_zendesk_user_by_line_id(
                     line_user_id_for_state, retries=1
                 )
+                print(f"[ASK_PHONE] after_search_by_line uid={line_user_id_for_state} bound_user={'Y' if bound_user else 'N'}", flush=True)
             except Exception as e:
+                print(f"[ASK_PHONE] search_by_line EXC uid={line_user_id_for_state} err={repr(e)}", flush=True)
                 app.logger.error(f"[ask_phone][claim] search by line_id failed: {e}")
                 bound_user = None
             # ===== Guard：若此 LINE 已有綁定中的 user（不論 complete/need_name），不允許更換手機去認領別人 =====
@@ -940,6 +1214,7 @@ def handle_message(event: MessageEvent):
 
                 # 若 Zendesk 已留 phone，且使用者輸入的 digits 與既有 phone 不同 → 直接擋
                 if bound_phone and bound_phone != digits:
+                    start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=5, timeout=(1, 2))
                     send_line(
                         line_bot_api,
                         event,
@@ -965,6 +1240,7 @@ def handle_message(event: MessageEvent):
                             "phone": (bound_phone or digits),
                         },
                     )
+
                     reply_consent_input(
                         line_bot_api=line_bot_api,
                         event=event,
@@ -974,7 +1250,7 @@ def handle_message(event: MessageEvent):
                         cancel_data="CANCEL_FLOW",
                     )
                     return
-
+ 
                 reply_date_range_buttons(
                     event, "已確認您的身分，請選擇要預約的日期範圍："
                 )
@@ -1010,6 +1286,7 @@ def handle_message(event: MessageEvent):
                                 "phone": digits,
                             },
                         )
+
                         reply_consent_input(
                             line_bot_api=line_bot_api,
                             event=event,
@@ -1039,6 +1316,7 @@ def handle_message(event: MessageEvent):
                             MessageAction(label="我要修改", text="我要修改姓名"),
                         ],
                     )
+
                     send_line(
                         line_bot_api,
                         event,
@@ -1072,6 +1350,7 @@ def handle_message(event: MessageEvent):
                     #     )
                     # )
                     # return
+
                     send_line(
                         line_bot_api,
                         event,
@@ -1109,6 +1388,7 @@ def handle_message(event: MessageEvent):
                                     "found_name": found_name,
                                 },
                             )
+                            
                             send_line(
                                 line_bot_api,
                                 event,
@@ -1121,6 +1401,7 @@ def handle_message(event: MessageEvent):
                             )
                             return
 
+                        
                         # 姓名完整 → 直接放行預約
                         reply_date_range_buttons(
                             event, f"{found_name} 您好，\n請選擇要預約的日期範圍："
@@ -1144,6 +1425,7 @@ def handle_message(event: MessageEvent):
                             "mode": "already_bound",  # 用來讓後續分支知道這是「已綁走」情境
                         },
                     )
+                    start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
                     send_line(
                         line_bot_api,
                         event,
@@ -1239,6 +1521,8 @@ def handle_message(event: MessageEvent):
                 state["step"] = "wait_consent_name_after_phone"
                 set_state(line_user_id_for_state, state)
 
+                start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
+
                 reply_consent_input(
                     line_bot_api=line_bot_api,
                     event=event,
@@ -1251,6 +1535,8 @@ def handle_message(event: MessageEvent):
 
             # 姓名有效 → 清狀態 → 放行選日期範圍
             clear_state(line_user_id_for_state)
+
+            start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
 
             info_text = (
                 "已為您完成基本資料建檔\n"
@@ -1362,26 +1648,42 @@ def handle_message(event: MessageEvent):
 
         # 1. 檢查是否已有 Zendesk 病患資料（避免未建檔客戶亂預約）
         if not is_registered_patient(line_user_id):
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。"
-                        )
-                    ],
-                )
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[
+            #             TextMessage(
+            #                 text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。"
+            #             )
+            #         ],
+            #     )
+            # )
+            send_line(
+                line_bot_api,
+                event,
+                messages=[
+                    TextMessage(
+                        text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。"
+                    )
+                ],
+                label="ask_register_before_booking",
             )
             return
 
         # 2. 驗證日期（格式正確／三週內／非過去）
         ok, msg = validate_appointment_date(date_str)
         if not ok:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=msg)],
-                )
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[TextMessage(text=msg)],
+            #     )
+            # )
+            send_line(
+                line_bot_api,
+                event,
+                messages=[TextMessage(text=msg)],
+                label="validate_appointment_date",
             )
             return
 
@@ -1397,11 +1699,17 @@ def handle_message(event: MessageEvent):
             reply_msg = TextMessage(text="取得可預約時段失敗，請稍後再試")
 
         # 回傳 Carousel 或是錯誤訊息
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[reply_msg],
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[reply_msg],
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[reply_msg],
+            label="booking_error_message",
         )
         return
 
@@ -1504,6 +1812,8 @@ def handle_message(event: MessageEvent):
 
         # ✅ Case 3：其餘（查不到、沒有 phone、未綁、等等）→ 才走 consent → ask_phone
         set_state(line_user_id, {"step": "wait_consent_phone"})
+
+        start_loading_animation(line_bot_api, line_user_id_for_state, loading_seconds=15, timeout=(1, 2))
 
         reply_consent_input(
             line_bot_api=line_bot_api,
@@ -1635,10 +1945,12 @@ def handle_message(event: MessageEvent):
             )
         )
         return
+    # === 測試身分 END ===
 
     # === ②-1 其他日期：再提供兩週後／三週後選項 ===
     elif text == "其他日期":
         line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        print(f"[WEEK_PICK] enter uid={line_user_id} text={text}", flush=True)
 
         # 立刻顯示 loading
         if line_user_id:
@@ -1659,19 +1971,29 @@ def handle_message(event: MessageEvent):
             ],
         )
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[
-                    TemplateMessage(alt_text="選擇其他日期", template=buttons_template)
-                ],
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[
+        #             TemplateMessage(alt_text="選擇其他日期", template=buttons_template)
+        #         ],
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[
+               TemplateMessage(alt_text="選擇其他日期", template=buttons_template)
+            ],
+            label="other_dates",
         )
         return
 
     # === ② 我要預約本週 ===
     elif text == "我要預約本週":
+
         line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        print(f"[WEEK_PICK] enter uid={line_user_id} text={text}", flush=True)
 
         # 立刻顯示 loading
         if line_user_id:
@@ -1687,7 +2009,9 @@ def handle_message(event: MessageEvent):
 
     # === ③ 我要預約下週 ===
     elif text == "我要預約下週":
+    
         line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        print(f"[WEEK_PICK] enter uid={line_user_id} text={text}", flush=True)
 
         # 立刻顯示 loading
         if line_user_id:
@@ -1702,7 +2026,9 @@ def handle_message(event: MessageEvent):
 
     # === ③-2 我要預約兩週後 ===
     elif text == "我要預約兩週後":
+
         line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        print(f"[WEEK_PICK] enter uid={line_user_id} text={text}", flush=True)
 
         # 立刻顯示 loading
         if line_user_id:
@@ -1717,7 +2043,9 @@ def handle_message(event: MessageEvent):
 
     # === ③-3 我要預約三週後 ===
     elif text == "我要預約三週後":
+
         line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        print(f"[WEEK_PICK] enter uid={line_user_id} text={text}", flush=True)
 
         # 立刻顯示 loading
         if line_user_id:
@@ -1732,6 +2060,7 @@ def handle_message(event: MessageEvent):
 
     # === 我想預約 YYYY-MM-DD HH:MM（需限制三週內＋需已建檔） ===
     elif text.startswith("我想預約"):
+        print(f"[INTENT_BOOK] enter uid={uid} evt_id={evt_id} text={text}", flush=True)
         payload = text.replace("我想預約", "").strip()
         parts = payload.split()
 
@@ -1745,30 +2074,55 @@ def handle_message(event: MessageEvent):
             if event.source and hasattr(event.source, "user_id"):
                 line_user_id = event.source.user_id
 
+            print(f"[INTENT_BOOK] parsed uid={line_user_id} date={date_str} time={time_str}", flush=True)
+
             start_loading_animation(line_bot_api, line_user_id, loading_seconds=30)
 
             # 1. 檢查是否已有 Zendesk 病患資料（避免未建檔亂預約）
-            if not is_registered_patient(line_user_id):
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            TextMessage(
-                                text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。"
-                            )
-                        ],
-                    )
+
+            print(f"[CONFIRM_APPT] before_is_registered uid={line_user_id}", flush=True)
+            ok_patient = is_registered_patient(line_user_id)
+            print(f"[CONFIRM_APPT] after_is_registered uid={line_user_id} ok={ok_patient}", flush=True)
+
+            if not ok_patient:
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[
+                #             TextMessage(
+                #                 text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。"
+                #             )
+                #         ],
+                #     )
+                # )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[
+                    TextMessage(text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。")
+                    ],
+                    label="invalid_patient",
                 )
                 return
 
             # 2. 日期驗證（三週內／非過去）
             ok, msg = validate_appointment_date(date_str)
+            print(f"[CONFIRM_APPT] validate_date uid={line_user_id} ok={ok} msg={msg}", flush=True)
+
+            print(f"[INTENT_BOOK] validate_date uid={line_user_id} ok={ok} msg={msg}", flush=True)
+
             if not ok:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)],
-                    )
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[TextMessage(text=msg)],
+                #     )
+                # )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text=msg)],
+                    label="validate_appointment_date",
                 )
                 return
 
@@ -1784,28 +2138,45 @@ def handle_message(event: MessageEvent):
                 ],
             )
 
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TemplateMessage(alt_text="預約確認", template=buttons_template)
-                    ],
-                )
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[
+            #             TemplateMessage(alt_text="預約確認", template=buttons_template)
+            #         ],
+            #     )
+            # )
+            print(f"[INTENT_BOOK] before_send_confirm uid={line_user_id} date={date_str} time={time_str}", flush=True)
+
+            send_line(
+                line_bot_api,
+                event,
+                messages=[TemplateMessage(alt_text="預約確認", template=buttons_template)],
+                label="booking_confirm",
             )
+            print(f"[INTENT_BOOK] after_send_confirm uid={line_user_id}", flush=True)
+
             return
 
         # 格式不正確 → 直接提示
         else:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text="請用格式：我想預約 YYYY-MM-DD HH:MM")],
-                )
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[TextMessage(text="請用格式：我想預約 YYYY-MM-DD HH:MM")],
+            #     )
+            # )
+            send_line(
+                line_bot_api,
+                event,
+                messages=[TextMessage(text="請用格式：我想預約 YYYY-MM-DD HH:MM")],
+                label="wrong_format",
             )
             return
 
     # === 使用者取消預約流程（我想預約 → 預約確認 → 取消） ===
     elif text == "取消預約流程":
+        print(f"[CANCEL_BOOK_FLOW] enter uid={uid} evt_id={evt_id}", flush=True)
         buttons_template = ButtonsTemplate(
             title="已經取消約診流程",
             text="若需預約看診，請點擊「線上約診」。",
@@ -1814,15 +2185,22 @@ def handle_message(event: MessageEvent):
             ],
         )
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[
-                    TemplateMessage(
-                        alt_text="已取消預約流程", template=buttons_template
-                    )
-                ],
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[
+        #             TemplateMessage(
+        #                 alt_text="已取消預約流程", template=buttons_template
+        #             )
+        #         ],
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TemplateMessage(
+                alt_text="已取消預約流程", template=buttons_template)],
+            label="cancelled",
         )
         return
 
@@ -1840,44 +2218,109 @@ def handle_message(event: MessageEvent):
             if event.source and hasattr(event.source, "user_id"):
                 line_user_id = event.source.user_id
 
+            evt_id_safe = locals().get("evt_id") or getattr(event, "webhook_event_id", None) or "NA"
+            
+            print(f"[CONFIRM_APPT] parsed uid={line_user_id} date={date_str} time={time_str}", flush=True)
+
+            if not line_user_id:
+                print(f"[CONFIRM_APPT] missing_uid evt_id={evt_id_safe} date={date_str} time={time_str}", flush=True)
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text="系統未取得您的帳號資訊，請稍後再試或重新開啟對話。")],
+                    label="confirm_appt_missing_uid",
+                )
+                return
+
+            print(f"[CONFIRM_APPT] enter uid={line_user_id} evt_id={evt_id_safe} date={date_str} time={time_str}", flush=True)
+
+            lock_key = f"confirm:{line_user_id}:{date_str}:{time_str}"
+            print(f"[CONFIRM_APPT] before_lock uid={line_user_id} key={lock_key}", flush=True)
+            lock_ok = acquire_lock(lock_key, ttl_sec=30)
+            print(f"[CONFIRM_APPT] after_lock uid={line_user_id} ok={lock_ok}", flush=True)
+            if not lock_ok:
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[
+                #             TextMessage(
+                #                 text="正在建立預約中，請勿重複點擊～\n若未收到預約成功訊息，請稍後再試或「約診查詢」。"
+                #             )
+                #         ],
+                #     )
+                # )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text="正在建立預約中，請勿重複點擊～\n若未收到預約成功訊息，請稍後再試或「約診查詢」。")],
+                    label="duplication",
+                )
+                return
+
             start_loading_animation(line_bot_api, line_user_id, loading_seconds=30)
 
             # ② 檢查是否已在 Zendesk 建檔（防止未建檔暴力確認）
             if not is_registered_patient(line_user_id):
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            TextMessage(
-                                text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。"
-                            )
-                        ],
-                    )
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[
+                #             TextMessage(
+                #                 text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。"
+                #             )
+                #         ],
+                #     )
+                # )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text="目前系統尚未有您的基本資料，請先點選「線上約診」完成建檔，再進行預約喔。")],
+                    label="cancelled",
                 )
                 return
 
             # ③ 檢查日期是否合法（三週內／非過去）
             ok, msg = validate_appointment_date(date_str)
+            print(f"[CONFIRM_APPT] validate_date uid={line_user_id} ok={ok} msg={msg}", flush=True)
+
             if not ok:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)],
-                    )
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[TextMessage(text=msg)],
+                #     )
+                # )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text=msg)],
+                    label="validate_appointment_date",
                 )
                 return
 
             # ④ 檢查該時段目前是否仍可預約（防止暴力輸入或已被別人搶走）
-            if not is_slot_available(date_str, time_str):
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            TextMessage(
-                                text="很抱歉，您選擇的時段已滿或無法預約，請重新選擇其他時段。"
-                            )
-                        ],
-                    )
+            t0 = time.time()
+            ok_slot = is_slot_available(date_str, time_str)
+            print(f"[CONFIRM_APPT] slot_check uid={line_user_id} ok={ok_slot} elapsed={time.time()-t0:.3f}s", flush=True)
+            print(f"[CONFIRM_APPT] slot_check uid={line_user_id} date={date_str} time={time_str} ok={ok_slot}", flush=True)
+
+            # if not is_slot_available(date_str, time_str):
+            if not ok_slot:
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[
+                #             TextMessage(
+                #                 text="很抱歉，您選擇的時段已滿或無法預約，請重新選擇其他時段。"
+                #             )
+                #         ],
+                #     )
+                # )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text="很抱歉，您選擇的時段已滿或無法預約，請重新選擇其他時段。")],
+                    label="date_full",
                 )
                 return
 
@@ -1891,6 +2334,7 @@ def handle_message(event: MessageEvent):
             # ⑥ 如果拿得到 line_user_id，就去 Zendesk 找 user
             if line_user_id:
                 try:
+                    print(f"[CONFIRM_APPT] before_search_zd uid={line_user_id}", flush=True)
                     zd_count, zd_user = search_zendesk_user_by_line_id(line_user_id)
                     if zd_user:
                         # Zendesk 裡的 name / phone
@@ -1900,19 +2344,31 @@ def handle_message(event: MessageEvent):
                         customer_phone = zd_phone
                         # 關鍵：從 Zendesk User 物件中取得 ID
                         zendesk_customer_id = zd_user.get("id")
+                    print(f"[CONFIRM_APPT] after_search_zd uid={line_user_id} found={'Y' if zd_user else 'N'}", flush=True)
+
 
                 except Exception as e:
                     app.logger.error(f"用 line_user_id 查 Zendesk user 失敗: {e}")
 
                 # ⑦ 再嘗試拿 LINE 顯示名稱（例如 Kevin）
+                print(f"[CONFIRM_APPT] before_get_profile uid={line_user_id}", flush=True)
+
                 try:
+                    print(f"[CONFIRM_APPT] before_get_profile uid={line_user_id}", flush=True)
                     profile = line_bot_api.get_profile(line_user_id)
                     if profile and hasattr(profile, "display_name"):
                         line_display_name = profile.display_name
+                        print(f"[CONFIRM_APPT] after_get_profile uid={line_user_id} display={line_display_name}", flush=True)
+                    else:
+                        print(f"[CONFIRM_APPT] after_get_profile uid={line_user_id} display=None", flush=True)
                 except Exception as e:
+                    print(f"[CONFIRM_APPT] get_profile EXC uid={line_user_id} err={repr(e)}", flush=True)
                     app.logger.error(f"取得 LINE profile 失敗: {e}")
 
             # ⑧ 呼叫新的 create_booking_appointment（會寫入 LINE_USER 到 serviceNotes）
+
+            print(f"[CONFIRM_APPT] before_create uid={line_user_id} evt_id={evt_id} date={date_str} time={time_str}", flush=True)
+
             try:
                 created = create_booking_appointment(
                     date_str=date_str,
@@ -1924,6 +2380,9 @@ def handle_message(event: MessageEvent):
                     line_display_name=line_display_name,
                     line_user_id=line_user_id,
                 )
+                bid = created.get("id") if isinstance(created, dict) else None
+                print(f"[CONFIRM_APPT] after_create uid={line_user_id} booking_id={bid} created_type={type(created).__name__}", flush=True)
+
                 appt_id = created.get("id", "（沒有取得 ID）")
                 # ===== DEBUG：強制走 notes 兜底（只在本機測試用）=====
                 if FORCE_ZD_ID_FROM_NOTES:
@@ -2013,32 +2472,52 @@ def handle_message(event: MessageEvent):
                     actions=[MessageAction(label="位置導航", text="查詢診所位置")],
                 )
 
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            TextMessage(text=detail_text),
-                            TemplateMessage(
-                                alt_text="診所位置導航",
-                                template=buttons_template,
-                            ),
-                        ],
-                    )
+                # line_bot_api.reply_message(
+                #     ReplyMessageRequest(
+                #         reply_token=event.reply_token,
+                #         messages=[
+                #             TextMessage(text=detail_text),
+                #             TemplateMessage(
+                #                 alt_text="診所位置導航",
+                #                 template=buttons_template,
+                #             ),
+                #         ],
+                #     )
+                # )
+                print(f"[CONFIRM_APPT] before_send_success uid={line_user_id} booking_id={bid}", flush=True)
+                send_line(
+                    line_bot_api, event,
+                    messages=[
+                        TextMessage(text=detail_text),
+                        TemplateMessage(alt_text="診所位置導航", template=buttons_template),
+                    ],
+                    label="confirm_appt_success",
+                    timeout=(3, 10),
+                    push_timeout=(3, 10),
                 )
+                print(f"[CONFIRM_APPT] after_send_success uid={line_user_id}", flush=True)
+
                 return
 
             except Exception as e:
+                print(f"[CONFIRM_APPT] create EXC uid={line_user_id} err={repr(e)}", flush=True)
                 app.logger.error(f"建立 Bookings 預約失敗: {e}")
                 reply_text = "未成功預約，請重新操作"
 
         else:
             reply_text = "格式：確認預約 YYYY-MM-DD HH:MM"
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[TextMessage(text=reply_text)],
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text=reply_text)],
+            label="reply_text",
         )
         return
 
@@ -2061,21 +2540,33 @@ def handle_message(event: MessageEvent):
         return flow_cancel_request(event, text)
 
     elif text.startswith("確認取消"):
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="請先點選「約診查詢」確認約診狀態。")],
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[TextMessage(text="請先點選「約診查詢」確認約診狀態。")],
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text="請先點選「約診查詢」確認約診狀態。")],
+            label="need_check_appointment_cancel",
         )
         return
 
     # === ⑦ 確認回診 ===
     elif text.startswith("確認回診"):
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="請先點選「約診查詢」確認約診狀態。")],
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[TextMessage(text="請先點選「約診查詢」確認約診狀態。")],
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text="請先點選「約診查詢」確認約診狀態。")],
+            label="need_check_appointment_confirm",
         )
         return
 
@@ -2087,15 +2578,29 @@ def handle_message(event: MessageEvent):
             latitude=CLINIC_LAT,
             longitude=CLINIC_LNG,
         )
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token, messages=[location_message]
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token, messages=[location_message]
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[location_message],
+            label="location_message",
         )
         return
 
     # === 診所資訊 ===
     elif text == "診所資訊":
+        line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        if line_user_id:
+            start_loading_animation(
+                line_bot_api,
+                line_user_id,
+                loading_seconds=30,
+                timeout=(1, 2),
+            )
         short_text = f"地址：{CLINIC_ADDRESS}\n點擊下方查看地圖位置"
 
         clinic_info_template = ButtonsTemplate(
@@ -2125,16 +2630,27 @@ def handle_message(event: MessageEvent):
             longitude=CLINIC_LNG,
         )
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[
-                    TemplateMessage(alt_text="診所資訊", template=clinic_info_template),
-                    opening_hours_message,
-                    location_message,
-                ],
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token,
+        #         messages=[
+        #             TemplateMessage(alt_text="診所資訊", template=clinic_info_template),
+        #             opening_hours_message,
+        #             location_message,
+        #         ],
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[
+                TemplateMessage(alt_text="診所資訊", template=clinic_info_template),
+                opening_hours_message,
+                location_message,
+            ],
+            label="clinic_info_bundle",
         )
+
         return
 
     # === 查看地圖位置 ===
@@ -2145,11 +2661,18 @@ def handle_message(event: MessageEvent):
             latitude=CLINIC_LAT,
             longitude=CLINIC_LNG,
         )
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token, messages=[location_message]
-            )
+        # line_bot_api.reply_message(
+        #     ReplyMessageRequest(
+        #         reply_token=event.reply_token, messages=[location_message]
+        #     )
+        # )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[location_message],
+            label="clinic_location_only",
         )
+
         return
 
     # === fallback：使用者直接輸入手機，但尚未進入任何流程 ===
@@ -2157,33 +2680,52 @@ def handle_message(event: MessageEvent):
         digits = normalize_phone(text)
         # ✅ Redis：若目前沒有任何 pending state，才走 fallback-phone
         st = get_state(uid)
+        print(f"[fallback-phone] check uid={uid} digits={digits} has_state={'Y' if (st and st.get('step')) else 'N'}", flush=True)
         if (
             len(digits) == 10
             and digits.startswith("09")
             and (not st or not st.get("step"))
         ):
             app.logger.info(f"[fallback-phone] uid={uid} digits={digits}")
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text="請先點選「線上約診」，並按下「好的，我要開始輸入」後再輸入手機喔。"
-                        )
-                    ],
-                )
+            print(f"[fallback-phone] uid={uid} digits={digits} st={st}", flush=True)
+            # line_bot_api.reply_message(
+            #     ReplyMessageRequest(
+            #         reply_token=event.reply_token,
+            #         messages=[
+            #             TextMessage(
+            #                 text="請先點選「線上約診」，並按下「好的，我要開始輸入」後再輸入手機喔。"
+            #             )
+            #         ],
+            #     )
+            # )
+            send_line(
+                line_bot_api,
+                event,
+                messages=[
+                    TextMessage(text="請先點選「線上約診」，並按下「好的，我要開始輸入」後再輸入手機喔。")
+                ],
+                label="fallback_phone",
+                timeout=(3, 10),
+                push_timeout=(3, 10),
             )
+
             return
 
     # === 其他訊息（最後 default 回覆） ===
     app.logger.info("非線上約診相關指令，請聯繫客服")
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[
-                TextMessage(text="我目前只支援線上約診流程喔～請輸入「線上約診」開始。")
-            ],
-        )
+    # line_bot_api.reply_message(
+    #     ReplyMessageRequest(
+    #         reply_token=event.reply_token,
+    #         messages=[
+    #             TextMessage(text="我目前只支援線上約診流程喔～請輸入「線上約診」開始。")
+    #         ],
+    #     )
+    # )
+    send_line(
+        line_bot_api,
+        event,
+        messages=[TextMessage(text="目前只支援線上約診流程～請從「線上約診」開始。")],
+        label="remind_message",
     )
     return
 
@@ -2211,9 +2753,34 @@ def handle_postback(event):
 
     # ===== 新增：同意開始輸入手機 =====
     if data == "CONSENT_PHONE":
-
+        
         if not line_user_id:
             return
+        
+        print(f"[PB] CONSENT_PHONE enter uid={line_user_id}", flush=True)
+        
+        state = get_state(line_user_id) or {}
+        step = (state.get("step") or "").strip()
+
+        print(f"[PB] CONSENT_PHONE before_enter step={step} state={state}", flush=True)
+
+
+        # 只允許在「等同意輸入手機 / 已在輸入手機」時推進，避免舊卡片把流程拉回去
+        if step and step not in {"wait_consent_phone", "ask_phone"}:
+
+            print(f"[PB] CONSENT_PHONE blocked step={step}", flush=True)
+
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="您目前正在填寫其他資料。如需重新開始，請輸入「取消」。")],
+                )
+            )
+            return
+        
+        print(f"[PB] CONSENT_PHONE calling enter_input_step uid={line_user_id}", flush=True)
+
+        start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
 
         enter_input_step(
             line_bot_api=line_bot_api,
@@ -2222,6 +2789,11 @@ def handle_postback(event):
             step="ask_phone",
             prompt_text="好的，請輸入您的手機號碼（09xxxxxxxx）：",
         )
+
+        # 進一步確認 set_state 後 step 是否真的變 ask_phone
+        state2 = get_state(line_user_id) or {}
+        step2 = (state2.get("step") or "").strip()
+        print(f"[PB] CONSENT_PHONE after_enter step={step2} state={state2}", flush=True)
         return
 
     # ===== 同意開始輸入姓名（手機已確認後補姓名）=====
@@ -2229,7 +2801,11 @@ def handle_postback(event):
         if not line_user_id:
             return
 
+        print(f"[PB] CONSENT_NAME_AFTER_PHONE enter uid={line_user_id} data={data}", flush=True)
+
         state = get_state(line_user_id) or {}
+
+        print(f"[PB] CONSENT_NAME_AFTER_PHONE state step={(state.get('step') or '').strip()} state={state}", flush=True)
 
         # state 不見也能重建（避免 bad_state / Redis TTL / worker restart）
         if not state:
@@ -2300,6 +2876,10 @@ def handle_postback(event):
         # step == wait_consent_name_after_phone → 正常進入輸入
         zendesk_user_id = state.get("zendesk_user_id")
         phone = state.get("phone")
+
+        print(f"[PB] CONSENT_NAME_AFTER_PHONE proceed uid={line_user_id} -> enter_input_step ask_name_after_phone", flush=True)
+
+        start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
 
         enter_input_step(
             line_bot_api=line_bot_api,

@@ -124,7 +124,7 @@ def flow_query_next_appointment(event, text: str):
             template=buttons_template
         )
 
-        send_line(line_bot_api, event, messages=[template_message])
+        send_line(line_bot_api, event, messages=[template_message], label="appt_query")
 
         return
 

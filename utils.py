@@ -98,20 +98,30 @@ def enter_input_step(*, line_bot_api, event, line_user_id: str, step: str, promp
     進入某個輸入 step，並立刻回一則文字提示「可以開始輸入」。
     狀態改存 Redis（state_store），不再用記憶體 dict。
     """
-    state = {"step": step}
+    # ✅ 先拿舊 state，避免把 zendesk_user_id / phone 蓋掉
+    prev = get_state(line_user_id) or {}
+
+    new_state = dict(prev)
+    new_state["step"] = step
     if extra_state:
-        state.update(extra_state)
+        new_state.update(extra_state)
 
     # 存進 Redis（有 TTL）
-    set_state(line_user_id, state)
+    app.logger.info(f"[enter_input_step] uid={line_user_id} step={new_state} extra={bool(extra_state)}")
+    print(f"[enter_input_step] uid={line_user_id} prev={prev} -> new={new_state}", flush=True)
+    set_state(line_user_id, new_state)
 
-    app.logger.info(f"[enter_input_step] uid={line_user_id} step={step} extra={bool(extra_state)}")
-
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text=prompt_text)],
-        )
+    # line_bot_api.reply_message(
+    #     ReplyMessageRequest(
+    #         reply_token=event.reply_token,
+    #         messages=[TextMessage(text=prompt_text)],
+    #     )
+    # )
+    send_line(
+    line_bot_api,
+    event,
+    messages=[TextMessage(text=prompt_text)],
+    label=f"enter_input_step_{step}",
     )
 
 # def clear_pending_state(line_user_id: str) -> bool:

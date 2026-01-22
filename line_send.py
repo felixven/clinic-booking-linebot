@@ -25,39 +25,43 @@ from queue_core import redis_conn
 
 PUSH_GUARD_PREFIX = "linebot:pushguard:"
 
+
 def _guard_key(to_id: str) -> str:
     # 只用 to_id 做 guard（避免 reply timeout 後同一人短時間被重複 push 洗版）
     return f"{PUSH_GUARD_PREFIX}{to_id}"
 
 
-def _acquire_push_guard(to_id: str, label: str, ttl_sec: int) -> bool:
+def _acquire_push_guard(to_id: str, label: str, event_key: str | None, ttl_sec: int) -> bool:
     """
-    60 秒內同一個 user + 同一種 label，只允許 fallback push 一次
+    同一顆事件（event_key）60 秒只允許一次
     - return True：成功取得 guard（允許 push）
     - return False：guard 已存在（跳過 push）
     """
     if not to_id:
         return False
+    
+    #萬一沒有event_key就直接放行
+    if not event_key:
+        print("[LINE_guard] missing event_key -> allow", flush=True)
+        return True
 
     ttl_sec = int(ttl_sec or 60)
     if ttl_sec <= 0:
         ttl_sec = 60
 
-    key = f"line:push_guard:{to_id}:{label}"
+    key = f"line:push_guard:{to_id}:{label}:{event_key}"
 
     try:
         ok = redis_conn.set(name=key, value=b"1", nx=True, ex=ttl_sec)
-
         # redis-py: ok 可能是 True / False；有些版本回 b'OK'
         acquired = (ok is True) or (ok == b"OK") or (ok == "OK")
-
         print(f"[LINE_guard] acquired={acquired} key={key} ttl={ttl_sec}", flush=True)
-
         return acquired
 
     except Exception as e:
         # guard 壞了也不要讓主流程爆炸：寧可放行（避免 push 永遠不送）
         current_app.logger.warning("[LINE_guard] error=%s key=%s -> allow", repr(e), key)
+        print(f"[LINE_guard] error={repr(e)} key={key} -> allow", flush=True)
         return True
 
     
@@ -76,6 +80,28 @@ def _acquire_push_guard_by_event(event_key: str, label: str, ttl_sec: int) -> bo
     except Exception as e:
         current_app.logger.warning("[LINE_%s] push guard redis error -> allow push err=%s", label, repr(e))
         return True
+    
+def _latest_key(uid: str, label: str) -> str:
+    return f"line:latest:{uid}:{label}"
+
+def _set_latest(uid: str, label: str, event_key: str, ttl_sec: int = 120) -> None:
+    try:
+        redis_conn.set(_latest_key(uid, label), event_key, ex=ttl_sec)
+    except Exception:
+        # latest guard 掛掉就當沒這功能，不要影響主流程
+        pass
+
+def _is_latest(uid: str, label: str, event_key: str) -> bool:
+    try:
+        v = redis_conn.get(_latest_key(uid, label))
+        if v is None:
+            return True  # 沒資料就放行
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", errors="ignore")
+        return v == event_key
+    except Exception:
+        return True  # fail-open
+
     
 try:
     import requests
@@ -350,6 +376,14 @@ def start_loading_animation(line_bot_api, chat_id: str, *, loading_seconds: int 
 #     except Exception as e:
 #         current_app.logger.warning("[LINE_loading] start failed err=%s chat_id=%s", repr(e), chat_id)
 #         return False
+
+def _get_event_key(event) -> str | None:
+    # linebot v3 的 event 可能是 webhook_event_id 或 webhookEventId
+    return (
+        getattr(event, "webhook_event_id", None)
+        or getattr(event, "webhookEventId", None)
+        or getattr(event, "webhookEventID", None)  # 保險
+    )
     
 
 def send_line(
@@ -361,13 +395,22 @@ def send_line(
     push_timeout=(3, 10),     # ✅ push 不沿用 reply timeout
     label="send",
     push_guard_ttl_sec=60,
+    event_key: str | None = None,
 ):
     to_id = _event_to_to_id(event)
     t0 = time.time()
     req = ReplyMessageRequest(reply_token=event.reply_token, messages=messages)
 
+    if event_key is None:          # 沒傳要自己抓
+        event_key = _get_event_key(event)
+
     # ✅ 先用 print 把路徑釘死（暫時用，之後再拿掉）
     print(f"[SEND_LINE_ENTER] label={label} to_id={to_id}", flush=True)
+    print(f"[SEND_LINE] label={label} uid={to_id} event_key={event_key} is_reply={bool(event and getattr(event,'reply_token',None))}", flush=True)
+
+    # 記住：這個 uid + label 的最新事件是誰
+    _set_latest(to_id, label, event_key, ttl_sec=120)
+
 
     try:
         if os.getenv("FORCE_REPLY_TIMEOUT") in ("1", "true", "True", "yes", "Y"):
@@ -393,14 +436,19 @@ def send_line(
 
         # guard
         try:
-            force = os.getenv("FORCE_REPLY_TIMEOUT", "0") in ("1", "true", "True", "yes", "Y")
+            force_guard_bypass = os.getenv("FORCE_GUARD_BYPASS", "0") in ("1", "true", "True", "yes", "Y")
 
-            if not force:
-                if not _acquire_push_guard(to_id, label, push_guard_ttl_sec):
-                    print(f"[SEND_LINE_GUARD_HIT] label={label} to_id={to_id}", flush=True)
+            # ✅ 最新事件守門：不是最新就不要 push（避免舊事件晚到）
+            if not _is_latest(to_id, label, event_key):
+                print(f"[SEND_LINE_STALE_SKIP] label={label} to_id={to_id} event_key={event_key}", flush=True)
+                return None
+
+            if not force_guard_bypass:
+                if not _acquire_push_guard(to_id, label, event_key, push_guard_ttl_sec):
+                    print(f"[SEND_LINE_GUARD_HIT] label={label} to_id={to_id} event_key={event_key}", flush=True)
                     return None
             else:
-                print(f"[SEND_LINE_GUARD_BYPASS] label={label} to_id={to_id}", flush=True)
+                print(f"[SEND_LINE_GUARD_BYPASS] label={label} to_id={to_id} event_key={event_key}", flush=True)
 
             preq = PushMessageRequest(to=to_id, messages=messages)
             t1 = time.time()
@@ -409,8 +457,9 @@ def send_line(
             return r
 
         except Exception as e2:
-            print(f"[SEND_LINE_PUSH_FAIL] label={label} err={repr(e2)} to_id={to_id}", flush=True)
+            print(f"[SEND_LINE_PUSH_FAIL] label={label} err={repr(e2)} to_id={to_id} event_key={event_key}", flush=True)
             return None
+
 
     
 # def send_line(
