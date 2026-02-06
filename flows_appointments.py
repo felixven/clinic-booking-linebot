@@ -150,8 +150,19 @@ def flow_query_next_appointment(event, text: str):
         service_notes = appt.get("serviceNotes") or ""
         is_confirmed = CONFIRM_NOTE_KEYWORD in service_notes
 
-        # Title：日期 + 時間
-        title = f"{display_date} {display_time}"
+        # Title：依類型決定顯示
+        btype = (appt.get("_booking_type") or "clinic").strip()
+
+        if btype == "clinic":
+            # ✅ 門診：不顯示 HH:MM，只顯示早/晚
+            period_label = "早診" if local_start.hour < 12 else "晚診"
+            title = f"【門診】{display_date}（{period_label}）"
+        else:
+            # ✅ 針灸：顯示時間
+            title = f"【針灸】{display_date} {display_time}"
+
+
+        # title = f"{display_date} {display_time}"
 
         actions = []
 

@@ -1,13 +1,15 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import os
 import requests
 import re
+import json
 from flask import current_app as app  # 用 app.logger
 
 from config import (
-    BOOKING_DEMO_SERVICE_ID,
-    BOOKING_DEMO_STAFF_ID,
-    BOOKING_BUSINESS_ID,
+    BOOKINGS_DEMO_SERVICE_ID,
+    BOOKINGS_DEMO_STAFF_ID,
+    BOOKINGS_BUSINESS_CLINIC_ID,
     SLOT_INTERVAL_MINUTES,
     APPOINTMENT_DURATION_MINUTES,
     MORNING_START, 
@@ -19,6 +21,20 @@ from config import (
     SAT_MORNING_START, 
     SAT_MORNING_END,
     CLOSED_WEEKDAYS,
+    ACU_SLOTS,
+    ACU_SERVICE_IDS,
+    ACU_STAFF_BED1_ID,
+    ACU_STAFF_BED2_ID,
+    BOOKINGS_BUSINESS_ACU_ID,
+    BOOKINGS_SERVICE_ACU_BED1_ID,
+    BOOKINGS_SERVICE_ACU_BED2_ID,
+    BOOKINGS_BUSINESS_ACU_BED1_ID,
+    BOOKINGS_BUSINESS_ACU_BED2_ID,
+    BOOKINGS_SERVICE_ACU_BED_ID,
+    CLINIC_MORNING_START, 
+    CLINIC_MORNING_END,
+    CLINIC_EVENING_END,
+    CLINIC_EVENING_START
 )
 
 # ======== 跟 Entra 拿 Microsoft Graph 的 access token ========
@@ -46,7 +62,55 @@ def get_graph_token():
 
     resp.raise_for_status()
     return resp.json()["access_token"]
+
+
+def _get_clinic_day_intervals_by_session(session: str) -> list[tuple[str, str]]:
+    # session: "morning" / "evening"
+    if session == "morning":
+        return [(CLINIC_MORNING_START, CLINIC_MORNING_END)]
+    if session == "evening":
+        return [(CLINIC_EVENING_START, CLINIC_EVENING_END)]
+    return []
+
     
+def get_available_clinic_slots_for_session(date_str: str, business_id: str, session: str) -> list[str]:
+    intervals = _get_clinic_day_intervals_by_session(session)
+    if not intervals:
+        return []
+
+    appts = list_appointments_for_date(date_str, business_id=business_id)
+
+    booked_times = set()
+    for appt in appts:
+        s = (appt.get("startDateTime", {}) or {}).get("dateTime")
+        if not s:
+            continue
+        try:
+            if s.endswith("Z"):
+                s = s[:-1]
+            if "." in s:
+                s = s.split(".", 1)[0]
+            utc_dt = datetime.fromisoformat(s)
+            local_dt = utc_dt + timedelta(hours=8)
+            booked_times.add(local_dt.strftime("%H:%M"))
+        except Exception:
+            continue
+
+    slots = []
+    duration = APPOINTMENT_DURATION_MINUTES
+
+    for start_hhmm, end_hhmm in intervals:
+        cur = datetime.strptime(start_hhmm, "%H:%M")
+        end_dt = datetime.strptime(end_hhmm, "%H:%M")
+
+        while cur + timedelta(minutes=duration) <= end_dt:
+            hhmm = cur.strftime("%H:%M")
+            if hhmm not in booked_times:
+                slots.append(hhmm)
+            cur += timedelta(minutes=SLOT_INTERVAL_MINUTES)
+
+    return slots
+
 
 def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
     """
@@ -84,20 +148,21 @@ def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
     return local_dt
 
 # --- 輔助函式：取得指定日期所有預約 (實際呼叫 Graph API) ---
-def list_appointments_for_date(date_str: str) -> list:
+def list_appointments_for_date(date_str: str, business_id: str) -> list:
     """
     從 Bookings 取得指定日期 (台北時間, YYYY-MM-DD) 的所有預約列表。
     回傳: 預約列表 (list of dict)
     """
     token: str = get_graph_token()
-    business_id: str = os.environ.get("BOOKING_BUSINESS_ID") or BOOKING_BUSINESS_ID
 
+    # ✅ 用傳入的 business_id；沒傳才 fallback（但建議你都要傳）
+    business_id = business_id or os.environ.get("BOOKING_BUSINESS_CLINIC_ID") or BOOKINGS_BUSINESS_CLINIC_ID
     if not business_id:
-        raise Exception("缺 BOOKING_BUSINESS_ID，請檢查環境變數。")
+        raise Exception("缺 business_id（BOOKING_BUSINESS_CLINIC_ID），請檢查環境變數。")
+    
 
     # 1. 計算 UTC 範圍 (將台北時間 T+08:00 轉換為 UTC)
     try:
-        # 台北時間 (UTC+8) 的 00:00:00
         local_start_dt: datetime = datetime.strptime(f"{date_str} 00:00:00", "%Y-%m-%d %H:%M:%S")
     except ValueError:
         app.logger.error(f"日期格式錯誤，請使用 YYYY-MM-DD: {date_str}")
@@ -105,37 +170,78 @@ def list_appointments_for_date(date_str: str) -> list:
 
     local_end_dt: datetime = local_start_dt + timedelta(days=1)
 
-    # 轉為 UTC 時間 (減 8 小時)
     utc_start_dt: datetime = local_start_dt - timedelta(hours=8)
     utc_end_dt: datetime = local_end_dt - timedelta(hours=8)
 
-    # 格式化為 Graph API 要求的 ISO 格式
-    start_time: str = utc_start_dt.isoformat() + "Z"
-    end_time: str = utc_end_dt.isoformat() + "Z"
+    start_time: str = utc_start_dt.replace(microsecond=0).isoformat() + "Z"
+    end_time: str = utc_end_dt.replace(microsecond=0).isoformat() + "Z"
 
-    # 2. 呼叫 calendarView API
+    app.logger.info(f"[list_appointments_for_date] business_id={business_id} date={date_str}")
     url: str = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/calendarView"
+    headers: dict = {"Authorization": f"Bearer {token}"}
+    params: dict = {"start": start_time, "end": end_time}
 
-    headers: dict = {
-        "Authorization": f"Bearer {token}"
-    }
-
-    params: dict = {
-        "start": start_time,
-        "end": end_time
-    }
-
-    # 執行 API 呼叫
     resp = requests.get(url, headers=headers, params=params)
-    app.logger.info(
-        f"CALENDAR VIEW STATUS: {resp.status_code}, URL: {resp.url}")
-
+    app.logger.info(f"CALENDAR VIEW STATUS: {resp.status_code}, URL: {resp.url}")
     resp.raise_for_status()
-
-    # calendarView 回傳的結果已經是該日期範圍內 (UTC+8) 的預約
     return resp.json().get("value", [])
 
-def list_appointments_for_range(start_local: datetime, end_local: datetime):
+# def list_appointments_for_date(date_str: str, business_id: str) -> list:
+#     """
+#     從 Bookings 取得指定日期 (台北時間, YYYY-MM-DD) 的所有預約列表。
+#     回傳: 預約列表 (list of dict)
+#     """
+#     token: str = get_graph_token()
+#     business_id: str = os.environ.get("BOOKING_BUSINESS_ID") or BOOKING_BUSINESS_ID
+
+#     if not business_id:
+#         raise Exception("缺 BOOKING_BUSINESS_ID，請檢查環境變數。")
+
+#     # 1. 計算 UTC 範圍 (將台北時間 T+08:00 轉換為 UTC)
+#     try:
+#         # 台北時間 (UTC+8) 的 00:00:00
+#         local_start_dt: datetime = datetime.strptime(f"{date_str} 00:00:00", "%Y-%m-%d %H:%M:%S")
+#     except ValueError:
+#         app.logger.error(f"日期格式錯誤，請使用 YYYY-MM-DD: {date_str}")
+#         return []
+
+#     local_end_dt: datetime = local_start_dt + timedelta(days=1)
+
+#     # 轉為 UTC 時間 (減 8 小時)
+#     utc_start_dt: datetime = local_start_dt - timedelta(hours=8)
+#     utc_end_dt: datetime = local_end_dt - timedelta(hours=8)
+
+#     # 格式化為 Graph API 要求的 ISO 格式
+#     start_time: str = utc_start_dt.isoformat() + "Z"
+#     end_time: str = utc_end_dt.isoformat() + "Z"
+
+#     # 2. 呼叫 calendarView API
+#     url: str = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/calendarView"
+
+#     headers: dict = {
+#         "Authorization": f"Bearer {token}"
+#     }
+
+#     params: dict = {
+#         "start": start_time,
+#         "end": end_time
+#     }
+
+#     # 執行 API 呼叫
+#     resp = requests.get(url, headers=headers, params=params)
+#     app.logger.info(
+#         f"CALENDAR VIEW STATUS: {resp.status_code}, URL: {resp.url}")
+
+#     resp.raise_for_status()
+
+#     # calendarView 回傳的結果已經是該日期範圍內 (UTC+8) 的預約
+#     return resp.json().get("value", [])
+
+def list_appointments_for_range(
+    start_local: datetime,
+    end_local: datetime,
+    business_id: str | None = None,
+):
     """
     一次從 Bookings 抓「某個時間範圍內」所有 appointments。
 
@@ -146,19 +252,58 @@ def list_appointments_for_range(start_local: datetime, end_local: datetime):
 
     回傳：list[dict]（appointments 清單）
     """
+    print(
+        f"[LIST_APPTS_RANGE] enter "
+        f"start_local={start_local!r} end_local={end_local!r} "
+        f"business_id_arg={business_id!r}",
+        flush=True
+    )
+
     token = get_graph_token()
-    business_id = os.environ.get("BOOKING_BUSINESS_ID")
+
+    # ✅ business_id 來源優先順序：
+    # 1) 呼叫端傳入
+    # 2) 環境變數 BOOKING_BUSINESS_ID（舊版相容）
+    # 3) （可選）你也可以自己加 BOOKING_BUSINESS_CLINIC_ID / BOOKING_BUSINESS_ACU_ID 在外面做分流後傳入
+    business_id = (business_id or "").strip() or (os.environ.get("BOOKING_BUSINESS_ID") or "").strip()
+
+    print(f"[LIST_APPTS_RANGE] resolved business_id={business_id!r}", flush=True)
+
     if not business_id:
-        raise Exception("缺 BOOKING_BUSINESS_ID")
+        # 保留你原本的錯誤語意，但把訊息寫清楚一點方便你抓 log
+        raise Exception("缺 BOOKING_BUSINESS_ID（或呼叫時未傳入 business_id）")
 
-    # 先把台北時間（UTC+8）轉成 UTC 時間
-    start_utc = start_local - timedelta(hours=8)
-    end_utc = end_local - timedelta(hours=8)
+    # ===== 時間處理（穩健版）=====
+    # 你的規格：start_local / end_local 是台北時間 naive
+    # 做法：把 naive 視為 Asia/Taipei → 轉成 UTC → 格式化為 ISO + Z
+    tz_taipei = ZoneInfo("Asia/Taipei")
 
-    # 轉成 ISO 格式，補上 Z
-    start_iso = start_utc.replace(microsecond=0).isoformat() + "Z"
-    end_iso = end_utc.replace(microsecond=0).isoformat() + "Z"
+    if start_local.tzinfo is None:
+        start_local_aware = start_local.replace(tzinfo=tz_taipei)
+    else:
+        start_local_aware = start_local.astimezone(tz_taipei)
 
+    if end_local.tzinfo is None:
+        end_local_aware = end_local.replace(tzinfo=tz_taipei)
+    else:
+        end_local_aware = end_local.astimezone(tz_taipei)
+
+    start_utc = start_local_aware.astimezone(timezone.utc)
+    end_utc = end_local_aware.astimezone(timezone.utc)
+
+    # 轉成 ISO 格式，補上 Z（Graph 接受）
+    start_iso = start_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    end_iso = end_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    print(
+        f"[LIST_APPTS_RANGE] time_convert "
+        f"start_local_aware={start_local_aware.isoformat()} "
+        f"end_local_aware={end_local_aware.isoformat()} "
+        f"start_iso={start_iso} end_iso={end_iso}",
+        flush=True
+    )
+
+    # ===== Graph 呼叫 =====
     url = (
         f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
         f"?startDateTime={start_iso}&endDateTime={end_iso}"
@@ -169,15 +314,86 @@ def list_appointments_for_range(start_local: datetime, end_local: datetime):
         "Content-Type": "application/json",
     }
 
-    resp = requests.get(url, headers=headers)
-    app.logger.info(
-        f"LIST APPTS RANGE STATUS: {resp.status_code}, BODY: {resp.text[:500]}"
-    )
-    resp.raise_for_status()
+    all_items: list[dict] = []
+    page = 0
 
-    data = resp.json()
-    # 通常 Graph 會把結果放在 value 裡
-    return data.get("value", [])
+    while True:
+        page += 1
+        print(f"[LIST_APPTS_RANGE] GET page={page} url={url}", flush=True)
+
+        resp = requests.get(url, headers=headers)
+
+        # 你原本的 logger 我保留，另外補 print，讓你不看 logger 也知道狀態碼
+        print(
+            f"[LIST_APPTS_RANGE] RESP page={page} status={resp.status_code} body_head={resp.text[:200]!r}",
+            flush=True
+        )
+        app.logger.info(
+            f"[LIST_APPTS_RANGE] STATUS page={page}: {resp.status_code}, BODY_HEAD: {resp.text[:500]}"
+        )
+
+        # 失敗就直接噴（維持你原本行為）
+        resp.raise_for_status()
+
+        data = resp.json() or {}
+        items = data.get("value") or []
+        all_items.extend(items)
+
+        next_link = data.get("@odata.nextLink") or data.get("odata.nextLink")
+        if not next_link:
+            break
+
+        # Graph nextLink 已含完整 URL
+        url = next_link
+
+    print(f"[LIST_APPTS_RANGE] done total_items={len(all_items)}", flush=True)
+    return all_items
+
+# 不支援business ID版本
+# def list_appointments_for_range(start_local: datetime, end_local: datetime):
+#     """
+#     一次從 Bookings 抓「某個時間範圍內」所有 appointments。
+
+#     傳入的 start_local / end_local 是「台北時間（naive）」，
+#     我們會轉成 UTC 後呼叫 Graph API：
+#     GET /solutions/bookingBusinesses/{business_id}/appointments?
+#         startDateTime=...&endDateTime=...
+
+#     回傳：list[dict]（appointments 清單）
+#     """
+#     token = get_graph_token()
+#     business_id = os.environ.get("BOOKING_BUSINESS_ID")
+
+#     if not business_id:
+#         raise Exception("缺 BOOKING_BUSINESS_ID")
+
+#     # 先把台北時間（UTC+8）轉成 UTC 時間
+#     start_utc = start_local - timedelta(hours=8)
+#     end_utc = end_local - timedelta(hours=8)
+
+#     # 轉成 ISO 格式，補上 Z
+#     start_iso = start_utc.replace(microsecond=0).isoformat() + "Z"
+#     end_iso = end_utc.replace(microsecond=0).isoformat() + "Z"
+
+#     url = (
+#         f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
+#         f"?startDateTime={start_iso}&endDateTime={end_iso}"
+#     )
+
+#     headers = {
+#         "Authorization": f"Bearer {token}",
+#         "Content-Type": "application/json",
+#     }
+
+#     resp = requests.get(url, headers=headers)
+#     app.logger.info(
+#         f"LIST APPTS RANGE STATUS: {resp.status_code}, BODY: {resp.text[:500]}"
+#     )
+#     resp.raise_for_status()
+
+#     data = resp.json()
+#     # 通常 Graph 會把結果放在 value 裡
+#     return data.get("value", [])
 
 def get_appointment_by_id(appt_id: str):
     """
@@ -331,7 +547,7 @@ def _get_day_intervals(date_str: str):
 #     return SLOT_START, SLOT_END
 
 
-def get_available_slots_for_date(date_str: str) -> list:
+def get_available_slots_for_date(date_str: str, business_id: str) -> list:
     """
     回傳指定日期「可預約」的時段列表（20 分鐘一格）
     """
@@ -340,7 +556,7 @@ def get_available_slots_for_date(date_str: str) -> list:
         return []
 
     # 取得當天已存在的 Bookings 預約
-    appts = list_appointments_for_date(date_str)
+    appts = list_appointments_for_date(date_str, business_id=business_id)
 
     booked_times = set()
     for appt in appts:
@@ -430,6 +646,9 @@ def create_booking_appointment(
     zendesk_customer_id: str, # <--- 修正為 str
     line_display_name: str = None,
     line_user_id: str = None,
+    business_id: str = None,
+    service_id: str = None,            # 新增 - 針灸
+    staff_member_ids: list[str] = None # 新增（可傳可不傳）
 ):
     """
     建立一筆 Bookings 預約。
@@ -442,10 +661,10 @@ def create_booking_appointment(
     """
 
     token: str = get_graph_token()
-    business_id: str = os.environ.get("BOOKING_BUSINESS_ID") or BOOKING_BUSINESS_ID 
 
+    business_id = business_id or os.environ.get("BOOKING_BUSINESS_CLINIC_ID") or BOOKINGS_BUSINESS_CLINIC_ID
     if not business_id:
-        raise Exception("缺 BOOKING_BUSINESS_ID")
+        raise Exception("缺 business_id（BOOKING_BUSINESS_ID）")
 
     # --- 1. 準備 Bookings Payload (邏輯與您的原始碼一致) ---
     local_str: str = f"{date_str} {time_str}:00"
@@ -480,28 +699,52 @@ def create_booking_appointment(
     url: str = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
     duration: int = APPOINTMENT_DURATION_MINUTES 
 
+    # fallback：沒傳就用原本 demo 常數（不影響流程）
+    final_service_id = service_id or BOOKINGS_DEMO_SERVICE_ID
+
+    # ⚠️ staff：針灸才一定需要；內科若你不想指定，就讓它 None
+    # （你目前呼叫端：針灸會傳 staff_member_ids；內科傳 None）
+    final_staff_ids = staff_member_ids  # 不再 fallback 成 demo staff，避免內科/針灸 business 不相容
+
+
+    # payload: dict = {
+    #     "customerName": booking_customer_name,
+    #     "customerEmailAddress": None,
+    #     "customerPhone": customer_phone,
+    #     "serviceId": final_service_id,
+    #     "serviceName": display_title,
+    #     "startDateTime": { "dateTime": utc_iso, "timeZone": "UTC" },
+    #     "endDateTime": {
+    #         "dateTime": (utc_dt + timedelta(minutes=duration)).isoformat() + "Z",
+    #         "timeZone": "UTC",
+    #     },
+    #     "priceType": "free",
+    #     "price": 0.0,
+    #     "smsNotificationsEnabled": False,
+    #     "staffMemberIds": final_staff_ids,
+    #     "maximumAttendeesCount": 1,
+    #     "filledAttendeesCount": 1,
+    # }
     payload: dict = {
         "customerName": booking_customer_name,
-        "customerEmailAddress": None,
         "customerPhone": customer_phone,
-        "serviceId": BOOKING_DEMO_SERVICE_ID,
-        "serviceName": display_title,
+        "serviceId": final_service_id,
         "startDateTime": { "dateTime": utc_iso, "timeZone": "UTC" },
         "endDateTime": {
-            "dateTime": (utc_dt + timedelta(minutes=duration)).isoformat() + "Z",
+            "dateTime": (utc_dt + timedelta(minutes=duration)).replace(microsecond=0).isoformat() + "Z",
             "timeZone": "UTC",
         },
-        "priceType": "free",
-        "price": 0.0,
         "smsNotificationsEnabled": False,
-        "staffMemberIds": [BOOKING_DEMO_STAFF_ID],
-        "maximumAttendeesCount": 1,
-        "filledAttendeesCount": 1,
     }
+
+    # 針灸：有 staff 才塞（內科不塞，讓 Bookings 自己決定）
+    if final_staff_ids:
+        payload["staffMemberIds"] = final_staff_ids
 
     # 有內容時才塞 serviceNotes
     if service_notes:
         payload["serviceNotes"] = service_notes
+
 
     headers: dict = {
         "Authorization": f"Bearer {token}",
@@ -511,6 +754,46 @@ def create_booking_appointment(
     # --- 2. 建立 Bookings 預約 ---
     resp = requests.post(url, headers=headers, json=payload)
     app.logger.info(f"CREATE APPT STATUS: {resp.status_code}, BODY: {resp.text}")
+
+    # ===== DEBUG（保留 print，不刪）=====
+    print(
+        "[CREATE_APPT] ready "
+        f"business_id={business_id} "
+        f"service_id={final_service_id} "
+        f"staff_ids={final_staff_ids} "
+        f"local={date_str} {time_str} "
+        f"utc_start={utc_iso} "
+        f"duration_min={duration} "
+        f"customer_phone={customer_phone} "
+        f"zd_user={zendesk_customer_id} "
+        f"line_user={line_user_id}",
+        flush=True
+    )
+
+    # 也把 payload 重要欄位印出來（避免整包太長）
+    try:
+        _dbg_payload = {
+            "customerName": payload.get("customerName"),
+            "customerPhone": payload.get("customerPhone"),
+            "serviceId": payload.get("serviceId"),
+            "staffMemberIds": payload.get("staffMemberIds"),
+            "startDateTime": payload.get("startDateTime"),
+            "endDateTime": payload.get("endDateTime"),
+            "smsNotificationsEnabled": payload.get("smsNotificationsEnabled"),
+            "serviceNotes": payload.get("serviceNotes"),
+        }
+        print(f"[CREATE_APPT] payload_core={json.dumps(_dbg_payload, ensure_ascii=False)}", flush=True)
+    except Exception as e:
+        print(f"[CREATE_APPT] payload_core dump failed err={repr(e)}", flush=True)
+
+
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        # ✅ 把 Graph 的錯誤 JSON 印出來，通常會有 message + innerError
+        app.logger.error(f"[CREATE_APPT][HTTPError] status={resp.status_code} body={resp.text}")
+        app.logger.error(f"[CREATE_APPT][payload] {json.dumps(payload, ensure_ascii=False)}")
+        raise
 
     resp.raise_for_status()
     created_booking: dict = resp.json()
@@ -554,5 +837,307 @@ def extract_zd_user_id_from_service_notes(service_notes: str | None) -> int | No
         return int(m.group(1))
     except ValueError:
         return None
+
+####### 針灸 ###########
+
+def _extract_staff_ids(appt: dict) -> set[str]:
+    """
+    Graph 的 appointment 可能回 staffMemberIds: ["id1","id2"] 或 staffMemberIds: [{"id":...}]（看版本/欄位）
+    我們做一個保險的解析。
+    """
+    raw = appt.get("staffMemberIds")
+    if not raw:
+        return set()
+
+    out = set()
+    if isinstance(raw, list):
+        for x in raw:
+            if isinstance(x, str):
+                out.add(x.strip())
+            elif isinstance(x, dict) and x.get("id"):
+                out.add(str(x["id"]).strip())
+    return out
+
+
+def get_available_acu_slots_for_date(date_str: str) -> list[str]:
+    """
+    針灸：回傳該日期可預約的時段（依固定表 + 依床位 staff 是否已被佔用）
+    - 只查一次 BOOKING_BUSINESS_ACU_ID
+    - 用 staffMemberIds 判斷是床1或床2
+    """
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    wd = d.weekday()
+
+    day_map = ACU_SLOTS.get(wd) or {}
+    if not day_map:
+        app.logger.info(f"[acu_slots] date={date_str} wd={wd} -> no day_map (closed?)")
+        return []
+
+    acu_business_id = BOOKINGS_BUSINESS_ACU_ID
+    app.logger.info(
+        f"[acu_slots] date={date_str} wd={wd} acu_business={acu_business_id} bed1_staff={ACU_STAFF_BED1_ID} bed2_staff={ACU_STAFF_BED2_ID}"
+    )
+
+    appts = list_appointments_for_date(date_str, business_id=acu_business_id)
+
+    booked_by_bed = {"bed1": set(), "bed2": set()}
+
+    for appt in appts:
+        # （可選）只看針灸 service，避免同 business 裡有別的服務影響
+        sid = (appt.get("serviceId") or "").strip()
+        if BOOKINGS_SERVICE_ACU_BED_ID and sid and sid != BOOKINGS_SERVICE_ACU_BED_ID:
+            continue
+
+        staff_ids = _extract_staff_ids(appt)
+
+        s = (appt.get("startDateTime", {}) or {}).get("dateTime")
+        if not s:
+            continue
+
+        try:
+            if s.endswith("Z"):
+                s = s[:-1]
+            if "." in s:
+                s = s.split(".", 1)[0]
+            utc_dt = datetime.fromisoformat(s)
+            local_dt = utc_dt + timedelta(hours=8)
+            hhmm = local_dt.strftime("%H:%M")
+        except Exception:
+            continue
+
+        if ACU_STAFF_BED1_ID in staff_ids:
+            booked_by_bed["bed1"].add(hhmm)
+        if ACU_STAFF_BED2_ID in staff_ids:
+            booked_by_bed["bed2"].add(hhmm)
+
+    available = []
+    for hhmm, bed in day_map.items():
+        if hhmm not in booked_by_bed.get(bed, set()):
+            available.append(hhmm)
+
+    available.sort()
+
+    app.logger.info(f"[acu_slots] date={date_str} day_map_keys={list(day_map.keys())}")
+    app.logger.info(f"[acu_slots] booked bed1={sorted(booked_by_bed['bed1'])}")
+    app.logger.info(f"[acu_slots] booked bed2={sorted(booked_by_bed['bed2'])}")
+    app.logger.info(f"[acu_slots] available={available}")
+
+    return available
+
+
+# def get_available_acu_slots_for_date(date_str: str) -> list[str]:
+#     """
+#     針灸：回傳該日期可預約的時段（依固定表 + 依床位 business 是否已被佔用）
+#     - bed1 -> BOOKINGS_BUSINESS_ACU_BED1_ID (Bookings2@...)
+#     - bed2 -> BOOKINGS_BUSINESS_ACU_BED2_ID (Bookings3@...)
+#     """
+#     d = datetime.strptime(date_str, "%Y-%m-%d").date()
+#     wd = d.weekday()
+
+#     day_map = ACU_SLOTS.get(wd) or {}   # {"08:50":"bed1", ...}
+#     if not day_map:
+#         app.logger.info(f"[acu_slots] date={date_str} wd={wd} -> no day_map (closed?)")
+#         return []
+
+#     # 兩床各自查一次（各自是獨立 business）
+#     app.logger.info(
+#         f"[acu_slots] date={date_str} wd={wd} "
+#         f"bed1_business={BOOKINGS_BUSINESS_ACU_BED1_ID} bed2_business={BOOKINGS_BUSINESS_ACU_BED2_ID}"
+#     )
+
+#     appts_bed1 = list_appointments_for_date(date_str, business_id=BOOKINGS_BUSINESS_ACU_BED1_ID)
+#     appts_bed2 = list_appointments_for_date(date_str, business_id=BOOKINGS_BUSINESS_ACU_BED2_ID)
+
+#     booked_by_bed = {"bed1": set(), "bed2": set()}
+
+#     def _add_booked(appts: list, bed_key: str):
+#         for appt in appts:
+#             s = (appt.get("startDateTime", {}) or {}).get("dateTime")
+#             if not s:
+#                 continue
+#             try:
+#                 ss = s[:-1] if s.endswith("Z") else s
+#                 if "." in ss:
+#                     ss = ss.split(".", 1)[0]
+#                 utc_dt = datetime.fromisoformat(ss)
+#                 local_dt = utc_dt + timedelta(hours=8)
+#                 hhmm = local_dt.strftime("%H:%M")
+#                 booked_by_bed[bed_key].add(hhmm)
+#             except Exception as e:
+#                 app.logger.warning(f"[acu_slots] parse_time_failed bed={bed_key} s={s} err={repr(e)}")
+#                 continue
+
+#     _add_booked(appts_bed1, "bed1")
+#     _add_booked(appts_bed2, "bed2")
+
+#     # === DEBUG LOG（你想看的我全部放這裡）===
+#     app.logger.info(f"[acu_slots] date={date_str} day_map_keys={sorted(list(day_map.keys()))}")
+#     app.logger.info(f"[acu_slots] booked bed1={sorted(list(booked_by_bed['bed1']))}")
+#     app.logger.info(f"[acu_slots] booked bed2={sorted(list(booked_by_bed['bed2']))}")
+
+#     available = []
+#     for hhmm, bed in day_map.items():
+#         # bed 只會是 "bed1"/"bed2"
+#         if hhmm not in booked_by_bed.get(bed, set()):
+#             available.append(hhmm)
+
+#     available.sort()
+#     app.logger.info(f"[acu_slots] available={available}")
+
+#     return available
+
+# def get_available_acu_slots_for_date(date_str: str) -> list[str]:
+#     """
+#     針灸：回傳該日期可預約的時段（依固定表 + 依床位 serviceId 是否已被佔用）
+#     """
+#     d = datetime.strptime(date_str, "%Y-%m-%d").date()
+#     wd = d.weekday()
+
+#     day_map = ACU_SLOTS.get(wd) or {}   # {"08:50":"bed1", ...}
+#     if not day_map:
+#         return []
+
+#     appts = list_appointments_for_date(date_str, business_id=business_id)
+
+#     booked_by_bed = {"bed1": set(), "bed2": set()}
+
+#     for appt in appts:
+#         sid = (appt.get("serviceId") or "").strip()
+#         if sid not in ACU_SERVICE_IDS:
+#             continue
+
+#         s = (appt.get("startDateTime", {}) or {}).get("dateTime")
+#         if not s:
+#             continue
+
+#         try:
+#             if s.endswith("Z"):
+#                 s = s[:-1]
+#             if "." in s:
+#                 s = s.split(".", 1)[0]
+#             utc_dt = datetime.fromisoformat(s)
+#             local_dt = utc_dt + timedelta(hours=8)
+#             hhmm = local_dt.strftime("%H:%M")
+#         except Exception:
+#             continue
+
+#         if sid == BOOKINGS_SERVICE_ACU_BED1_ID:
+#             booked_by_bed["bed1"].add(hhmm)
+#         elif sid == BOOKINGS_SERVICE_ACU_BED2_ID:
+#             booked_by_bed["bed2"].add(hhmm)
+
+#     available = []
+#     for hhmm, bed in day_map.items():
+#         if hhmm not in booked_by_bed.get(bed, set()):
+#             available.append(hhmm)
+
+#     available.sort()
+#     return available
+
+
+def is_acu_slot_available(date_str: str, time_str: str) -> bool:
+    """
+    針灸：檢查該日期+時間是否仍可預約（固定表內 + 對應床位 staff 尚未被佔用）
+    """
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    wd = d.weekday()
+
+    day_map = ACU_SLOTS.get(wd) or {}
+    bed = day_map.get(time_str)
+    if not bed:
+        return False
+
+    target_staff_id = None
+    if bed == "bed1":
+        target_staff_id = ACU_STAFF_BED1_ID
+    elif bed == "bed2":
+        target_staff_id = ACU_STAFF_BED2_ID
+    else:
+        return False
+
+    appts = list_appointments_for_date(date_str, business_id=BOOKINGS_BUSINESS_ACU_ID)
+
+    for appt in appts:
+        sid = (appt.get("serviceId") or "").strip()
+        if BOOKINGS_SERVICE_ACU_BED_ID and sid and sid != BOOKINGS_SERVICE_ACU_BED_ID:
+            continue
+
+        staff_ids = _extract_staff_ids(appt)
+        if target_staff_id not in staff_ids:
+            continue
+
+        s = (appt.get("startDateTime", {}) or {}).get("dateTime")
+        if not s:
+            continue
+
+        try:
+            if s.endswith("Z"):
+                s = s[:-1]
+            if "." in s:
+                s = s.split(".", 1)[0]
+            utc_dt = datetime.fromisoformat(s)
+            local_dt = utc_dt + timedelta(hours=8)
+            hhmm = local_dt.strftime("%H:%M")
+        except Exception:
+            continue
+
+        if hhmm == time_str:
+            return False
+
+    return True
+
+
+
+# def is_acu_slot_available(date_str: str, time_str: str) -> bool:
+#     """
+#     針灸：檢查該日期+時間是否仍可預約（固定表內 + 對應床位尚未被佔用）
+#     """
+#     d = datetime.strptime(date_str, "%Y-%m-%d").date()
+#     wd = d.weekday()
+
+#     day_map = ACU_SLOTS.get(wd) or {}
+#     bed = day_map.get(time_str)
+#     if not bed:
+#         return False  # 不是針灸可預約時間
+
+#     # 依床位選 serviceId + businessId
+#     if bed == "bed1":
+#         target_service_id = BOOKINGS_SERVICE_ACU_BED1_ID
+#         business_id = BOOKINGS_BUSINESS_ACU_BED1_ID
+#     elif bed == "bed2":
+#         target_service_id = BOOKINGS_SERVICE_ACU_BED2_ID
+#         business_id = BOOKINGS_BUSINESS_ACU_BED2_ID
+#     else:
+#         return False
+
+#     appts = list_appointments_for_date(date_str, business_id=business_id)
+
+#     # 只檢查「該床位 service」在該時間有沒有被佔用
+#     for appt in appts:
+#         sid = (appt.get("serviceId") or "").strip()
+#         if sid != target_service_id:
+#             continue
+
+#         s = (appt.get("startDateTime", {}) or {}).get("dateTime")
+#         if not s:
+#             continue
+
+#         try:
+#             if s.endswith("Z"):
+#                 s = s[:-1]
+#             if "." in s:
+#                 s = s.split(".", 1)[0]
+#             utc_dt = datetime.fromisoformat(s)
+#             local_dt = utc_dt + timedelta(hours=8)
+#             hhmm = local_dt.strftime("%H:%M")
+#         except Exception:
+#             continue
+
+#         if hhmm == time_str:
+#             return False
+
+#     return True
+
+
 
 

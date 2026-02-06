@@ -20,7 +20,7 @@ from flask import current_app
 # except Exception:
 #     requests = None
 
-from linebot.v3.messaging import ReplyMessageRequest, PushMessageRequest
+from linebot.v3.messaging import ReplyMessageRequest, PushMessageRequest, TextMessage
 from queue_core import redis_conn
 
 PUSH_GUARD_PREFIX = "linebot:pushguard:"
@@ -423,18 +423,22 @@ def send_line(
 
         print(f"[SEND_LINE_REPLY_OK] label={label} elapsed={time.time()-t0:.2f}s", flush=True)
         return resp
-
     except Exception as e:
-        print(f"[SEND_LINE_REPLY_FAIL] label={label} elapsed={time.time()-t0:.2f}s err={repr(e)}", flush=True)
+        # ✅ 印出更多資訊：ApiException 要看到 status/body 才知道 LINE 嫌什麼
+        status = getattr(e, "status", None)
+        body = getattr(e, "body", None)
+        reason = getattr(e, "reason", None)
 
-        print(f"[SEND_LINE_IS_TIMEOUT] label={label} is_timeout={is_timeout_exc(e)}", flush=True)
+        print(
+            f"[SEND_LINE_REPLY_FAIL] label={label} elapsed={time.time()-t0:.2f}s "
+            f"err={repr(e)} status={status} reason={reason} body={body}",
+            flush=True
+        )
 
-        if not is_timeout_exc(e):
-            return None
+        # ✅ 不管是不是 timeout，都要嘗試 fallback（但仍然尊重 stale/latest 與 guard）
         if not to_id:
             return None
 
-        # guard
         try:
             force_guard_bypass = os.getenv("FORCE_GUARD_BYPASS", "0") in ("1", "true", "True", "yes", "Y")
 
@@ -450,15 +454,79 @@ def send_line(
             else:
                 print(f"[SEND_LINE_GUARD_BYPASS] label={label} to_id={to_id} event_key={event_key}", flush=True)
 
-            preq = PushMessageRequest(to=to_id, messages=messages)
-            t1 = time.time()
-            r = line_bot_api.push_message(preq, _request_timeout=push_timeout)
-            print(f"[SEND_LINE_PUSH_OK] label={label} elapsed={time.time()-t1:.2f}s to_id={to_id}", flush=True)
-            return r
+            # ✅ 重要：如果原本 messages 本身就「不合法」(400)，push 同一包也會失敗
+            # 所以這裡做一個保險：先試原 messages，失敗再改推純文字兜底
+            try:
+                preq = PushMessageRequest(to=to_id, messages=messages)
+                t1 = time.time()
+                r = line_bot_api.push_message(preq, _request_timeout=push_timeout)
+                print(f"[SEND_LINE_PUSH_OK] label={label} elapsed={time.time()-t1:.2f}s to_id={to_id}", flush=True)
+                return r
+            except Exception as e_push:
+                status2 = getattr(e_push, "status", None)
+                body2 = getattr(e_push, "body", None)
+                reason2 = getattr(e_push, "reason", None)
+                print(
+                    f"[SEND_LINE_PUSH_FAIL] label={label} err={repr(e_push)} status={status2} reason={reason2} body={body2} "
+                    f"to_id={to_id} event_key={event_key}",
+                    flush=True
+                )
+
+                # ✅ 再兜底：推純文字（至少讓病患看到「系統忙碌」）
+                fallback = [TextMessage(text="系統忙碌中，請稍後再試一次🙏")]
+                preq2 = PushMessageRequest(to=to_id, messages=fallback)
+                t2 = time.time()
+                r2 = line_bot_api.push_message(preq2, _request_timeout=push_timeout)
+                print(f"[SEND_LINE_PUSH_OK_FALLBACK_TEXT] label={label} elapsed={time.time()-t2:.2f}s to_id={to_id}", flush=True)
+                return r2
 
         except Exception as e2:
-            print(f"[SEND_LINE_PUSH_FAIL] label={label} err={repr(e2)} to_id={to_id} event_key={event_key}", flush=True)
+            status3 = getattr(e2, "status", None)
+            body3 = getattr(e2, "body", None)
+            reason3 = getattr(e2, "reason", None)
+            print(
+                f"[SEND_LINE_FALLBACK_FATAL] label={label} err={repr(e2)} status={status3} reason={reason3} body={body3} "
+                f"to_id={to_id} event_key={event_key}",
+                flush=True
+            )
             return None
+
+
+    # except Exception as e:
+    #     print(f"[SEND_LINE_REPLY_FAIL] label={label} elapsed={time.time()-t0:.2f}s err={repr(e)}", flush=True)
+
+    #     print(f"[SEND_LINE_IS_TIMEOUT] label={label} is_timeout={is_timeout_exc(e)}", flush=True)
+
+    #     if not is_timeout_exc(e):
+    #         return None
+    #     if not to_id:
+    #         return None
+
+    #     # guard
+    #     try:
+    #         force_guard_bypass = os.getenv("FORCE_GUARD_BYPASS", "0") in ("1", "true", "True", "yes", "Y")
+
+    #         # ✅ 最新事件守門：不是最新就不要 push（避免舊事件晚到）
+    #         if not _is_latest(to_id, label, event_key):
+    #             print(f"[SEND_LINE_STALE_SKIP] label={label} to_id={to_id} event_key={event_key}", flush=True)
+    #             return None
+
+    #         if not force_guard_bypass:
+    #             if not _acquire_push_guard(to_id, label, event_key, push_guard_ttl_sec):
+    #                 print(f"[SEND_LINE_GUARD_HIT] label={label} to_id={to_id} event_key={event_key}", flush=True)
+    #                 return None
+    #         else:
+    #             print(f"[SEND_LINE_GUARD_BYPASS] label={label} to_id={to_id} event_key={event_key}", flush=True)
+
+    #         preq = PushMessageRequest(to=to_id, messages=messages)
+    #         t1 = time.time()
+    #         r = line_bot_api.push_message(preq, _request_timeout=push_timeout)
+    #         print(f"[SEND_LINE_PUSH_OK] label={label} elapsed={time.time()-t1:.2f}s to_id={to_id}", flush=True)
+    #         return r
+
+    #     except Exception as e2:
+    #         print(f"[SEND_LINE_PUSH_FAIL] label={label} err={repr(e2)} to_id={to_id} event_key={event_key}", flush=True)
+    #         return None
 
 
     

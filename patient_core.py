@@ -10,6 +10,8 @@ parse_booking_datetime_to_local
 
 from config import (
     PROFILE_STATUS_COMPLETE,
+    BOOKINGS_BUSINESS_CLINIC_ID,
+    BOOKINGS_BUSINESS_ACU_ID,
     is_valid_name
     )
 
@@ -33,14 +35,6 @@ def normalize_phone(phone: str) -> str:
     return digits
 
 def get_future_appointments_for_line_user(line_user_id: str, max_days: int = 30) -> list[tuple[datetime, dict]]:
-    """
-    取得指定 LINE 使用者從「現在起 ~ 未來 max_days 天內」的所有預約（已排序）。
-
-    回傳：
-        [(local_start_dt, appt_dict), ...]
-    若找不到 / 發生錯誤，回傳 []。
-    """
-
     matched: list[tuple[datetime, dict]] = []
 
     # ① 先從 Zendesk 找 user，拿 phone 當備援 key
@@ -54,49 +48,48 @@ def get_future_appointments_for_line_user(line_user_id: str, max_days: int = 30)
         app.logger.info(f"[get_future_for_line] line_user_id={line_user_id} 在 Zendesk 中查無使用者")
         return []
 
-    raw_phone = zd_user.get("phone") or ""
-    target_phone = normalize_phone(raw_phone)
+    target_phone = normalize_phone(zd_user.get("phone") or "") or ""
     if not target_phone:
         app.logger.info(f"[get_future_for_line] Zendesk user 沒有 phone，之後僅用 [LINE_USER] 比對")
-        target_phone = ""
 
-    # ② 準備查詢範圍：現在 ~ 未來 max_days 天（台北時間，naive）
+    # ② 查詢範圍：現在 ~ 未來 max_days 天
     now_local = datetime.now()
     end_local = now_local + timedelta(days=max_days)
+    app.logger.info(f"[get_future_for_line] 查詢範圍：{now_local} ~ {end_local}, line_user_id={line_user_id}")
 
-    app.logger.info(
-        f"[get_future_for_line] 查詢範圍：{now_local} ~ {end_local}, line_user_id={line_user_id}"
-    )
+    # ✅ ③ 一次查多個 business（門診 + 針灸）
+    business_ids = []
+    if BOOKINGS_BUSINESS_CLINIC_ID:
+        business_ids.append(("clinic", BOOKINGS_BUSINESS_CLINIC_ID))
+    if BOOKINGS_BUSINESS_ACU_ID:
+        business_ids.append(("acupuncture", BOOKINGS_BUSINESS_ACU_ID))
 
-    try:
-        appts = list_appointments_for_range(now_local, end_local)
-    except Exception as e:
-        app.logger.error(f"[get_future_for_line] list_appointments_for_range 失敗: {e}")
-        return []
+    all_appts: list[dict] = []
+    for btype, bid in business_ids:
+        try:
+            appts = list_appointments_for_range(now_local, end_local, business_id=bid)
+            # 把來源標記進去，避免 UI/後續判斷混在一起
+            for a in appts:
+                a["_booking_type"] = btype
+                a["_business_id"] = bid
+            all_appts.extend(appts)
+        except Exception as e:
+            app.logger.error(f"[get_future_for_line] list_appointments_for_range failed type={btype} bid={bid} err={e}")
+            # 不要整個壞掉，繼續查下一個 business
+            continue
 
-    app.logger.info(
-        f"[get_future_for_line] 範圍內共取得 {len(appts)} 筆 appointments"
-    )
+    app.logger.info(f"[get_future_for_line] 範圍內共取得 {len(all_appts)} 筆 appointments（合併後）")
 
-    for appt in appts:
+    for appt in all_appts:
         appt_phone = normalize_phone(appt.get("customerPhone") or "")
         service_notes = appt.get("serviceNotes") or ""
 
-        # ③ 比對條件：
-        #    - phone 完全一致，或
-        #    - serviceNotes 有 [LINE_USER] 且包含 line_user_id
         matched_by_phone = (target_phone and appt_phone and appt_phone == target_phone)
-        matched_by_line_id = (
-            line_user_id
-            and "[LINE_USER]" in service_notes
-            and line_user_id in service_notes
-        )
+        matched_by_line_id = (line_user_id and "[LINE_USER]" in service_notes and line_user_id in service_notes)
 
         if not (matched_by_phone or matched_by_line_id):
             continue
 
-    
-        # ④ 解析 startDateTime → 使用共用 helper 轉成台北時間
         start_info = appt.get("startDateTime") or {}
         start_str = start_info.get("dateTime")
         if not start_str:
@@ -104,26 +97,125 @@ def get_future_appointments_for_line_user(line_user_id: str, max_days: int = 30)
 
         local_start = parse_booking_datetime_to_local(start_str)
         if not local_start:
-            app.logger.warning(
-                f"[get_future_for_line] 無法解析 startDateTime: {start_str}"
-            )
+            app.logger.warning(f"[get_future_for_line] 無法解析 startDateTime: {start_str}")
             continue
 
-
-        # 只考慮「現在之後」的約診（同一天但時間已過就跳過）
         if local_start < now_local:
             continue
 
         matched.append((local_start, appt))
 
-    if not matched:
-        app.logger.info("[get_future_for_line] 找不到符合條件的預約")
-        return []
-
-    # ⑤ 依照時間排序（由近到遠）
     matched.sort(key=lambda x: x[0])
     app.logger.info(f"[get_future_for_line] 共 {len(matched)} 筆屬於該 LINE 使用者的 future 預約")
     return matched
+
+
+# def get_future_appointments_for_line_user(line_user_id: str, max_days: int = 30) -> list[tuple[datetime, dict]]:
+#     """
+#     取得指定 LINE 使用者從「現在起 ~ 未來 max_days 天內」的所有預約（已排序）。
+
+#     回傳：
+#         [(local_start_dt, appt_dict), ...]
+#     若找不到 / 發生錯誤，回傳 []。
+#     """
+
+#     matched: list[tuple[datetime, dict]] = []
+
+#     # ① 先從 Zendesk 找 user，拿 phone 當備援 key
+#     try:
+#         count, zd_user = search_zendesk_user_by_line_id(line_user_id)
+#     except Exception as e:
+#         app.logger.error(f"[get_future_for_line] 用 line_user_id 查 Zendesk user 失敗: {e}")
+#         return []
+
+#     if not zd_user:
+#         app.logger.info(f"[get_future_for_line] line_user_id={line_user_id} 在 Zendesk 中查無使用者")
+#         return []
+
+#     raw_phone = zd_user.get("phone") or ""
+#     target_phone = normalize_phone(raw_phone)
+#     if not target_phone:
+#         app.logger.info(f"[get_future_for_line] Zendesk user 沒有 phone，之後僅用 [LINE_USER] 比對")
+#         target_phone = ""
+
+#     # ② 準備查詢範圍：現在 ~ 未來 max_days 天（台北時間，naive）
+#     now_local = datetime.now()
+#     end_local = now_local + timedelta(days=max_days)
+
+#     app.logger.info(
+#         f"[get_future_for_line] 查詢範圍：{now_local} ~ {end_local}, line_user_id={line_user_id}"
+#     )
+
+#     # ✅ FIX：多 business 查詢（門診 + 針灸），合併 appointments
+#     biz_ids = []
+#     if BOOKINGS_BUSINESS_CLINIC_ID:
+#         biz_ids.append(BOOKINGS_BUSINESS_CLINIC_ID)
+#     if BOOKINGS_BUSINESS_ACU_ID:
+#         biz_ids.append(BOOKINGS_BUSINESS_ACU_ID)
+
+#     if not biz_ids:
+#         app.logger.error("[get_future_for_line] 缺 Bookings business id（BOOKINGS_BUSINESS_CLINIC_ID / BOOKINGS_BUSINESS_ACU_ID）")
+#         return []
+
+#     appts: list[dict] = []
+#     seen_ids: set[str] = set()
+
+#     try:
+#         for biz in biz_ids:
+#             sub = list_appointments_for_range(now_local, end_local, business_id=biz)  # ✅ 你缺的就是這個
+#             app.logger.info(f"[get_future_for_line] business_id={biz} 取得 {len(sub)} 筆 appointments")
+#             for a in sub:
+#                 aid = (a.get("id") or "").strip()
+#                 if aid and aid in seen_ids:
+#                     continue
+#                 if aid:
+#                     seen_ids.add(aid)
+#                 appts.append(a)
+#     except Exception as e:
+#         app.logger.error(f"[get_future_for_line] list_appointments_for_range 失敗: {e}")
+#         return []
+
+#     app.logger.info(f"[get_future_for_line] 範圍內合併後共取得 {len(appts)} 筆 appointments")
+
+#     for appt in appts:
+#         appt_phone = normalize_phone(appt.get("customerPhone") or "")
+#         service_notes = appt.get("serviceNotes") or ""
+
+#         # ③ 比對條件：
+#         matched_by_phone = (target_phone and appt_phone and appt_phone == target_phone)
+#         matched_by_line_id = (
+#             line_user_id
+#             and "[LINE_USER]" in service_notes
+#             and line_user_id in service_notes
+#         )
+
+#         if not (matched_by_phone or matched_by_line_id):
+#             continue
+
+#         # ④ 解析 startDateTime → 使用共用 helper 轉成台北時間
+#         start_info = appt.get("startDateTime") or {}
+#         start_str = start_info.get("dateTime")
+#         if not start_str:
+#             continue
+
+#         local_start = parse_booking_datetime_to_local(start_str)
+#         if not local_start:
+#             app.logger.warning(f"[get_future_for_line] 無法解析 startDateTime: {start_str}")
+#             continue
+
+#         if local_start < now_local:
+#             continue
+
+#         matched.append((local_start, appt))
+
+#     if not matched:
+#         app.logger.info("[get_future_for_line] 找不到符合條件的預約")
+#         return []
+
+#     matched.sort(key=lambda x: x[0])
+#     app.logger.info(f"[get_future_for_line] 共 {len(matched)} 筆屬於該 LINE 使用者的 future 預約")
+#     return matched
+
 
 def get_next_upcoming_appointment_for_line_user(line_user_id: str, max_days: int = 30):
     """

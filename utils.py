@@ -124,6 +124,32 @@ def enter_input_step(*, line_bot_api, event, line_user_id: str, step: str, promp
     label=f"enter_input_step_{step}",
     )
 
+def reply_acu_terms_buttons(line_bot_api, event):
+    buttons_template = ButtonsTemplate(
+        title="針灸同意事項",
+        text="為確保療程安排與注意事項已確認，請先閱讀並同意後再進行針灸預約。",
+        actions=[
+            PostbackAction(
+                label="同意並繼續",
+                data="CONSENT_ACU_TERMS",
+                display_text="同意並繼續",
+            ),
+            PostbackAction(
+                label="取消",
+                data="CANCEL_FLOW",
+                display_text="取消",
+            ),
+        ],
+    )
+
+    send_line(
+        line_bot_api,
+        event,
+        messages=[TemplateMessage(alt_text="針灸同意事項", template=buttons_template)],
+        label="acu_terms_buttons",
+    )
+
+
 # def clear_pending_state(line_user_id: str) -> bool:
 #     """
 #     清除使用者的暫存流程狀態（目前只處理 PENDING_REGISTRATIONS）。

@@ -35,6 +35,9 @@ from config import (
     ZENDESK_REMINDER_STATE_CANCELLED,
     ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE,
     APPOINTMENT_DURATION_MINUTES,
+    ZENDESK_UF_ACU_OK_1_INTERNAL_MED_PATIENT_KEY,
+    ZENDESK_UF_ACU_OK_2_SEEN_WITHIN_3_MONTHS_KEY,
+    ZENDESK_UF_ACU_OK_3_DOCTOR_APPROVED_KEY
 )
 
 from bookings_core import (
@@ -82,6 +85,52 @@ def search_zendesk_users_by_phone(phone_digits: str):
     users = data.get("users") or []
     app.logger.info(f"[ZD_SEARCH_PHONE][HIT] count={len(users)} phone={phone_digits}")
     return users
+
+def check_acupuncture_eligibility_from_zendesk(line_user_id: str):
+    """
+    回傳：(ok: bool, missing_titles: list[str], user: dict|None)
+    - ok=True：三個 checkbox 都 True
+    - missing_titles：缺少的資格文案（給你直接組訊息）
+    """
+    try:
+        count, user = search_zendesk_user_by_line_id(line_user_id, retries=1)
+    except Exception as e:
+        app.logger.error(f"[ACU_ELIG] search by line_id failed: {e}")
+        return False, ["後端查詢病患資料失敗"], None
+
+    if not user:
+        return False, ["找不到病患資料"], None
+
+    ufs = user.get("user_fields") or {}
+
+    v1 = ufs.get(ZENDESK_UF_ACU_OK_1_INTERNAL_MED_PATIENT_KEY)
+    v2 = ufs.get(ZENDESK_UF_ACU_OK_2_SEEN_WITHIN_3_MONTHS_KEY)
+    v3 = ufs.get(ZENDESK_UF_ACU_OK_3_DOCTOR_APPROVED_KEY)
+
+    print(
+        f"[ACU_ELIG][RAW] uid={line_user_id} "
+        f"u={user.get('id')} "
+        f"{ZENDESK_UF_ACU_OK_1_INTERNAL_MED_PATIENT_KEY}={v1}({type(v1).__name__}) "
+        f"{ZENDESK_UF_ACU_OK_2_SEEN_WITHIN_3_MONTHS_KEY}={v2}({type(v2).__name__}) "
+        f"{ZENDESK_UF_ACU_OK_3_DOCTOR_APPROVED_KEY}={v3}({type(v3).__name__})",
+        flush=True,
+    )
+
+    ok1 = (v1 is True)
+    ok2 = (v2 is True)
+    ok3 = (v3 is True)
+
+    missing = []
+    if not ok1:
+        missing.append("針灸資格1：內科患者")
+    if not ok2:
+        missing.append("針灸資格2：近三個月有看過診")
+    if not ok3:
+        missing.append("針灸資格3：醫師評估可預約針灸")
+
+    ok = (len(missing) == 0)
+    return ok, missing, user
+
 
 
 def create_zendesk_user(line_user_id: str, name: str, phone: str):
