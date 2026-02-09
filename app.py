@@ -488,7 +488,7 @@ def callback():
 
     app.logger.info("Request body: " + body)
 
-    # ✅ 改：把 handler.handle 丟到背景跑，callback 先回 200 避免 LINE request_timeout
+    # 把 handler.handle 丟到背景跑，callback 先回 200 避免 LINE request_timeout
     def _run_bg():
         try:
             _bg_handle_line_webhook(body=body, signature=signature, req_id=req_id)
@@ -502,7 +502,7 @@ def callback():
 
     threading.Thread(target=_run_bg, daemon=True).start()
 
-    # ✅ 先回應 LINE（秒回）
+    # 先回應 LINE（秒回）
     print(
         f"[CB_ACK][{req_id}] elapsed={time.time()-t0:.3f}s",
         file=sys.stderr,

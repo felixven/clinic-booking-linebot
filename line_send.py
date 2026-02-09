@@ -473,7 +473,7 @@ def send_line(
                 )
 
                 # ✅ 再兜底：推純文字（至少讓病患看到「系統忙碌」）
-                fallback = [TextMessage(text="系統忙碌中，請稍後再試一次🙏")]
+                fallback = [TextMessage(text="系統忙碌中，請稍後再試一次")]
                 preq2 = PushMessageRequest(to=to_id, messages=fallback)
                 t2 = time.time()
                 r2 = line_bot_api.push_message(preq2, _request_timeout=push_timeout)
