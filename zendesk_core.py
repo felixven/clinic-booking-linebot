@@ -37,7 +37,10 @@ from config import (
     APPOINTMENT_DURATION_MINUTES,
     ZENDESK_UF_ACU_OK_1_INTERNAL_MED_PATIENT_KEY,
     ZENDESK_UF_ACU_OK_2_SEEN_WITHIN_3_MONTHS_KEY,
-    ZENDESK_UF_ACU_OK_3_DOCTOR_APPROVED_KEY
+    ZENDESK_UF_ACU_OK_3_DOCTOR_APPROVED_KEY,
+    ZENDESK_CF_APPT_CATEGORY,
+    ZENDESK_CF_VISIT_COMPLETED,
+    ZENDESK_VISIT_COMPLETED_NO
 )
 
 from bookings_core import (
@@ -713,6 +716,7 @@ def create_zendesk_appointment_ticket(
     zendesk_customer_id: int,
     customer_name: str,
     booking_service_name: str = "一般門診",
+    appt_category: str = None,
 ):
     """
     在 Zendesk 內建立一個新的 Ticket，作為預約確認提醒的排程觸發點。
@@ -738,8 +742,12 @@ def create_zendesk_appointment_ticket(
     url: str = f"{base_url}/api/v2/tickets.json"
 
     # ====== 1. 組 subject / body ======
+
+    # 依服務項目決定 subject 類型：門診預約 / 針灸預約
+    subject_type = "門診預約" if booking_service_name in ("一般門診", "門診", "clinic") else "針灸預約"
+
     ticket_subject: str = (
-        f"【預約提醒】{customer_name}，將於 "
+        f"【{subject_type}】{customer_name}，將於 "
         f"{local_start_dt.strftime('%Y/%m/%d %H:%M')} 看診"
     )
 
@@ -751,7 +759,7 @@ def create_zendesk_appointment_ticket(
         f"客戶 ID (Zendesk): {zendesk_customer_id}\n"
         f"預約時間: {local_start_dt.strftime('%Y/%m/%d %H:%M')}  ～ "
         f"{local_end_dt.strftime('%H:%M')}\n"
-        f"服務項目: {booking_service_name}\n\n"
+        f"預約項目: {booking_service_name}\n\n"
         "--- 提醒流程 ---\n"
         "如果到期時，Bookings 備註內『尚未』顯示 'Confirmed via LINE'，"
         "則需要通知 LINE Bot 進行回呼確認。"
@@ -761,6 +769,7 @@ def create_zendesk_appointment_ticket(
     appt_date_str: str = local_start_dt.strftime("%Y-%m-%d")
     appt_time_str: str = local_start_dt.strftime("%H:%M")
 
+
     custom_fields = [
         {"id": ZENDESK_CF_BOOKING_ID, "value": booking_id},
         {"id": ZENDESK_CF_APPOINTMENT_DATE, "value": appt_date_str},
@@ -768,11 +777,12 @@ def create_zendesk_appointment_ticket(
         {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_PENDING},
         {"id": ZENDESK_CF_REMINDER_ATTEMPTS, "value": 0},
         {"id": ZENDESK_CF_LAST_CALL_ID, "value": ""},
+        {"id": ZENDESK_CF_APPT_CATEGORY, "value": appt_category},
     ]
 
     payload: dict = {
         "ticket": {
-            # ✅ 指定使用「預約專用 Form」
+            #  指定使用「預約專用 Form」
             "ticket_form_id": ZENDESK_APPOINTMENT_FORM_ID,
             "subject": ticket_subject,
             "comment": {"body": ticket_body},
@@ -857,12 +867,12 @@ def find_zendesk_ticket_by_booking_id(booking_id):
 
     return results[0]
 
-def mark_zendesk_ticket_confirmed(ticket_id: int):
+def mark_zendesk_ticket_confirmed(ticket_id: int, confirmed_local_dt=None):
     """
     使用者完成「確認回診」後，更新對應的 Zendesk ticket：
 
       - 將 reminder_state 改成 success
-      - 將 ticket 狀態改成 solved
+      - 將 ticket 狀態改成 solved(先取消)
 
     Args:
         ticket_id: Zendesk ticket id
@@ -871,12 +881,26 @@ def mark_zendesk_ticket_confirmed(ticket_id: int):
         app.logger.warning("[mark_zendesk_ticket_confirmed] 缺少 ticket_id")
         return
 
+    # confirm_date_text = None
+    # try:
+    #     if confirmed_local_dt:
+    #         confirm_date_text = confirmed_local_dt.strftime("%Y年%m月%d日")
+    # except Exception:
+    #     confirm_date_text = None
+
+    today_str = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y/%m/%d")
+    comment_body = f"已在{today_str}透過LINE確認回診"
+
     base_url, headers = _build_zendesk_headers()
     url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
 
     payload = {
         "ticket": {
-            "status": "solved",
+            #"status": "solved",
+            "comment": {
+                "body": comment_body,
+                "public": False,  # 預設 internal note（不通知客戶）
+            },
             "custom_fields": [
                 {
                     "id": ZENDESK_CF_REMINDER_STATE,
@@ -903,13 +927,10 @@ def mark_zendesk_ticket_confirmed(ticket_id: int):
 def mark_zendesk_ticket_cancelled(ticket_id: int):
     """
     使用者「取消約診」後，更新該 ticket 狀態：
-
-      - reminder_state 改成cancelled）
+      - reminder_state 改成 cancelled
       - ticket 狀態改成 solved
+      - ✅ solved 時必填：已完成看診（填「未完成/否」）
       - 新增 private note 記錄取消時間
-
-    Args:
-        ticket_id: Zendesk ticket id
     """
     if not ticket_id:
         app.logger.warning("[mark_zendesk_ticket_cancelled] 缺少 ticket_id")
@@ -921,15 +942,32 @@ def mark_zendesk_ticket_cancelled(ticket_id: int):
     cancelled_at = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
     note = f"[已取消約診] 患者已於{cancelled_at}在 LINE 上取消預約"
 
-    payload = {
-        "ticket": {
-            "status": "solved",
-            "custom_fields": [
-                {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_CANCELLED}
-            ],
-            "comment": {"public": False, "body": note},
-        }
+    cancelled_value = (ZENDESK_REMINDER_STATE_CANCELLED or "").strip()
+    visit_completed_no = (ZENDESK_VISIT_COMPLETED_NO or "").strip()
+
+    ticket_obj = {
+        "status": "solved",
+        "comment": {"public": False, "body": note},
+        "custom_fields": []
     }
+
+    # ✅ reminder_state
+    if cancelled_value:
+        ticket_obj["custom_fields"].append(
+            {"id": ZENDESK_CF_REMINDER_STATE, "value": cancelled_value}
+        )
+
+    # ✅ solved 必填欄位：已完成看診（取消時一定要填 NO）
+    if visit_completed_no:
+        ticket_obj["custom_fields"].append(
+            {"id": ZENDESK_CF_VISIT_COMPLETED, "value": visit_completed_no}
+        )
+
+    # 如果兩個都空，乾脆不要送 custom_fields（避免格式怪）
+    if not ticket_obj["custom_fields"]:
+        ticket_obj.pop("custom_fields", None)
+
+    payload = {"ticket": ticket_obj}
 
     app.logger.info(
         f"[mark_zendesk_ticket_cancelled] 更新 ticket_id={ticket_id}, payload="
@@ -938,10 +976,61 @@ def mark_zendesk_ticket_cancelled(ticket_id: int):
 
     try:
         resp = requests.put(url, headers=headers, json=payload, timeout=10)
+
+        if resp.status_code >= 400:
+            app.logger.error(
+                f"[mark_zendesk_ticket_cancelled] FAILED status={resp.status_code} "
+                f"ticket_id={ticket_id} resp_body={resp.text}"
+            )
+
         resp.raise_for_status()
         app.logger.info(f"[mark_zendesk_ticket_cancelled] 更新成功 ticket_id={ticket_id}")
+
     except Exception as e:
-        app.logger.error(f"[mark_zendesk_ticket_cancelled] 更新失敗: {e}")
+        app.logger.error(f"[mark_zendesk_ticket_cancelled] 更新失敗: {repr(e)}")
+
+# def mark_zendesk_ticket_cancelled(ticket_id: int):
+#     """
+#     使用者「取消約診」後，更新該 ticket 狀態：
+
+#       - reminder_state 改成cancelled）
+#       - ticket 狀態改成 solved
+#       - 新增 private note 記錄取消時間
+
+#     Args:
+#         ticket_id: Zendesk ticket id
+#     """
+#     if not ticket_id:
+#         app.logger.warning("[mark_zendesk_ticket_cancelled] 缺少 ticket_id")
+#         return
+
+#     base_url, headers = _build_zendesk_headers()
+#     url = f"{base_url}/api/v2/tickets/{ticket_id}.json"
+
+#     cancelled_at = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+#     note = f"[已取消約診] 患者已於{cancelled_at}在 LINE 上取消預約"
+
+#     payload = {
+#         "ticket": {
+#             "status": "solved",
+#             "custom_fields": [
+#                 {"id": ZENDESK_CF_REMINDER_STATE, "value": ZENDESK_REMINDER_STATE_CANCELLED}
+#             ],
+#             "comment": {"public": False, "body": note},
+#         }
+#     }
+
+#     app.logger.info(
+#         f"[mark_zendesk_ticket_cancelled] 更新 ticket_id={ticket_id}, payload="
+#         f"{json.dumps(payload, ensure_ascii=False)}"
+#     )
+
+#     try:
+#         resp = requests.put(url, headers=headers, json=payload, timeout=10)
+#         resp.raise_for_status()
+#         app.logger.info(f"[mark_zendesk_ticket_cancelled] 更新成功 ticket_id={ticket_id}")
+#     except Exception as e:
+#         app.logger.error(f"[mark_zendesk_ticket_cancelled] 更新失敗: {e}")
 
 # def mark_zendesk_ticket_queued(
 #     ticket_id: int,
@@ -1054,6 +1143,58 @@ def increment_reminder_attempts(ticket_id: int, *, reason: str = "") -> int | No
 
 
 
+def search_zendesk_tickets_for_reminder():
+    """
+    找出候選票（不要依賴 ticket_form_id / dropdown 搜尋值）：
+    - type:ticket
+    - 排除 solved/closed（避免撈到一堆舊票）
+    - （可選）有 booking_id 的票（把噪音壓低）
+    真正要不要提醒（reminder_state / appointment_date / days_before）在 run_reminder_check 內判斷
+    """
+    base_url, headers = _build_zendesk_headers()
+    search_url = f"{base_url}/api/v2/search.json"
+
+    booking_key = f"custom_field_{ZENDESK_CF_BOOKING_ID}"
+
+    # ✅ 只抓活票 +（可選）必須有 booking_id
+    query = (
+        f"type:ticket "
+        f"-status:solved -status:closed "
+        f"{booking_key}:*"
+    )
+
+    params = {"query": query, "per_page": 100}
+
+    try:
+        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+        app.logger.info(f"[search_zendesk_tickets_for_reminder] URL = {resp.url}")
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.error(f"[search_zendesk_tickets_for_reminder] 失敗: {e}")
+        return []
+
+    data = resp.json() or {}
+    results = data.get("results") or []
+    app.logger.info(
+        f"[search_zendesk_tickets_for_reminder] 找到 {len(results)} 筆候選 ticket（active + has booking_id）"
+    )
+
+    # DEBUG：列出前幾筆 id/status（search results 不一定包含 ticket_form_id，None 正常）
+    for t in results[:20]:
+        app.logger.info(
+            f"[search_zendesk_tickets_for_reminder][debug] "
+            f"id={t.get('id')} status={t.get('status')} form_id={t.get('ticket_form_id')}"
+        )
+
+    # DEBUG：印第一筆 custom_fields（如果 search 有帶回）
+    if results:
+        first = results[0]
+        app.logger.info(
+            "[search_zendesk_tickets_for_reminder] 第一筆 custom_fields = "
+            + json.dumps(first.get("custom_fields") or [], ensure_ascii=False)
+        )
+
+    return results
 
 
 # def mark_zendesk_ticket_queued(ticket_id: int, ticket: dict | None = None):
@@ -1112,48 +1253,81 @@ def increment_reminder_attempts(ticket_id: int, *, reason: str = "") -> int | No
 #         app.logger.error(f"[mark_zendesk_ticket_queued] 更新失敗: {e}")
 
     
-def search_zendesk_tickets_for_reminder():
-    """
-    找出：
-    - 使用預約表單 (ticket_form_id = ZENDESK_APPOINTMENT_FORM_ID)
-    - reminder_state = pending
-    - 狀態不是 solved 的 ticket
-    """
-    base_url, headers = _build_zendesk_headers()
-    search_url = f"{base_url}/api/v2/search.json"
+# def search_zendesk_tickets_for_reminder():
+#     """
+#     找出：
+#     - 使用預約表單 (ticket_form_id = ZENDESK_APPOINTMENT_FORM_ID)
+#     - reminder_state = pending
+#     - 狀態不是 solved 的 ticket
+#     """
+#     base_url, headers = _build_zendesk_headers()
+#     search_url = f"{base_url}/api/v2/search.json"
 
-    field_key = f"custom_field_{ZENDESK_CF_REMINDER_STATE}"
-    query = (
-        f"type:ticket "
-        f"ticket_form_id:{ZENDESK_APPOINTMENT_FORM_ID} "
-        f"-status:solved "
-        f"{field_key}:{ZENDESK_REMINDER_STATE_PENDING}"
-    )
+#     field_key = f"custom_field_{ZENDESK_CF_REMINDER_STATE}"
+#     query = (
+#         f"type:ticket "
+#         f"ticket_form_id:{ZENDESK_APPOINTMENT_FORM_ID} "
+#         f"-status:solved "
+#         f"{field_key}:{ZENDESK_REMINDER_STATE_PENDING}"
+#     )
 
-    params = {"query": query}
+#     params = {"query": query}
 
-    try:
-        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
-        app.logger.info(f"[search_zendesk_tickets_for_reminder] URL = {resp.url}")
-        resp.raise_for_status()
-    except Exception as e:
-        app.logger.error(f"[search_zendesk_tickets_for_reminder] 失敗: {e}")
-        return []
+#     try:
+#         resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+#         app.logger.info(f"[search_zendesk_tickets_for_reminder] URL = {resp.url}")
+#         resp.raise_for_status()
+#     except Exception as e:
+#         app.logger.error(f"[search_zendesk_tickets_for_reminder] 失敗: {e}")
+#         return []
 
-    data = resp.json() or {}
-    results = data.get("results") or []
-    app.logger.info(
-        f"[search_zendesk_tickets_for_reminder] 找到 {len(results)} 筆候選 ticket（reminder_state = pending）"
-    )
+#     data = resp.json() or {}
+#     results = data.get("results") or []
+#     app.logger.info(
+#         f"[search_zendesk_tickets_for_reminder] 找到 {len(results)} 筆候選 ticket（reminder_state = pending）"
+#     )
 
-    if results:
-        first = results[0]
-        app.logger.info(
-            "[search_zendesk_tickets_for_reminder] 第一筆 custom_fields = "
-            + json.dumps(first.get("custom_fields") or [], ensure_ascii=False)
-        )
+#     if results:
+#         first = results[0]
+#         app.logger.info(
+#             "[search_zendesk_tickets_for_reminder] 第一筆 custom_fields = "
+#             + json.dumps(first.get("custom_fields") or [], ensure_ascii=False)
+#         )
 
-    return results
+#     return results
+
+##0209測試搜尋ticket用的
+# def search_zendesk_tickets_for_reminder():
+#     base_url, headers = _build_zendesk_headers()
+#     search_url = f"{base_url}/api/v2/search.json"
+
+#     query = (
+#         f"type:ticket "
+#         f"ticket_form_id:{ZENDESK_APPOINTMENT_FORM_ID} "
+#         f"-status:solved"
+#     )
+
+#     params = {"query": query}
+#     resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+#     app.logger.info(f"[search_zendesk_tickets_for_reminder] URL = {resp.url}")
+#     resp.raise_for_status()
+
+#     data = resp.json() or {}
+#     results = data.get("results") or []
+#     app.logger.info(
+#         f"[search_zendesk_tickets_for_reminder] 找到 {len(results)} 筆候選 ticket（form + not solved）"
+#     )
+
+#     # DEBUG：印出候選 tickets 的 id / form / status（只印前 20 筆避免爆）
+#     for t in results[:20]:
+#         app.logger.info(
+#             f"[search_zendesk_tickets_for_reminder][debug] "
+#             f"id={t.get('id')} form_id={t.get('ticket_form_id')} status={t.get('status')}"
+#         )
+
+#     return results
+
+
 
 def search_zendesk_tickets_for_voice_reminder(state: str):
     """

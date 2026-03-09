@@ -94,7 +94,7 @@ def build_redis_conn() -> Redis:
         ssl=use_ssl,
 
         # ✅ 建議統一成 True（你 URL 那邊也是 True），避免有時 bytes 有時 str
-        decode_responses=True,
+        decode_responses=False,
 
         # ✅ 核心：把 timeout 壓小（Redis 掛掉時 0.3~0.8 秒內就 fail-open）
         socket_connect_timeout=0.3,

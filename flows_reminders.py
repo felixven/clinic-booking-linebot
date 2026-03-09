@@ -238,6 +238,7 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
     )
 
     columns: list[CarouselColumn] = []
+    
     for item in appts_sorted:
         s_str = (item.get("startDateTime") or {}).get("dateTime")
         s_local = parse_booking_datetime_to_local(s_str) if s_str else None
@@ -598,6 +599,14 @@ def run_reminder_check(days_before: int | None = None) -> int:
         ticket_id = ticket.get("id")
 
         state = _get_ticket_cf_value(ticket, ZENDESK_CF_REMINDER_STATE)
+        appt_date_str = _get_ticket_cf_value(ticket, ZENDESK_CF_APPOINTMENT_DATE)
+        booking_id = _get_ticket_cf_value(ticket, ZENDESK_CF_BOOKING_ID)
+
+        app.logger.info(
+            f"[run_reminder_check][debug2] ticket_id={ticket_id} status={ticket.get('status')} "
+            f"reminder_state={state!r} appt_date={appt_date_str!r} booking_id={booking_id!r}"
+        )
+
         if state != ZENDESK_REMINDER_STATE_PENDING:
             app.logger.info(
                 f"[run_reminder_check] ticket_id={ticket_id} state={state}，略過不再發 LINE"

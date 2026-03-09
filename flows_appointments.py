@@ -44,8 +44,9 @@ from config import (
     DEMO_CUSTOMER_NAME,
     CONFIRM_OPEN_DAYS_BEFORE, # 原本 2，現在 +1
     CANCEL_DEADLINE_DAYS_BEFORE,
-    DEMO_CUSTOMER_EMAIL,
-    DEMO_CUSTOMER_PHONE,
+    BOOKINGS_BUSINESS_CLINIC_ID,
+    BOOKINGS_BUSINESS_ACU_ID,
+    BOOKINGS_SERVICE_ACU_BED_ID,
 )
 
 from line_send import send_line
@@ -147,8 +148,13 @@ def flow_query_next_appointment(event, text: str):
         customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
         appt_id = appt.get("id", "")
 
-        service_notes = appt.get("serviceNotes") or ""
-        is_confirmed = CONFIRM_NOTE_KEYWORD in service_notes
+        sid = (appt.get("serviceId") or "").strip()
+        biz = BOOKINGS_BUSINESS_ACU_ID if sid == BOOKINGS_SERVICE_ACU_BED_ID else BOOKINGS_BUSINESS_CLINIC_ID
+
+
+        service_notes = (appt.get("serviceNotes") or "")
+        is_confirmed = (CONFIRM_NOTE_KEYWORD.lower() in service_notes.lower())
+
 
         # Title：依類型決定顯示
         btype = (appt.get("_booking_type") or "clinic").strip()
@@ -189,7 +195,7 @@ def flow_query_next_appointment(event, text: str):
             actions.append(
                 PostbackAction(
                     label="取消約診",
-                    data=f"CANCEL_APPT:{appt_id}",
+                    data=f"CANCEL_APPT|{biz}|{appt_id}",
                     display_text="取消約診",
                 )
             )
@@ -206,7 +212,7 @@ def flow_query_next_appointment(event, text: str):
             actions.append(
                 PostbackAction(
                     label="確認回診",
-                    data=f"CONFIRM_APPT:{appt_id}",
+                    data=f"CONFIRM_APPT|{biz}|{appt_id}",
                     display_text="確認回診",
                 )
             )
@@ -265,7 +271,7 @@ def flow_query_next_appointment(event, text: str):
     )
     return
 
-def flow_cancel_request(event, text: str):
+def flow_cancel_request(event, text: str, business_id: str = None):
     """
     Flow：處理「取消約診 {id}」
     - 優先用傳進來的 appt_id
@@ -273,6 +279,8 @@ def flow_cancel_request(event, text: str):
     """
     parts = text.split()
     appt_id = parts[1] if len(parts) >= 2 else ""
+    app.logger.info(f"[cancel_request] enter appt_id={appt_id} biz_param={business_id}")
+
 
     # 先拿 LINE userId（用於沒帶 id 的 fallback）
     line_user_id = None
@@ -294,7 +302,14 @@ def flow_cancel_request(event, text: str):
 
     # ② 有帶 id → 直接依 id 查那一筆
     else:
-        appt, local_start = get_appointment_by_id(appt_id)
+        if business_id:
+            appt, local_start = get_appointment_by_id(appt_id, business_id)
+        else:
+            # 舊格式相容：才 fallback 雙試
+            appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_CLINIC_ID)
+            if not appt:
+                appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_ACU_ID)
+
 
     # ③ 找不到可取消的約診
     if not appt or not local_start:
@@ -327,6 +342,8 @@ def flow_cancel_request(event, text: str):
     display_time = local_start.strftime("%H:%M")
     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
     appt_id = appt.get("id", "")
+    biz = business_id or appt.get("_business_id")
+
 
     detail_text = (
         "您即將取消以下約診：\n"
@@ -342,9 +359,10 @@ def flow_cancel_request(event, text: str):
             # 這裡我們已經改成 PostbackAction 了，如果你還沒改可以先保留舊版
             PostbackAction(
                 label="確認取消",
-                data=f"CANCEL_CONFIRM:{appt_id}",
+                data=f"CANCEL_CONFIRM|{biz}|{appt_id}",
                 display_text="確認取消",
             ),
+
             PostbackAction(
                 label="保留約診",
                 data="CANCEL_KEEP",
@@ -364,19 +382,20 @@ def flow_cancel_request(event, text: str):
     return
 
 
-def flow_confirm_cancel(event, text: str):
+def flow_confirm_cancel(event, text: str, business_id: str = None):
     """
     Flow：處理「確認取消 {id}」
     規則：
     - 只允許看診日前 ≥ 3 天取消
     - 成功取消 Bookings 後，同步把對應的 Zendesk ticket 標記為「取消 / 不需再提醒」
     - ✅ 一律要求帶有 appt_id（只給按鈕觸發用）
+    - ✅ 新版支援 business_id（正規），舊版沒有 business_id 則 fallback 雙試（相容）
     """
-    # 這樣寫可以避免中間多空白出事
     parts = text.split(maxsplit=1)
     appt_id = parts[1].strip() if len(parts) >= 2 else ""
 
-    # ✅ 不再嘗試用 line_user_id 做 fallback，只允許「帶 id 的取消」
+    app.logger.info(f"[confirm_cancel] enter appt_id={appt_id} biz_param={business_id}")
+
     if not appt_id:
         send_line(
             line_bot_api,
@@ -384,46 +403,49 @@ def flow_confirm_cancel(event, text: str):
             messages=[TextMessage(
                 text="要取消的資訊不完整，請重新透過「約診查詢」列表中的按鈕進行操作。"
             )],
+            label="confirm_cancel:missing_appt_id",
         )
         return
 
-
     # 再查一次這筆約診（避免早就被改時間或取消）
-    appt, local_start = get_appointment_by_id(appt_id)
+    if business_id:
+        appt, local_start = get_appointment_by_id(appt_id, business_id)
+    else:
+        appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_CLINIC_ID)
+        if not appt:
+            appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_ACU_ID)
+
     if not appt or not local_start:
         send_line(
             line_bot_api,
             event,
             messages=[TextMessage(text="找不到這筆約診，請重新查詢。")],
+            label="confirm_cancel:not_found",
         )
         return
 
+    biz = business_id or appt.get("_business_id")
 
-    days_left = get_days_until(local_start)
     if not can_cancel(local_start):
         msg = (
             f"距離看診日已少於 {CANCEL_DEADLINE_DAYS_BEFORE} 天，"
             "無法透過 LINE 取消約診。\n"
             "如有特殊狀況請電話聯繫診所。"
         )
-        send_line(
-            line_bot_api,
-            event,
-            messages=[TextMessage(text=msg)],
-        )
+        send_line(line_bot_api, event, messages=[TextMessage(text=msg)], label="confirm_cancel:too_late")
         return
 
     # 真的取消（DELETE Bookings appointment）
     try:
-        cancel_booking_appointment(appt_id)
+        cancel_booking_appointment(appt_id, biz)
     except Exception as e:
-        app.logger.error(f"取消預約失敗: {e}")
+        app.logger.error(f"[confirm_cancel] cancel_booking_appointment failed appt_id={appt_id} biz={biz} err={repr(e)}")
         send_line(
             line_bot_api,
             event,
             messages=[TextMessage(text="取消時發生錯誤，請稍後再試")],
+            label="confirm_cancel:delete_failed",
         )
-
         return
 
     # --- 同步更新 Zendesk ticket：這筆 booking 已經取消，不用再提醒 ---
@@ -435,45 +457,49 @@ def flow_confirm_cancel(event, text: str):
                 ticket_id = ticket.get("id")
                 mark_zendesk_ticket_cancelled(ticket_id)
             else:
-                app.logger.info(
-                    f"[flow_confirm_cancel] 找不到對應 booking_id={booking_id} 的 ticket，略過同步。"
-                )
+                app.logger.info(f"[flow_confirm_cancel] 找不到對應 booking_id={booking_id} 的 ticket，略過同步。")
         except Exception as e:
             app.logger.error(f"[flow_confirm_cancel] 更新 Zendesk ticket 失敗: {e}")
-    else:
-        app.logger.warning("[flow_confirm_cancel] 這筆 appt 沒有 id，無法同步 Zendesk ticket")
 
     # === 回覆給使用者 ===
     display_date = local_start.strftime("%Y/%m/%d")
     display_time = local_start.strftime("%H:%M")
     customer_name = appt.get("customerName") or DEMO_CUSTOMER_NAME
 
-    msg = (
-        "已為您取消以下約診：\n"
-        f"姓名：{customer_name}\n"
-        f"時間：{display_date} {display_time}"
-    )
+    sid = (appt.get("serviceId") or "").strip()
+    is_acu = (sid == BOOKINGS_SERVICE_ACU_BED_ID)
+
+    if is_acu:
+        msg = (
+            "已為您取消以下針灸預約：\n"
+            f"姓名：{customer_name}\n"
+            f"時間：{display_date} {display_time}"
+        )
+    else:
+        period_label = "早診" if local_start.hour < 12 else "晚診"
+        msg = (
+            "已為您取消以下門診預約：\n"
+            f"姓名：{customer_name}\n"
+            f"時間：{display_date}（{period_label}）"
+        )
 
     buttons_template = ButtonsTemplate(
         title="需要重新約診嗎？",
         text="如需重新預約請點選「線上約診」。",
-        actions=[
-            MessageAction(label="線上約診", text="線上約診"),
-        ],
+        actions=[MessageAction(label="線上約診", text="線上約診")],
     )
 
     send_line(
         line_bot_api,
         event,
-        messages=[
-            TextMessage(text=msg),
-            TemplateMessage(alt_text="約診已取消", template=buttons_template),
-        ],
+        messages=[TextMessage(text=msg), TemplateMessage(alt_text="約診已取消", template=buttons_template)],
+        label="confirm_cancel:success",
     )
     return
 
 
-def flow_confirm_visit(event, text: str):
+
+def flow_confirm_visit(event, text: str, business_id: str = None):
     """
     Flow：處理「確認回診 {id}」
     規則：
@@ -508,6 +534,8 @@ def flow_confirm_visit(event, text: str):
 
     parts = text.split(maxsplit=1)
     appt_id = parts[1].strip() if len(parts) >= 2 else ""
+    app.logger.info(f"[confirm_visit] enter appt_id={appt_id} biz_param={business_id}")
+
 
     # 現在：沒有 appt_id 就直接擋掉，不再幫他抓「下一筆預約」
     # if not appt_id:
@@ -530,7 +558,23 @@ def flow_confirm_visit(event, text: str):
 
 
     # 有帶 id 才會真的去撈那一筆預約
-    appt, local_start = get_appointment_by_id(appt_id)
+# ✅ 新格式有 business_id：直接打，不猜
+    if business_id:
+        appt, local_start = get_appointment_by_id(appt_id, business_id)
+    else:
+        # ✅ 舊格式相容：才 fallback 雙試
+        appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_CLINIC_ID)
+        if not appt:
+            appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_ACU_ID)
+
+
+    # DEBUG：確認撈到哪一筆預約、目前 notes 是什麼
+    app.logger.info(
+        f"[confirm_visit] fetched appt_id={appt_id} "
+        f"has_appt={'Y' if appt else 'N'} "
+        f"serviceId={(appt or {}).get('serviceId')} "
+        f"notes={(appt or {}).get('serviceNotes')!r}"
+    )
 
 
     # if not appt or not local_start:
@@ -583,6 +627,11 @@ def flow_confirm_visit(event, text: str):
     service_notes = appt.get("serviceNotes") or ""
     already_confirmed = (CONFIRM_NOTE_KEYWORD in service_notes)
 
+    app.logger.info(
+    f"[confirm_visit] appt_id={appt_id} keyword={CONFIRM_NOTE_KEYWORD!r} "
+    f"already_confirmed={already_confirmed} notes={service_notes!r}"
+    )
+
     # 已確認 → 不再 PATCH，只回提示＋位置按鈕
     if already_confirmed:
         detail_text = (
@@ -633,11 +682,24 @@ def flow_confirm_visit(event, text: str):
     else:
         merged_notes = new_line
 
+    # DEBUG：要寫入的內容長怎樣
+    app.logger.info(
+        f"[confirm_visit] appt_id={appt_id} new_line={new_line!r} merged_notes={merged_notes!r}"
+    )
+
+
     # 先試著更新 Bookings 備註（失敗只記 log，不擋流程）
     try:
-        update_booking_service_notes(appt_id, merged_notes)
+        app.logger.info(f"[confirm_visit] appt_id={appt_id} about_to_patch_notes ...")
+        biz = business_id or appt.get("_business_id")
+        update_booking_service_notes(appt_id, merged_notes, business_id=biz)
+
+        # update_booking_service_notes(appt_id, merged_notes)
     except Exception as e:
-        app.logger.error(f"更新 Bookings 備註失敗: {e}")
+        app.logger.error(
+        f"[confirm_visit] update_booking_service_notes failed appt_id={appt_id} err={repr(e)}",
+        exc_info=True,  # 會印出完整 stack trace
+    )
         # 寫備註失敗不影響使用者體驗，只記 log
 
     # --- 同步更新 Zendesk ticket 狀態 ---
@@ -661,7 +723,7 @@ def flow_confirm_visit(event, text: str):
     detail_text = (
         "回診提醒：\n"
         f"姓名：{customer_name}\n"
-        f"看診時間：{display_date} {display_time}\n"
+        f"看診時間：{display_date} \n" #不顯示時間
         "\n請於門診開始前 10 分鐘至診所報到。"
     )
     detail_message = TextMessage(text=detail_text)

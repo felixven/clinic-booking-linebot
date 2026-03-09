@@ -39,6 +39,7 @@ from config import (
     APPOINTMENT_DURATION_MINUTES,
     SLOT_INTERVAL_MINUTES,
     AFTERNOON_START,
+    SPECIAL_CLOSED_DATES,
 
 )
 
@@ -217,7 +218,8 @@ def pick_first_available_clinic_time(date_str: str, period: str, business_id: st
     period: "morning" 或 "evening"
     回傳該 date_str 在該時段第一個可預約 HH:MM；如果沒有回 None
     """
-    slots = get_available_slots_for_date(date_str, business_id=business_id)  # 你原本就有
+    # slots = get_available_slots_for_date(date_str, business_id=business_id)  # 你原本就有
+    slots = sorted(get_available_slots_for_date(date_str, business_id=business_id) or [])#改成有排序的
     if not slots:
         return None
 
@@ -766,5 +768,9 @@ def validate_appointment_date(date_str: str) -> tuple[bool, str]:
 
     if appt_date.weekday() in CLOSED_WEEKDAYS:
         return False, "該日期為休診日，請重新選擇其他日期。"
+    
+    note = SPECIAL_CLOSED_DATES.get(date_str)
+    if note:
+        return False, f"該日期為{note}，請重新選擇其他日期。"
 
     return True, ""

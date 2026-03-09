@@ -16,6 +16,8 @@ from linebot.v3.messaging import (
     ButtonsTemplate,
     MessageAction,
     LocationMessage,
+    QuickReply,
+    QuickReplyItem,
 )
 
 from linebot.v3.messaging.models import (
@@ -150,6 +152,9 @@ from config import (
     BOOKINGS_SERVICE_ACU_BED_ID,
     ACU_STAFF_BED1_ID,
     ACU_STAFF_BED2_ID,
+    ZENDESK_APPT_CATEGORY_ACU_BED1,
+    ZENDESK_APPT_CATEGORY_ACU_BED2,
+    ZENDESK_APPT_CATEGORY_CLINIC
 )
 
 # PENDING_REGISTRATIONS = {}
@@ -792,7 +797,7 @@ def handle_message(event: MessageEvent):
                 event,
                 messages=[
                     TextMessage(
-                        text="您目前正在填寫資料中。\n如要取消請按「取消」或輸入「取消建檔」。"
+                        text="您目前正在填寫資料中。\n如要取消請按「取消」或輸入「取消」。"
                     )
                 ],
                 label="already_in_flow_warning",
@@ -951,15 +956,29 @@ def handle_message(event: MessageEvent):
                     footer = "如有疑問請聯繫診所協助確認，謝謝您。"
                     msg = f"{header}\n{details}\n\n{footer}"
 
+                    # clear_state(line_user_id_for_state)
+                    state["step"] = "pick_booking_type"
+                    set_state(line_user_id_for_state, state)
                     send_line(
                         line_bot_api,
                         event,
-                        messages=[TextMessage(text=msg)],
-                        label="acupuncture_ineligible",
+                        messages=[
+                            TextMessage(
+                                text=msg + "\n\n你可以改為預約看診，或取消本次操作：",
+                                quick_reply=QuickReply(
+                                    items=[
+                                        QuickReplyItem(
+                                            action=MessageAction(label="預約看診", text="預約看診")
+                                        ),
+                                        QuickReplyItem(
+                                            action=MessageAction(label="取消預約", text="取消預約")
+                                        ),
+                                    ]
+                                ),
+                            )
+                        ],
+                        label="acupuncture_ineligible_with_buttons",
                     )
-
-                    clear_state(line_user_id_for_state)
-
                     return
 
                 # 走到這裡 = 已是老客 + 針灸資格 OK → 先出同意書，再進入選日期
@@ -978,6 +997,17 @@ def handle_message(event: MessageEvent):
 
                 reply_acu_terms_buttons(line_bot_api, event)
                 return
+                        
+            if text == "取消預約":
+                clear_state(line_user_id_for_state)
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text="已取消本次操作。如需重新預約，請輸入「線上約診」。")],
+                    label="pick_booking_type_cancel",
+                )
+                return
+
 
             # 其他文字：提示使用者點按鈕
             start_loading_animation(
@@ -1276,7 +1306,10 @@ def handle_message(event: MessageEvent):
                 )
                 return
 
-            clear_state(line_user_id_for_state)
+            # clear_state(line_user_id_for_state)
+            state["step"] = "pick_booking_type"
+            state["zendesk_user_id"] = zendesk_user_id
+            set_state(line_user_id_for_state, state)
 
             info_text = (
                 f"{found_name or '貴賓'} 您好，已為您完成身分綁定。\n"
@@ -2817,21 +2850,52 @@ def handle_message(event: MessageEvent):
 
             print(f"[CONFIRM_APPT] enter uid={line_user_id} evt_id={evt_id_safe} date={date_str} time={time_str}", flush=True)
 
-            lock_key = f"confirm:{line_user_id}:{date_str}:{time_str}"
+            state = get_state(line_user_id) or {}
+            booking_type = (state.get("booking_type") or "clinic").strip()
+            
+            bed = None
+            print(f"[CONFIRM_APPT] type={booking_type} bed={bed}", flush=True)
+            
+            if booking_type == "acupuncture":
+                wd = datetime.strptime(date_str, "%Y-%m-%d").date().weekday()
+                bed = (ACU_SLOTS.get(wd) or {}).get(time_str)  # bed1 / bed2
+
+                if not bed:
+                    send_line(
+                        line_bot_api,
+                        event,
+                        messages=[TextMessage(text="此時段不是針灸可預約時段，請重新選擇。")],
+                        label="acu_invalid_time",
+                    )
+                    return
+
+                lock_key = f"confirm:acupuncture:{line_user_id}:{date_str}:{time_str}:{bed}"
+            else:
+                lock_key = f"confirm:clinic:{line_user_id}:{date_str}:{time_str}"
+
+            # bed = None
+            # if booking_type == "acupuncture":
+            #     wd = datetime.strptime(date_str, "%Y-%m-%d").date().weekday()
+            #     bed = (ACU_SLOTS.get(wd) or {}).get(time_str)  # bed1 / bed2
+
+            #     if not bed:
+            #         send_line(
+            #             line_bot_api,
+            #             event,
+            #             messages=[TextMessage(text="此時段不是針灸可預約時段，請重新選擇。")],
+            #             label="acu_invalid_time",
+            #         )
+            #         return
+
+            #     lock_key = f"confirm:acupuncture:{line_user_id}:{date_str}:{time_str}:{bed}"
+            # else:
+            #     lock_key = f"confirm:clinic:{line_user_id}:{date_str}:{time_str}"
+
             print(f"[CONFIRM_APPT] before_lock uid={line_user_id} key={lock_key}", flush=True)
             lock_ok = acquire_lock(lock_key, ttl_sec=30)
             print(f"[CONFIRM_APPT] after_lock uid={line_user_id} ok={lock_ok}", flush=True)
+
             if not lock_ok:
-                # line_bot_api.reply_message(
-                #     ReplyMessageRequest(
-                #         reply_token=event.reply_token,
-                #         messages=[
-                #             TextMessage(
-                #                 text="正在建立預約中，請勿重複點擊～\n若未收到預約成功訊息，請稍後再試或「約診查詢」。"
-                #             )
-                #         ],
-                #     )
-                # )
                 send_line(
                     line_bot_api,
                     event,
@@ -2839,6 +2903,15 @@ def handle_message(event: MessageEvent):
                     label="duplication",
                 )
                 return
+
+            # ④ ✅ 檢查該時段目前是否仍可預約（防止暴力輸入或已被別人搶走）
+            t0 = time.time()
+
+            if booking_type == "acupuncture":
+                ok_slot = is_acu_slot_available(date_str, time_str)
+            else:
+                ok_slot = is_slot_available(date_str, time_str, business_id=BOOKINGS_BUSINESS_CLINIC_ID)
+
 
             start_loading_animation(line_bot_api, line_user_id, loading_seconds=30)
 
@@ -2872,7 +2945,7 @@ def handle_message(event: MessageEvent):
                 return
 
             # ④ 檢查該時段目前是否仍可預約（防止暴力輸入或已被別人搶走）
-            t0 = time.time()
+            # t0 = time.time()
             # ok_slot = is_slot_available(date_str, time_str)
             # print(f"[CONFIRM_APPT] slot_check uid={line_user_id} ok={ok_slot} elapsed={time.time()-t0:.3f}s", flush=True)
             # print(f"[CONFIRM_APPT] slot_check uid={line_user_id} date={date_str} time={time_str} ok={ok_slot}", flush=True)
@@ -2880,8 +2953,8 @@ def handle_message(event: MessageEvent):
             # ④ 檢查該時段目前是否仍可預約（防止暴力輸入或已被別人搶走）
             t0 = time.time()
 
-            state = get_state(line_user_id) or {}
-            booking_type = (state.get("booking_type") or "clinic").strip()
+            # state = get_state(line_user_id) or {}
+            # booking_type = (state.get("booking_type") or "clinic").strip()
 
             if booking_type == "acupuncture":
                 ok_slot = is_acu_slot_available(date_str, time_str)
@@ -2956,14 +3029,13 @@ def handle_message(event: MessageEvent):
             # ⑧ 呼叫新的 create_booking_appointment（會寫入 LINE_USER 到 serviceNotes）
 
             print(f"[CONFIRM_APPT] before_create uid={line_user_id} evt_id={evt_id} date={date_str} time={time_str}", flush=True)
+
             # ⑧-0 若是針灸：依固定表決定床位 → 對應 serviceId
 
             staff_member_ids = None
 
+            # bed 已在前面鎖的地方算過，這裡直接使用
             if booking_type == "acupuncture":
-                wd = datetime.strptime(date_str, "%Y-%m-%d").date().weekday()
-                bed = (ACU_SLOTS.get(wd) or {}).get(time_str)  # 辨識"bed1" / "bed2"
-
                 if not bed:
                     send_line(
                         line_bot_api,
@@ -2972,13 +3044,16 @@ def handle_message(event: MessageEvent):
                         label="acu_invalid_time",
                     )
                     return
-                
+
                 business_id = BOOKINGS_BUSINESS_ACU_ID
                 service_id = BOOKINGS_SERVICE_ACU_BED_ID
+
                 if bed == "bed1":
                     staff_member_ids = [ACU_STAFF_BED1_ID]
+                    appt_category = ZENDESK_APPT_CATEGORY_ACU_BED1
                 elif bed == "bed2":
                     staff_member_ids = [ACU_STAFF_BED2_ID]
+                    appt_category = ZENDESK_APPT_CATEGORY_ACU_BED2
                 else:
                     send_line(
                         line_bot_api,
@@ -2987,10 +3062,44 @@ def handle_message(event: MessageEvent):
                         label="acu_bed_config_error",
                     )
                     return
- 
+            
             else:
                 service_id = BOOKINGS_DEMO_SERVICE_ID
                 business_id = BOOKINGS_BUSINESS_CLINIC_ID
+
+            
+            #前面防止重送的時候已經算過是哪個booking type和bed 1 bed 2，這邊是有重新算一次
+            # if booking_type == "acupuncture":
+            #     wd = datetime.strptime(date_str, "%Y-%m-%d").date().weekday()
+            #     bed = (ACU_SLOTS.get(wd) or {}).get(time_str)  # 辨識"bed1" / "bed2"
+
+            #     if not bed:
+            #         send_line(
+            #             line_bot_api,
+            #             event,
+            #             messages=[TextMessage(text="此時段不是針灸可預約時段，請重新選擇。")],
+            #             label="acu_invalid_time",
+            #         )
+            #         return
+                
+            #     business_id = BOOKINGS_BUSINESS_ACU_ID
+            #     service_id = BOOKINGS_SERVICE_ACU_BED_ID
+            #     if bed == "bed1":
+            #         staff_member_ids = [ACU_STAFF_BED1_ID]
+            #     elif bed == "bed2":
+            #         staff_member_ids = [ACU_STAFF_BED2_ID]
+            #     else:
+            #         send_line(
+            #             line_bot_api,
+            #             event,
+            #             messages=[TextMessage(text="針灸床位設定異常，請聯繫診所協助。")],
+            #             label="acu_bed_config_error",
+            #         )
+            #         return
+ 
+            # else:
+            #     service_id = BOOKINGS_DEMO_SERVICE_ID
+            #     business_id = BOOKINGS_BUSINESS_CLINIC_ID
 
             print(f"[ACU_CREATE] uid={line_user_id} type={booking_type} business_id={business_id} service_id={service_id} staff={staff_member_ids} date={date_str} time={time_str}", flush=True)  
             try:
@@ -3069,6 +3178,8 @@ def handle_message(event: MessageEvent):
                                 local_start_dt=local_start_dt,
                                 zendesk_customer_id=zid,
                                 customer_name=customer_name,
+                                booking_service_name="針灸",
+                                appt_category=appt_category
                             )
                             app.logger.info(
                                 f"[handle_message] 建立預約 Ticket 結果: {ticket_result}"
@@ -3547,6 +3658,21 @@ def handle_postback(event):
                 label="clinic_confirm_step_mismatch",
             )
             return
+        
+        # 防重複點擊 / 防重複建立（與「確認預約」共用同邏輯）
+        lock_key = f"confirm:clinic:{line_user_id}:{date_str}:{time_str}"
+        print(f"[PB] CLINIC_CONFIRM before_lock uid={line_user_id} key={lock_key}", flush=True)
+        lock_ok = acquire_lock(lock_key, ttl_sec=30)
+        print(f"[PB] CLINIC_CONFIRM after_lock uid={line_user_id} ok={lock_ok}", flush=True)
+
+        if not lock_ok:
+            send_line(
+                line_bot_api,
+                event,
+                messages=[TextMessage(text="正在建立預約中，請勿重複點擊～\n若未收到預約成功訊息，請稍後再試或「約診查詢」。")],
+                label="clinic_confirm_duplication",
+            )
+            return
 
         start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
 
@@ -3632,6 +3758,7 @@ def handle_postback(event):
             return
 
         booking_id = created.get("id")
+        appt_category = ZENDESK_APPT_CATEGORY_CLINIC
 
         # ✅ 必做：建 Zendesk ticket（沿用你原本 recover notes 的邏輯）
         try:
@@ -3654,6 +3781,8 @@ def handle_postback(event):
                     local_start_dt=local_start_dt,
                     zendesk_customer_id=zid,
                     customer_name=customer_name,
+                    booking_service_name="門診",
+                    appt_category=appt_category
                 )
         except Exception as e:
             app.logger.error(f"[CLINIC_CONFIRM] create_zendesk_ticket failed (non-blocking): {e}")
@@ -3733,71 +3862,99 @@ def handle_postback(event):
         reply_date_range_buttons(event, "已同意針灸注意事項。\n請選擇要預約的日期範圍：")
         return
 
-    # ===== 約診 postback 邏輯 =====
+  # ===== 約診 postback 邏輯 =====
 
-    # ① 按下「取消約診」按鈕（從約診查詢畫面）
-    if data.startswith("CANCEL_APPT:"):
-        appt_id = data.split(":", 1)[1].strip()
-        fake_text = f"取消約診 {appt_id}"
+    # 0) NOOP（已確認的卡片用空白按鈕）
+    if data == "NOOP":
+        return
+
+    # 1) 確認回診（新格式）
+    elif data.startswith("CONFIRM_APPT|"):
+        _, biz, appt_id = data.split("|", 2)
+        appt_id = appt_id.strip()
+        biz = biz.strip()
+
         line_user_id = getattr(getattr(event, "source", None), "user_id", None)
-
         if line_user_id:
-            start_loading_animation(
-                line_bot_api,
-                line_user_id,
-                loading_seconds=30,
-                timeout=(1, 2),
-            )
+            start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
+
+        fake_text = f"確認回診 {appt_id}"
+        return flow_confirm_visit(event, fake_text, business_id=biz)
+
+    # 1-legacy) 確認回診（舊格式）
+    elif data.startswith("CONFIRM_APPT:"):
+        appt_id = data.split(":", 1)[1].strip()
+
+        line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        if line_user_id:
+            start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
+
+        fake_text = f"確認回診 {appt_id}"
+        return flow_confirm_visit(event, fake_text)  # 舊格式 → flow 內 fallback 雙試
+
+    # 2) 取消約診（第一階段：跳出確認取消畫面）（新格式）
+    elif data.startswith("CANCEL_APPT|"):
+        _, biz, appt_id = data.split("|", 2)
+        appt_id = appt_id.strip()
+        biz = biz.strip()
+
+        line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        if line_user_id:
+            start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
+
+        fake_text = f"取消約診 {appt_id}"
+        return flow_cancel_request(event, fake_text, business_id=biz)
+
+    # 2-legacy) 取消約診（第一階段）（舊格式）
+    elif data.startswith("CANCEL_APPT:"):
+        appt_id = data.split(":", 1)[1].strip()
+
+        line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        if line_user_id:
+            start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
+
+        fake_text = f"取消約診 {appt_id}"
         return flow_cancel_request(event, fake_text)
 
-    # ② 按下「確認取消」按鈕（第二階段確認）
-    elif data.startswith("CANCEL_CONFIRM:") or data.startswith("CONFIRM_CANCEL:"):
-        appt_id = data.split(":", 1)[1].strip()
-        fake_text = f"確認取消 {appt_id}"
+    # 3) 確認取消（第二階段：真的取消）（新格式）
+    elif data.startswith("CANCEL_CONFIRM|"):
+        _, biz, appt_id = data.split("|", 2)
+        appt_id = appt_id.strip()
+        biz = biz.strip()
+
         line_user_id = getattr(getattr(event, "source", None), "user_id", None)
-
         if line_user_id:
-            start_loading_animation(
-                line_bot_api,
-                line_user_id,
-                loading_seconds=30,
-                timeout=(1, 2),
-            )
-        return flow_confirm_cancel(event, fake_text)
+            start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
 
-    # ②-1 按下「保留約診」按鈕
+        fake_text = f"確認取消 {appt_id}"
+        return flow_confirm_cancel(event, fake_text, business_id=biz)
+
+    # 3-legacy) 確認取消（舊格式）
+    elif data.startswith("CANCEL_CONFIRM:"):
+        appt_id = data.split(":", 1)[1].strip()
+
+        line_user_id = getattr(getattr(event, "source", None), "user_id", None)
+        if line_user_id:
+            start_loading_animation(line_bot_api, line_user_id, loading_seconds=30, timeout=(1, 2))
+
+        fake_text = f"確認取消 {appt_id}"
+        return flow_confirm_cancel(event, fake_text)  # 舊格式 → flow 內 fallback 雙試
+
+    # 4) 保留約診
     elif data == "CANCEL_KEEP":
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="已為您保留原本的約診，謝謝。")],
-            )
+        send_line(
+            line_bot_api,
+            event,
+            messages=[TextMessage(text="已為您保留原本的約診，謝謝。")],
+            label="cancel_keep",
         )
         return
 
-    # ③ 按下「確認回診」按鈕
-    elif data.startswith("CONFIRM_APPT:"):
-        appt_id = data.split(":", 1)[1].strip()
-        fake_text = f"確認回診 {appt_id}"
-        line_user_id = getattr(getattr(event, "source", None), "user_id", None)
-
-        if line_user_id:
-            start_loading_animation(
-                line_bot_api,
-                line_user_id,
-                loading_seconds=30,
-                timeout=(1, 2),
-            )
-
-        return flow_confirm_visit(event, fake_text)
-
-    # 其他沒處理到的 Postback 先記 log
+    # 其他沒處理到的 Postback
     else:
         app.logger.warning(f"未處理的 Postback data: {data}")
-
-        ### FIX-2: 把你原本「永遠跑不到的 print」搬到這裡（保留不刪）
-        print(f"[POSTBACK] unhandled uid={line_user_id} data={data}", flush=True)
-
+        uid = getattr(getattr(event, "source", None), "user_id", None)
+        print(f"[POSTBACK] unhandled uid={uid} data={data}", flush=True)
         return
 
     # === fallback：使用者直接輸入手機，但尚未進入任何流程 ===
@@ -4308,7 +4465,7 @@ def cron_run_reminder_fail():
 def ping():
     return {"ok": True, "ts": time.time()}, 200
 
-
+#替換區
         # # Case 3：查無此人，不是診所既有的病患，不開放初診線上預約
         # print(f"[FLOW] no_zendesk_user uid={uid} line_user_id={line_user_id}", flush=True)
         # start_loading_animation(
@@ -4443,3 +4600,26 @@ def ping():
     #         extra_state={"zendesk_user_id": zendesk_user_id, "phone": phone},
     #     )
     #     return
+
+            # lock_key = f"confirm:{line_user_id}:{date_str}:{time_str}"
+            # print(f"[CONFIRM_APPT] before_lock uid={line_user_id} key={lock_key}", flush=True)
+            # lock_ok = acquire_lock(lock_key, ttl_sec=30)
+            # print(f"[CONFIRM_APPT] after_lock uid={line_user_id} ok={lock_ok}", flush=True)
+            # if not lock_ok:
+            #     # line_bot_api.reply_message(
+            #     #     ReplyMessageRequest(
+            #     #         reply_token=event.reply_token,
+            #     #         messages=[
+            #     #             TextMessage(
+            #     #                 text="正在建立預約中，請勿重複點擊～\n若未收到預約成功訊息，請稍後再試或「約診查詢」。"
+            #     #             )
+            #     #         ],
+            #     #     )
+            #     # )
+            #     send_line(
+            #         line_bot_api,
+            #         event,
+            #         messages=[TextMessage(text="正在建立預約中，請勿重複點擊～\n若未收到預約成功訊息，請稍後再試或「約診查詢」。")],
+            #         label="duplication",
+            #     )
+            #     return

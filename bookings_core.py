@@ -395,42 +395,34 @@ def list_appointments_for_range(
 #     # 通常 Graph 會把結果放在 value 裡
 #     return data.get("value", [])
 
-def get_appointment_by_id(appt_id: str):
+# 0212新增版本
+def get_appointment_by_id(appt_id: str, business_id: str):
     """
-    用 Bookings appointment id 取得單一預約資訊。
+    用指定 bookingBusiness 的 appointment id 取得單一預約資訊。
     回傳 (appointment_dict, local_start_dt)；
     找不到或解析失敗則回 (None, None)。
     """
     if not appt_id:
         return None, None
+    if not business_id:
+        raise Exception("get_appointment_by_id: business_id 為空")
 
     token = get_graph_token()
-    business_id = os.environ.get("BOOKING_BUSINESS_ID")
-
-    if not business_id:
-        raise Exception("缺 BOOKING_BUSINESS_ID")
 
     url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{appt_id}"
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
+    headers = {"Authorization": f"Bearer {token}"}
 
     resp = requests.get(url, headers=headers)
     app.logger.info(
-        f"GET APPOINTMENT {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
+        f"GET APPOINTMENT biz={business_id} appt={appt_id} STATUS: {resp.status_code}, BODY: {resp.text}"
+    )
 
     if resp.status_code == 404:
-        # 已被刪除或不存在
         return None, None
 
     resp.raise_for_status()
     appt = resp.json()
-
-    app.logger.info(f"APPOINTMENT KEYS: {list(appt.keys())}")
-    app.logger.info(
-        f"APPT NOTES FIELDS: serviceNotes={appt.get('serviceNotes')}, "
-        f"customerNotes={appt.get('customerNotes')}"
-    )
+    appt["_business_id"] = business_id  # ✅ 回傳時順便帶著
 
     start_info = appt.get("startDateTime", {})
     local_dt = parse_booking_datetime_to_local(start_info.get("dateTime"))
@@ -440,60 +432,105 @@ def get_appointment_by_id(appt_id: str):
     return appt, local_dt
 
 
+# 0212前版本
+# def get_appointment_by_id(appt_id: str):
+#     """
+#     用 Bookings appointment id 取得單一預約資訊。
+#     回傳 (appointment_dict, local_start_dt)；
+#     找不到或解析失敗則回 (None, None)。
+#     """
+#     if not appt_id:
+#         return None, None
 
-def cancel_booking_appointment(appt_id: str):
+#     token = get_graph_token()
+#     business_id = os.environ.get("BOOKINGS_BUSINESS_CLINIC_ID")
+
+#     if not business_id:
+#         raise Exception("缺 BOOKINGS_BUSINESS_CLINIC_ID")
+
+#     url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{appt_id}"
+#     headers = {
+#         "Authorization": f"Bearer {token}"
+#     }
+
+#     resp = requests.get(url, headers=headers)
+#     app.logger.info(
+#         f"GET APPOINTMENT {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
+
+#     if resp.status_code == 404:
+#         # 已被刪除或不存在
+#         return None, None
+
+#     resp.raise_for_status()
+#     appt = resp.json()
+
+#     app.logger.info(f"APPOINTMENT KEYS: {list(appt.keys())}")
+#     app.logger.info(
+#         f"APPT NOTES FIELDS: serviceNotes={appt.get('serviceNotes')}, "
+#         f"customerNotes={appt.get('customerNotes')}"
+#     )
+
+#     start_info = appt.get("startDateTime", {})
+#     local_dt = parse_booking_datetime_to_local(start_info.get("dateTime"))
+#     if not local_dt:
+#         return None, None
+
+#     return appt, local_dt
+
+
+
+def cancel_booking_appointment(appt_id: str, business_id: str = None):
     """
-    DEMO 版：直接呼叫 DELETE 取消 Bookings appointment。
-    （正式版如果要改成「標記取消」也可以，改這裡就好。）
+    取消 Bookings appointment（DELETE）。
+
+    - 正式：由呼叫端傳入 business_id（clinic / acu 各自的 Bookings business）
+    - 相容：如果沒傳 business_id，才 fallback 用 env: BOOKING_BUSINESS_ID（舊 DEMO 行為）
     """
     if not appt_id:
         raise Exception("cancel_booking_appointment: appt_id 為空")
 
     token = get_graph_token()
-    business_id = os.environ.get("BOOKING_BUSINESS_ID")
 
-    if not business_id:
-        raise Exception("缺 BOOKING_BUSINESS_ID")
+    # ✅ 正式優先用傳入的 biz；沒傳才 fallback 舊 env
+    biz = (business_id or "").strip() or os.environ.get("BOOKING_BUSINESS_ID")
+    if not biz:
+        raise Exception("缺 business_id（未傳入且 env BOOKING_BUSINESS_ID 也不存在）")
 
-    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{appt_id}"
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
+    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{biz}/appointments/{appt_id}"
+    headers = {"Authorization": f"Bearer {token}"}
 
     resp = requests.delete(url, headers=headers)
     app.logger.info(
-        f"DELETE APPOINTMENT {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
+        f"DELETE APPOINTMENT biz={biz} appt={appt_id} STATUS: {resp.status_code}, BODY: {resp.text}"
+    )
 
-    # 204 No Content / 200 / 202
+    # 204 No Content / 200 / 202 都算成功
     if resp.status_code not in (200, 202, 204):
         resp.raise_for_status()
 
-def update_booking_service_notes(appt_id: str, notes_text: str):
+
+def update_booking_service_notes(appt_id: str, notes_text: str, business_id: str):
     """
     將指定 appointment 的 serviceNotes 更新為 notes_text。(診所／工作人員可以看的備註)
     """
     if not appt_id:
         raise Exception("update_booking_service_notes: appt_id 為空")
+    
+    if not business_id:
+        raise Exception("update_booking_service_notes: business_id 為空")
 
     token = get_graph_token()
-    business_id = os.environ.get("BOOKING_BUSINESS_ID")
-
-    if not business_id:
-        raise Exception("缺 BOOKING_BUSINESS_ID")
-
     url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{appt_id}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-
-    payload = {
-        "serviceNotes": notes_text
-    }
+    payload = {"serviceNotes": notes_text}
 
     resp = requests.patch(url, headers=headers, json=payload)
     app.logger.info(
-        f"PATCH APPT SERVICE NOTES {appt_id} STATUS: {resp.status_code}, BODY: {resp.text}")
+        f"PATCH APPT SERVICE NOTES biz={business_id} appt={appt_id} STATUS: {resp.status_code}, BODY: {resp.text}"
+    )
     resp.raise_for_status()
 
 def _get_day_intervals(date_str: str):
