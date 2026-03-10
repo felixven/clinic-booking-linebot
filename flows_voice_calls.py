@@ -145,7 +145,7 @@ def process_voice_call_task(task: dict):
     url = LIVEHUB_BASE_URL + LIVEHUB_DIALOUT_PATH
     headers = _build_livehub_headers()
 
-    # 4) 直接印出「最終送出的 JSON」（你要看的就是這個）
+    # 4) 直接印出「最終送出的 JSON」
     print("FINAL DIALOUT PAYLOAD =", json.dumps(payload, ensure_ascii=False))
 
     try:
@@ -191,7 +191,7 @@ def process_voice_call_group(line_user_id: str, appt_date_str: str, ticket_ids: 
             if not tid:
                 continue
             try:
-                # 用第一張 ticket 的資料可以算 attempts，但你這裡為了最小改動就不帶 ticket
+                # 用第一張 ticket 的資料可以算 attempts，但這裡為了最小改動就不帶 ticket
                 mark_zendesk_ticket_queued(ticket_id=int(tid), ticket=None)
             except Exception as e:
                 app.logger.error(f"[VOICE GROUP] lock queued failed tid={tid}: {e}")
@@ -362,7 +362,7 @@ def process_voice_call_demo_from_zendesk(line_user_id: str, appt_date_str: str, 
             "patientName": patient_name,
             "appointmentDate": appointment_date,
             "appointmentCount": appointment_count,
-            # ✅ 先帶著，不會影響你現階段播報；未來 webhook 回寫會用
+            # 先帶著，不會影響現階段播報；未來 webhook 回寫會用
             "ticketIds": [int(x) for x in ticket_ids if x],
         }
 

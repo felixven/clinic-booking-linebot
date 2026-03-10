@@ -38,7 +38,7 @@ from patient_core import (
     get_next_upcoming_appointment_for_line_user,
 )
 
-# --- flow 共用工具（你會放在同檔案） ---
+# --- flow 共用工具（在同檔案） ---
 from config import (
     CONFIRM_NOTE_KEYWORD,
     DEMO_CUSTOMER_NAME,
@@ -160,11 +160,11 @@ def flow_query_next_appointment(event, text: str):
         btype = (appt.get("_booking_type") or "clinic").strip()
 
         if btype == "clinic":
-            # ✅ 門診：不顯示 HH:MM，只顯示早/晚
+            # 門診：不顯示 HH:MM，只顯示早/晚
             period_label = "早診" if local_start.hour < 12 else "晚診"
             title = f"【門診】{display_date}（{period_label}）"
         else:
-            # ✅ 針灸：顯示時間
+            # 針灸：顯示時間
             title = f"【針灸】{display_date} {display_time}"
 
 
@@ -356,7 +356,7 @@ def flow_cancel_request(event, text: str, business_id: str = None):
         title="確認取消約診",
         text="請選擇是否取消本次約診。",
         actions=[
-            # 這裡我們已經改成 PostbackAction 了，如果你還沒改可以先保留舊版
+            # 這裡已經改成 PostbackAction 了
             PostbackAction(
                 label="確認取消",
                 data=f"CANCEL_CONFIRM|{biz}|{appt_id}",
@@ -558,11 +558,11 @@ def flow_confirm_visit(event, text: str, business_id: str = None):
 
 
     # 有帶 id 才會真的去撈那一筆預約
-# ✅ 新格式有 business_id：直接打，不猜
+# 新格式有 business_id：直接打，不猜
     if business_id:
         appt, local_start = get_appointment_by_id(appt_id, business_id)
     else:
-        # ✅ 舊格式相容：才 fallback 雙試
+        # 舊格式相容：才 fallback 雙試
         appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_CLINIC_ID)
         if not appt:
             appt, local_start = get_appointment_by_id(appt_id, BOOKINGS_BUSINESS_ACU_ID)

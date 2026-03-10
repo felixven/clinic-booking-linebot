@@ -155,7 +155,7 @@ def list_appointments_for_date(date_str: str, business_id: str) -> list:
     """
     token: str = get_graph_token()
 
-    # ✅ 用傳入的 business_id；沒傳才 fallback（但建議你都要傳）
+    # 用傳入的 business_id；沒傳才 fallback（最好都要傳）
     business_id = business_id or os.environ.get("BOOKING_BUSINESS_CLINIC_ID") or BOOKINGS_BUSINESS_CLINIC_ID
     if not business_id:
         raise Exception("缺 business_id（BOOKING_BUSINESS_CLINIC_ID），請檢查環境變數。")
@@ -261,21 +261,20 @@ def list_appointments_for_range(
 
     token = get_graph_token()
 
-    # ✅ business_id 來源優先順序：
+    # business_id 來源優先順序：
     # 1) 呼叫端傳入
     # 2) 環境變數 BOOKING_BUSINESS_ID（舊版相容）
-    # 3) （可選）你也可以自己加 BOOKING_BUSINESS_CLINIC_ID / BOOKING_BUSINESS_ACU_ID 在外面做分流後傳入
+    # 3) （可選）自己加 BOOKING_BUSINESS_CLINIC_ID / BOOKING_BUSINESS_ACU_ID 在外面做分流後傳入
     business_id = (business_id or "").strip() or (os.environ.get("BOOKING_BUSINESS_ID") or "").strip()
 
     print(f"[LIST_APPTS_RANGE] resolved business_id={business_id!r}", flush=True)
 
     if not business_id:
-        # 保留你原本的錯誤語意，但把訊息寫清楚一點方便你抓 log
         raise Exception("缺 BOOKING_BUSINESS_ID（或呼叫時未傳入 business_id）")
 
     # ===== 時間處理（穩健版）=====
-    # 你的規格：start_local / end_local 是台北時間 naive
-    # 做法：把 naive 視為 Asia/Taipei → 轉成 UTC → 格式化為 ISO + Z
+    # start_local / end_local 是台北時間 naive
+    # 把 naive 視為 Asia/Taipei → 轉成 UTC → 格式化為 ISO + Z
     tz_taipei = ZoneInfo("Asia/Taipei")
 
     if start_local.tzinfo is None:
@@ -323,7 +322,7 @@ def list_appointments_for_range(
 
         resp = requests.get(url, headers=headers)
 
-        # 你原本的 logger 我保留，另外補 print，讓你不看 logger 也知道狀態碼
+        # print狀態碼
         print(
             f"[LIST_APPTS_RANGE] RESP page={page} status={resp.status_code} body_head={resp.text[:200]!r}",
             flush=True
@@ -332,7 +331,7 @@ def list_appointments_for_range(
             f"[LIST_APPTS_RANGE] STATUS page={page}: {resp.status_code}, BODY_HEAD: {resp.text[:500]}"
         )
 
-        # 失敗就直接噴（維持你原本行為）
+        # 失敗就直接噴
         resp.raise_for_status()
 
         data = resp.json() or {}
@@ -739,8 +738,8 @@ def create_booking_appointment(
     # fallback：沒傳就用原本 demo 常數（不影響流程）
     final_service_id = service_id or BOOKINGS_DEMO_SERVICE_ID
 
-    # ⚠️ staff：針灸才一定需要；內科若你不想指定，就讓它 None
-    # （你目前呼叫端：針灸會傳 staff_member_ids；內科傳 None）
+    # staff：針灸才一定需要；內科若不想指定，就讓它 None
+    # （目前呼叫端：針灸會傳 staff_member_ids；內科傳 None）
     final_staff_ids = staff_member_ids  # 不再 fallback 成 demo staff，避免內科/針灸 business 不相容
 
 
@@ -938,7 +937,6 @@ def get_available_acu_slots_for_date(date_str: str) -> list[str]:
                 s = s.split(".", 1)[0]
             utc_dt = datetime.fromisoformat(s)
             local_dt = utc_dt + timedelta(hours=8)
-            hhmm = local_dt.strftime("%H:%M")
         except Exception:
             continue
 
@@ -1007,7 +1005,7 @@ def get_available_acu_slots_for_date(date_str: str) -> list[str]:
 #     _add_booked(appts_bed1, "bed1")
 #     _add_booked(appts_bed2, "bed2")
 
-#     # === DEBUG LOG（你想看的我全部放這裡）===
+#     # === DEBUG LOG===
 #     app.logger.info(f"[acu_slots] date={date_str} day_map_keys={sorted(list(day_map.keys()))}")
 #     app.logger.info(f"[acu_slots] booked bed1={sorted(list(booked_by_bed['bed1']))}")
 #     app.logger.info(f"[acu_slots] booked bed2={sorted(list(booked_by_bed['bed2']))}")

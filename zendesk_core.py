@@ -93,7 +93,7 @@ def check_acupuncture_eligibility_from_zendesk(line_user_id: str):
     """
     回傳：(ok: bool, missing_titles: list[str], user: dict|None)
     - ok=True：三個 checkbox 都 True
-    - missing_titles：缺少的資格文案（給你直接組訊息）
+    - missing_titles：缺少的資格文案
     """
     try:
         count, user = search_zendesk_user_by_line_id(line_user_id, retries=1)
@@ -352,7 +352,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         user_payload["external_id"] = line_user_id
         user_fields = user.get("user_fields") or {}
 
-        # 確保 line_user_id 有寫回去（雖然 fieldvalue 已經能查到，但你欄位還是要正確）
+        # 確保 line_user_id 有寫回去（雖然 fieldvalue 已經能查到，但欄位還是要正確）
         if line_user_id:
             user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
         if profile_status is not None:
@@ -412,7 +412,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         app.logger.info(f"[upsert_zendesk_user_basic_profile] 建立新 user 成功 id={created.get('id')}")
         return created
     except Exception as e:
-        # ✅ 422 自救：外部 id 可能已存在（你前面 search 剛好沒抓到）
+        # 422 自救：外部 id 可能已存在（前面 search 剛好沒抓到）
         try:
             status = getattr(resp, "status_code", None)
             body = getattr(resp, "text", "")[:300]
@@ -429,7 +429,7 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
                 return None
 
             if u2 and u2.get("id"):
-                # ✅ 改走 update（把你原本 update 那段重用）
+                # 改走 update（把原本 update 那段重用）
                 user_id = u2["id"]
                 put_url = f"{base_url}/api/v2/users/{user_id}.json"
 
@@ -683,7 +683,7 @@ def search_zendesk_user_by_line_id(line_user_id: str, retries: int = 3, sleep_se
                 f"uf_profile_status_raw={uf.get('profile_status')}"
             )
 
-            # ✅ 成功就回傳（不重試）
+            # 成功就直接回傳（不重試）
             if attempt > 1:
                 app.logger.info(
                     f"[ZD_SEARCH][RETRY_SUCCESS] external_id={line_user_id} attempt={attempt}/{tries}"
@@ -700,7 +700,7 @@ def search_zendesk_user_by_line_id(line_user_id: str, retries: int = 3, sleep_se
                 time.sleep(sleep_sec)
             continue
 
-        # 已最後一次仍找不到
+        # 已最後一次仍找不到就先這樣了
         return 0, None
 
 
@@ -828,7 +828,7 @@ def find_zendesk_ticket_by_booking_id(booking_id):
     base_url, headers = _build_zendesk_headers()
 
     # 這裡用 custom_field_<ticket_field_id>:<value> 的新寫法
-    # ZENDESK_CF_BOOKING_ID 是你的 ticket field id（例如 14459987905295）
+    # ZENDESK_CF_BOOKING_ID 是的 ticket field id（例如 14459987905295）
     field_key = "custom_field_%s" % ZENDESK_CF_BOOKING_ID
 
     # booking_id 裡面有 = 等字元，包成雙引號比較安全
@@ -1494,7 +1494,7 @@ def mark_zendesk_ticket_voice_succeeded(
     webhook 回來後更新 Zendesk（success）：
     - 防重送：同 call_id 只處理一次
     - reminder_state = SUCCESS
-    - ticket status = solved（你要不要 solved 都行，但 success 通常就可以 solved）
+    - ticket status = solved（要不要 solved 都行，但 success 通常就可以 solved）
     - attempts + 1
     - last_voice_attempt_date / last_call_id
     - internal note 留存
@@ -1639,7 +1639,7 @@ def run_fail_queued_tickets(*, days: int = 1, min_attempts: int = 3, dry_run: bo
     """
     target_date = (datetime.now().date() + timedelta(days=days)).strftime("%Y-%m-%d")
 
-    # 直接復用你現成的搜尋：撈 reminder_state=queued 的票
+    # 直接復用現成的搜尋：撈 reminder_state=queued 的票
     tickets = search_zendesk_tickets_for_voice_reminder(state=ZENDESK_REMINDER_STATE_QUEUED) or []
 
     checked = 0

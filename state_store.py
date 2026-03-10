@@ -79,4 +79,4 @@ def acquire_lock(key: str, ttl_sec: int = 30) -> bool:
         return ok
     except Exception as e:
         print(f"[LOCK] EXC key={key} err={repr(e)} -> allow", flush=True)  # ✅線上抓證據用
-        return True  # 跟你原策略一致：Redis 掛了就放行
+        return True  # Redis 掛了就放行

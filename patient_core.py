@@ -57,7 +57,7 @@ def get_future_appointments_for_line_user(line_user_id: str, max_days: int = 30)
     end_local = now_local + timedelta(days=max_days)
     app.logger.info(f"[get_future_for_line] 查詢範圍：{now_local} ~ {end_local}, line_user_id={line_user_id}")
 
-    # ✅ ③ 一次查多個 business（門診 + 針灸）
+    # ③ 一次查多個 business（門診 + 針灸）
     business_ids = []
     if BOOKINGS_BUSINESS_CLINIC_ID:
         business_ids.append(("clinic", BOOKINGS_BUSINESS_CLINIC_ID))
@@ -162,7 +162,7 @@ def get_future_appointments_for_line_user(line_user_id: str, max_days: int = 30)
 
 #     try:
 #         for biz in biz_ids:
-#             sub = list_appointments_for_range(now_local, end_local, business_id=biz)  # ✅ 你缺的就是這個
+#             sub = list_appointments_for_range(now_local, end_local, business_id=biz)  # 補上
 #             app.logger.info(f"[get_future_for_line] business_id={biz} 取得 {len(sub)} 筆 appointments")
 #             for a in sub:
 #                 aid = (a.get("id") or "").strip()
@@ -221,7 +221,7 @@ def get_next_upcoming_appointment_for_line_user(line_user_id: str, max_days: int
     """
     依照 LINE userId 找「未來最近一筆」屬於他的預約。
 
-    ✅ 現在內部改成呼叫 get_future_appointments_for_line_user，
+    現在內部改成呼叫 get_future_appointments_for_line_user，
       但對外行為不變：回傳 (appt, local_start) 或 (None, None)
     """
     matched = get_future_appointments_for_line_user(line_user_id, max_days=max_days)
@@ -243,8 +243,8 @@ def is_registered_patient(line_user_id: str) -> bool:
         count, user = search_zendesk_user_by_line_id(line_user_id)
     except Exception as e:
         app.logger.error(f"[is_registered_patient] 查詢 Zendesk 失敗: {e}")
-        # 查詢失敗不要硬說未建檔，避免流程最後一刻打回
-        # 這裡建議回 False，但要搭配呼叫端顯示「系統查詢異常，請稍後再試」
+        # 查詢失敗不硬回未建檔
+        # 這裡回 False，搭配顯示「系統查詢異常，請稍後再試」
         return False
 
     # count>0 但 user=None → 這是「查詢異常」，不是「未建檔」
@@ -255,7 +255,7 @@ def is_registered_patient(line_user_id: str) -> bool:
     if count < 1 or not user:
         return False
 
-    # 統一標準：要能預約 = name + phone 都有（避免半套資料混入預約流程）
+    # 統一標準：要能預約 = name + phone 都有（避免半成品資料混入預約流程）
     name = (user.get("name") or "").strip()
     phone = (user.get("phone") or "").strip()
 

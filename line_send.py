@@ -662,7 +662,7 @@ def send_line(
 # from linebot.v3.messaging import ReplyMessageRequest, PushMessageRequest
 
 # # 用 Redis 做 push guard（避免同一事件一直拼 push）
-# # 你專案裡應該已經有 queue_core.redis_conn
+# # 專案裡已經有 queue_core.redis_conn
 # from queue_core import redis_conn
 
 
@@ -670,7 +670,7 @@ def send_line(
 
 
 # def _guard_key(to_id: str, label: str) -> str:
-#     # label 也放進 key，避免不同訊息互相影響；你也可以改成只用 to_id 做全域 guard
+#     # label 也放進 key，避免不同訊息互相影響；也可以改成只用 to_id 做全域 guard
 #     safe_label = (label or "send").replace(" ", "_")
 #     return f"{PUSH_GUARD_PREFIX}{to_id}:{safe_label}"
 
@@ -719,9 +719,9 @@ def send_line(
 
 # def _event_to_to_id(event) -> str:
 #     """
-#     你原本應該就有這個邏輯：
+#     原本應該就有這個邏輯：
 #     - MessageEvent / PostbackEvent: event.source.user_id
-#     - 群組/聊天室可用 group_id/room_id（看你業務需求）
+#     - 群組/聊天室可用 group_id/room_id（看業務需求）
 #     """
 #     src = getattr(event, "source", None)
 #     if not src:
@@ -753,7 +753,7 @@ def send_line(
 #     """
 #     機制（講人話）：
 #     1) 先 reply（省訊息、體驗好）
-#     2) 若 reply “timeout” 才考慮 push（因 reply 可能其實送成功但你沒收到 response）
+#     2) 若 reply “timeout” 才考慮 push（因 reply 可能其實送成功但沒收到 response）
 #     3) push 前先用 Redis guard 擋：避免一直拼 push 洗版/燒 quota
 #     """
 #     t0 = time.time()
@@ -861,7 +861,7 @@ def send_line(
 # #     """
 # #     - 先 reply（一定帶 _request_timeout）
 # #     - 只有 timeout 才 fallback push
-# #     - 非 timeout：只 log（讓你修 bug / 修 token）
+# #     - 非 timeout：只 log（修 bug / 修 token）
 # #     """
 # #     t0 = time.time()
 # #     req = ReplyMessageRequest(reply_token=event.reply_token, messages=messages)

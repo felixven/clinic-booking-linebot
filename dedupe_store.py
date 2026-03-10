@@ -3,7 +3,7 @@ import hashlib
 import sys
 from queue_core import redis_conn
 
-PREFIX = "linebot:dedupe:webhook:"   # ✅ 跟你 linebot:pending: 同風格
+PREFIX = "linebot:dedupe:webhook:"   # 跟 linebot:pending: 同風格
 DEFAULT_TTL_SEC = 6 * 60 * 60        # 6 小時（可調 1~6 小時）
 
 def _key(key_id: str) -> str:
@@ -36,11 +36,11 @@ def check_and_mark_webhook(*, evt_id=None, msg_id=None, evt_ts=None, body="", tt
     k = _key(key_id)
 
     try:
-        # ✅ SET NX EX：不存在才寫入，並設定 TTL
+        # SET NX EX：不存在才寫入，並設定 TTL
         ok = redis_conn.set(k, "1", nx=True, ex=ttl_sec)
         return True if ok else False
     except Exception as e:
-        # ✅ 你要印出來：這裡會直接看到是不是 Redis 連線/timeout
+        # 這裡印出來會直接看到是不是 Redis 連線/timeout
         print(f"[DEDUPE_EX] evt_id={evt_id} msg_id={msg_id} err={repr(e)}", file=sys.stderr, flush=True)
         return None
 
@@ -56,7 +56,7 @@ def check_and_mark_webhook(*, evt_id=None, msg_id=None, evt_ts=None, body="", tt
 #     k = _key(key_id)
 
 #     try:
-#         # ✅ SET NX EX：不存在才寫入，並設定 TTL
+#         #  SET NX EX：不存在才寫入，並設定 TTL
 #         ok = redis_conn.set(k, "1", nx=True, ex=ttl_sec)
 #         return True if ok else False
 #     except Exception:

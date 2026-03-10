@@ -82,7 +82,7 @@ def reply_consent_input(*, line_bot_api, event, title: str, text: str, ok_data: 
         title=title,
         text=text,
         actions=[
-            PostbackAction(label="好的，我要開始輸入", data=ok_data),
+            PostbackAction(label="開始輸入", data=ok_data),
             PostbackAction(label="取消預約", data=cancel_data),
         ],
     )
@@ -98,7 +98,7 @@ def enter_input_step(*, line_bot_api, event, line_user_id: str, step: str, promp
     進入某個輸入 step，並立刻回一則文字提示「可以開始輸入」。
     狀態改存 Redis（state_store），不再用記憶體 dict。
     """
-    # ✅ 先拿舊 state，避免把 zendesk_user_id / phone 蓋掉
+    # 先拿舊 state，避免把 zendesk_user_id / phone 蓋掉
     prev = get_state(line_user_id) or {}
 
     new_state = dict(prev)
@@ -170,7 +170,7 @@ def to_local_date(dt: datetime) -> date:
     return dt.date()
 
 def can_confirm(appt_local_dt: datetime, today: date | None = None) -> bool:
-    today = today or date.today()  # 伺服器在台灣就OK；不然你就用台灣時區的 today
+    today = today or date.today()  # 伺服器在台灣就OK；不然就用台灣時區的 today
     appt_date = to_local_date(appt_local_dt)
     return today >= (appt_date - timedelta(days=CONFIRM_OPEN_DAYS_BEFORE))
 

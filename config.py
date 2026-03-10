@@ -14,6 +14,7 @@ BOOKINGS_BUSINESS_ACU_BED1_ID = os.getenv("BOOKINGS_BUSINESS_ACU_BED1_ID")
 BOOKINGS_BUSINESS_ACU_BED2_ID = os.getenv("BOOKINGS_BUSINESS_ACU_BED2_ID") 
 
 BOOKINGS_SERVICE_ACU_BED_ID=os.getenv("BOOKINGS_SERVICE_ACU_BED_ID") 
+
 # === Bookings service ids（針灸分床）===
 BOOKINGS_SERVICE_ACU_BED1_ID = os.getenv("BOOKINGS_SERVICE_ACU_BED1_ID") 
 # 針灸（一床）
@@ -128,6 +129,15 @@ SPECIAL_CLOSED_DATES = {
     "2026-02-21": "春節休診",
     "2026-02-27": "和平紀念日",
     "2026-02-28": "和平紀念日",
+    "2026-04-04": "清明節",
+    "2026-04-05": "清明節",
+    "2026-04-06": "清明節",
+    "2026-05-01": "勞動節",
+    "2026-06-19": "端午節",
+    "2026-09-25": "中秋節",
+    "2026-09-28": "教師節",
+    "2026-10-10": "國慶日",
+    "2026-12-25": "行憲紀念日",
 }
 
 CLOSED_WEEKDAYS = {2, 6}  # 週三、週日
@@ -137,8 +147,6 @@ CLINIC_MORNING_START = "09:00"
 CLINIC_MORNING_END   = "12:20"
 CLINIC_EVENING_START = "16:30"
 CLINIC_EVENING_END   = "19:50"
-
-
 
 
 SLOT_INTERVAL_MINUTES = SLOT_MINUTES
@@ -170,8 +178,8 @@ CLINIC_OPEN = {
     6: {"am": False, "pm": False},  # 週日休
 }
 
-# ✅ 人數上限（兩種做法擇一）
-# A) 直接設上限（最符合你說的“config調整”）
+# 人數上限（兩種做法擇一）
+# A) 直接設上限（可以調整）
 CLINIC_CAPACITY = {"am": 20, "pm": 20}
 
 # 或 B) 不寫死上限，改用「時段窗 / slot分鐘」自動算出總格數（更不容易忘記改）
@@ -239,7 +247,7 @@ ACU_SLOTS_BY_WEEKDAY = {
 }
 
 
-# 針灸相關 serviceId（你之後若分床1/床2，就把兩個都放進去）
+# 針灸相關 serviceId（若分床1/床2，就把兩個都放進去）
 ACU_SERVICE_IDS = {
     BOOKINGS_SERVICE_ACU_BED1_ID,
     BOOKINGS_SERVICE_ACU_BED2_ID

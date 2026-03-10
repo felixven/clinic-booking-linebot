@@ -218,13 +218,13 @@ def pick_first_available_clinic_time(date_str: str, period: str, business_id: st
     period: "morning" 或 "evening"
     回傳該 date_str 在該時段第一個可預約 HH:MM；如果沒有回 None
     """
-    # slots = get_available_slots_for_date(date_str, business_id=business_id)  # 你原本就有
+    # slots = get_available_slots_for_date(date_str, business_id=business_id)  # 原本就有
     slots = sorted(get_available_slots_for_date(date_str, business_id=business_id) or [])#改成有排序的
     if not slots:
         return None
 
     if period == "morning":
-        # 你門診早上最晚能約到 12:20（你常數 MORNING_END）
+        # 門診早上最晚能約到 12:20（常數 MORNING_END）
         for hhmm in slots:
             if hhmm < AFTERNOON_START:   # 16:30 前都算早上區間（簡單粗暴但有效）
                 return hhmm
@@ -321,7 +321,7 @@ def show_dates_for_week(offset: int, event: MessageEvent, line_user_id: str = No
         app.logger.info(f"[show_week] date={date_str} ok slots_count={len(slots)} first_slots={slots[:5]}")
 
         mmdd = d.strftime("%m/%d")
-        weekday_label = WEEKDAY_ZH[d.weekday()]  # 你自己決定 WEEKDAY_ZH 要不要含「週」
+        weekday_label = WEEKDAY_ZH[d.weekday()]  
         title = f"週{weekday_label}（{mmdd}）"
 
         columns.append(
@@ -434,7 +434,7 @@ def show_dates_for_week(offset: int, event: MessageEvent, line_user_id: str = No
 #             if booking_type == "acupuncture":
 #                 slots = get_available_acu_slots_for_date(date_str)
 #             else:
-#                 # 你「一般內科」那個 business id 要自己帶進去
+#                 # 「一般內科」那個 business id 要自己帶進去
 #                 slots = get_available_slots_for_date(date_str, business_id=BOOKINGS_BUSINESS_CLINIC_ID)
 #         except Exception as e:
 #             app.logger.error(f"[show_week] date={date_str} get_slots_failed err={repr(e)}")
@@ -599,7 +599,7 @@ def build_slots_carousel(date_str: str, slots: list[str]) -> TemplateMessage:
         target_date = datetime.now().date()
     display_date = target_date.strftime("%Y/%m/%d")
 
-    # === 一、照你原本的方式，把時段塞進 columns ===
+    # === 一、原本的方式，把時段塞進 columns ===
     for i in range(0, len(slots_for_display), BUTTONS_PER_COLUMN):
         chunk = slots_for_display[i:i+BUTTONS_PER_COLUMN]
 

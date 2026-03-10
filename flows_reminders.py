@@ -107,7 +107,7 @@ def send_line_reminder(line_user_id: str, appt: dict):
         app.logger.warning("[send_line_reminder] appointment 缺 startDateTime")
         return
 
-    # 用你專案裡既有的 helper 轉成台灣時間（或診所當地時間）
+    # 用專案裡既有的 helper 轉成台灣時間（或診所當地時間）
     local_dt = parse_booking_datetime_to_local(start_str)
     if not local_dt:
         app.logger.warning("[send_line_reminder] 無法解析預約時間")
@@ -198,7 +198,7 @@ def send_line_reminder(line_user_id: str, appt: dict):
 
 def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
     """
-    群組版推播（路線1核心）：
+    群組版推播：
     - 不再去查 Bookings
     - 直接用 appts（同一個人同一天的一組）組文字 + Carousel
     """
@@ -695,7 +695,7 @@ def run_reminder_check(days_before: int | None = None) -> int:
 #             )
 #             continue
 
-#         # 從 ticket custom fields 拿看診日期（你之前有 ZENDESK_CF_APPOINTMENT_DATE）
+#         # 從 ticket custom fields 拿看診日期（之前有 ZENDESK_CF_APPOINTMENT_DATE）
 #         appt_date_str = _get_ticket_cf_value(ticket, ZENDESK_CF_APPOINTMENT_DATE)
 #         if not appt_date_str:
 #             continue

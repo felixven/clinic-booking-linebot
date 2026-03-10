@@ -14,7 +14,7 @@ def _mask(s: str | None) -> str:
     return f"{s[:4]}...{s[-4:]}(len={len(s)})"
 
 # def build_redis_conn() -> Redis:
-#     # 你也可以用 REDIS_URL，但你現在走 host/port/password 也 OK
+#     # 也可以用 REDIS_URL，但現在走 host/port/password 也 OK
 #     redis_url = os.getenv("REDIS_URL")
 #     if redis_url:
 #         logger.error("[REDIS_ENV] mode=URL REDIS_URL=%s", redis_url)
@@ -46,18 +46,18 @@ def _mask(s: str | None) -> str:
 #         socket_timeout=5,
 #     )
 
-#     # Azure TLS 有時候會卡憑證驗證，先放寬（你也可以日後再收緊）
+#     # Azure TLS 有時候會卡憑證驗證，先放寬（也可以日後再收緊）
 #     if use_ssl:
 #         kwargs["ssl_cert_reqs"] = None
 
-#     # ✅ 只有在你真的設定了 REDIS_USERNAME 才帶 username
+#     # 只有真的設定了 REDIS_USERNAME 才帶 username
 #     if username:
 #         kwargs["username"] = username
 
 #     return Redis(**kwargs)
 
 def build_redis_conn() -> Redis:
-    # 你也可以用 REDIS_URL，但你現在走 host/port/password 也 OK
+    # 也可以用 REDIS_URL，但現在走 host/port/password 也 OK
     redis_url = os.getenv("REDIS_URL")
     if redis_url:
         logger.error("[REDIS_ENV] mode=URL REDIS_URL=%s", redis_url)
@@ -93,25 +93,25 @@ def build_redis_conn() -> Redis:
         password=password,
         ssl=use_ssl,
 
-        # ✅ 建議統一成 True（你 URL 那邊也是 True），避免有時 bytes 有時 str
+        #  建議統一成 True（URL 那邊也是 True），避免有時 bytes 有時 str
         decode_responses=False,
 
-        # ✅ 核心：把 timeout 壓小（Redis 掛掉時 0.3~0.8 秒內就 fail-open）
+        # 核心：把 timeout 壓小（Redis 掛掉時 0.3~0.8 秒內就 fail-open）
         socket_connect_timeout=0.3,
         socket_timeout=0.5,
 
-        # ✅ 不要 retry，避免疊到 20~30 秒
+        # 不要 retry，避免疊到 20~30 秒
         retry_on_timeout=False,
 
-        # ✅ 長連線健康檢查（可留可不留）
+        # 長連線健康檢查（可留可不留）
         health_check_interval=30,
     )
 
-    # Azure TLS 有時候會卡憑證驗證，先放寬（你也可以日後再收緊）
+    # Azure TLS 有時候會卡憑證驗證，先放寬（也可以日後再收緊）
     if use_ssl:
         kwargs["ssl_cert_reqs"] = None
 
-    # ✅ 只有在你真的設定了 REDIS_USERNAME 才帶 username
+    # 只有真的設定了 REDIS_USERNAME 才帶 username
     if username:
         kwargs["username"] = username
 
