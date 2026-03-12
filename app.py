@@ -48,6 +48,7 @@ from bookings_core import (
     extract_zd_user_id_from_service_notes,
     get_available_acu_slots_for_date,
     is_acu_slot_available,
+    has_existing_clinic_period_booking,
     get_available_clinic_slots_for_session
     
 )
@@ -2349,6 +2350,26 @@ def handle_message(event: MessageEvent):
                 label="clinic_period_require_registered",
             )
             return
+        
+        if has_existing_clinic_period_booking(line_user_id, date_str, period):
+            send_line(
+                line_bot_api,
+                event,
+                messages=[
+                    TextMessage(
+                        text="您已預約此時段門診，當天請準時到診所報到。\n\n若要查看已預約內容，請點選下方按鈕。",
+                        quick_reply=QuickReply(
+                            items=[
+                                QuickReplyItem(
+                                    action=MessageAction(label="約診查詢", text="約診查詢")
+                                ),
+                            ]
+                        ),
+                    )
+                ],
+                label="clinic_period_duplicate",
+            )
+            return
 
         start_loading_animation(line_bot_api, line_user_id, loading_seconds=15, timeout=(1, 2))
 
@@ -2716,7 +2737,11 @@ def handle_message(event: MessageEvent):
                                 zendesk_customer_id=zid,
                                 customer_name=customer_name,
                                 booking_service_name="針灸",
-                                appt_category=appt_category
+                                appt_category=appt_category,
+                                booking_type="acupuncture",
+                                business_id=business_id,
+                                line_user_id=line_user_id,
+                                bed=bed,
                             )
                             app.logger.info(
                                 f"[handle_message] 建立預約 Ticket 結果: {ticket_result}"
@@ -3289,7 +3314,11 @@ def handle_postback(event):
                     zendesk_customer_id=zid,
                     customer_name=customer_name,
                     booking_service_name="門診",
-                    appt_category=appt_category
+                    appt_category=appt_category,
+                    booking_type="clinic",
+                    business_id=BOOKINGS_BUSINESS_CLINIC_ID,
+                    line_user_id=line_user_id,
+                    clinic_period=period,
                 )
         except Exception as e:
             app.logger.error(f"[CLINIC_CONFIRM] create_zendesk_ticket failed (non-blocking): {e}")

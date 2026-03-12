@@ -41,6 +41,16 @@ from config import (
     ZENDESK_CF_REMINDER_STATE,
     ZENDESK_CF_BOOKING_ID,
     REMINDER_DAYS_BEFORE,
+    ZENDESK_CF_BOOKING_BUSINESS_ID,
+    ZENDESK_CF_BOOKING_TYPE,
+    BOOKINGS_BUSINESS_ACU_ID,
+    BOOKINGS_BUSINESS_CLINIC_ID,
+    ZENDESK_CF_APPT_CATEGORY,
+    ZENDESK_APPT_CATEGORY_ACU_BED1,
+    ZENDESK_APPT_CATEGORY_ACU_BED2,
+    BOOKINGS_BUSINESS_ACU_ID,
+    BOOKINGS_BUSINESS_CLINIC_ID,
+    ZENDESK_CF_CLINIC_PERIOD
 )
 
 
@@ -201,6 +211,8 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
     群組版推播：
     - 不再去查 Bookings
     - 直接用 appts（同一個人同一天的一組）組文字 + Carousel
+    - appts 內可包含 process_reminder_group 預先塞入的：
+      _booking_type / _clinic_period
     """
     if not line_user_id:
         app.logger.warning("[send_line_reminder_with_appts] 缺 line_user_id")
@@ -210,14 +222,12 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
         app.logger.warning("[send_line_reminder_with_appts] appts 為空")
         return
 
-    # 用最早的時間排序，顯示比較自然
     def _sort_key(a: dict):
         s = (a.get("startDateTime") or {}).get("dateTime") or ""
         return s
 
     appts_sorted = sorted(appts, key=_sort_key)
 
-    # 取第一筆決定 display_date/稱呼
     first = appts_sorted[0]
     first_start_str = (first.get("startDateTime") or {}).get("dateTime")
     first_local = parse_booking_datetime_to_local(first_start_str) if first_start_str else None
@@ -229,27 +239,49 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
     customer_name = first.get("customerName") or "貴賓"
 
     text_msg = TextMessage(
-         text=(
+        text=(
             f"{customer_name} 您好，\n"
-            f"您在 {display_date} 有以下門診預約：\n"
-            "請點選欲確認的時段進行回診確認。\n\n"
+            f"您在 {display_date} 有以下預約：\n"
+            "請點選欲確認的項目進行回診確認。\n\n"
             "若無法前來，請提前致電診所取消，謝謝！"
         )
     )
 
     columns: list[CarouselColumn] = []
-    
+
     for item in appts_sorted:
+        print(
+            f"[REMINDER_ITEM] id={item.get('id')} "
+            f"serviceName={item.get('serviceName')} "
+            f"booking_type={item.get('_booking_type')} "
+            f"clinic_period={item.get('_clinic_period')}",
+            flush=True
+        )
+
         s_str = (item.get("startDateTime") or {}).get("dateTime")
         s_local = parse_booking_datetime_to_local(s_str) if s_str else None
         if not s_local:
             continue
 
-        time_str = s_local.strftime("%H:%M")
-        svc_name = item.get("serviceName") or "門診"
+        display_time = s_local.strftime("%H:%M")
         appt_id = item.get("id", "")
+        btype = (item.get("_booking_type") or "clinic").strip().lower()
+        clinic_period = (item.get("_clinic_period") or "").strip().lower()
 
-        col_text = f"{time_str} {svc_name}"
+        if btype == "clinic":
+            if clinic_period == "morning":
+                period_label = "早診"
+            elif clinic_period == "evening":
+                period_label = "晚診"
+            else:
+                # fallback：舊資料沒 clinic_period 時，用時間推
+                period_label = "早診" if s_local.hour < 12 else "晚診"
+
+            col_text = f"【門診】{display_date}（{period_label}）"
+            display_text = f"確認回診 {display_date} {period_label}"
+        else:
+            col_text = f"【針灸】{display_date} {display_time}"
+            display_text = f"確認回診 {display_date} {display_time}"
 
         columns.append(
             CarouselColumn(
@@ -258,7 +290,7 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
                     PostbackAction(
                         label="確認回診",
                         data=f"CONFIRM_APPT:{appt_id}",
-                        display_text=f"確認回診 {display_date} {time_str}",
+                        display_text=display_text,
                     )
                 ],
             )
@@ -291,6 +323,226 @@ def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
     app.logger.info(
         f"[send_line_reminder_with_appts] 已推播 line_user_id={line_user_id} date={display_date} count={len(columns)}"
     )
+
+# def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
+#     """
+#     群組版推播：
+#     - 不再去查 Bookings
+#     - 直接用 appts（同一個人同一天的一組）組文字 + Carousel
+#     - appts 內可包含 process_reminder_group 預先塞入的：
+#       _booking_type / _clinic_period
+#     """
+#     if not line_user_id:
+#         app.logger.warning("[send_line_reminder_with_appts] 缺 line_user_id")
+#         return
+
+#     if not appts:
+#         app.logger.warning("[send_line_reminder_with_appts] appts 為空")
+#         return
+
+#     def _sort_key(a: dict):
+#         s = (a.get("startDateTime") or {}).get("dateTime") or ""
+#         return s
+
+#     appts_sorted = sorted(appts, key=_sort_key)
+
+#     first = appts_sorted[0]
+#     first_start_str = (first.get("startDateTime") or {}).get("dateTime")
+#     first_local = parse_booking_datetime_to_local(first_start_str) if first_start_str else None
+#     if not first_local:
+#         app.logger.warning("[send_line_reminder_with_appts] 無法解析第一筆預約時間")
+#         return
+
+#     display_date = first_local.strftime("%Y/%m/%d")
+#     customer_name = first.get("customerName") or "貴賓"
+
+#     text_msg = TextMessage(
+#         text=(
+#             f"{customer_name} 您好，\n"
+#             f"您在 {display_date} 有以下預約：\n"
+#             "請點選欲確認的項目進行回診確認。\n\n"
+#             "若無法前來，請提前致電診所取消，謝謝！"
+#         )
+#     )
+
+#     columns: list[CarouselColumn] = []
+
+#     for item in appts_sorted:
+#         print(
+#             f"[REMINDER_ITEM] id={item.get('id')} "
+#             f"serviceName={item.get('serviceName')} "
+#             f"booking_type={item.get('_booking_type')} "
+#             f"clinic_period={item.get('_clinic_period')}",
+#             flush=True
+#         )
+
+#         s_str = (item.get("startDateTime") or {}).get("dateTime")
+#         s_local = parse_booking_datetime_to_local(s_str) if s_str else None
+#         if not s_local:
+#             continue
+
+#         display_time = s_local.strftime("%H:%M")
+#         appt_id = item.get("id", "")
+#         btype = (item.get("_booking_type") or "clinic").strip().lower()
+#         clinic_period = (item.get("_clinic_period") or "").strip().lower()
+
+#         if btype == "clinic":
+#             if clinic_period == "morning":
+#                 period_label = "早診"
+#             elif clinic_period == "evening":
+#                 period_label = "晚診"
+#             else:
+#                 # fallback：舊資料沒 clinic_period 時，用時間推
+#                 period_label = "早診" if s_local.hour < 12 else "晚診"
+
+#             col_text = f"【門診】{display_date}（{period_label}）"
+#             display_text = f"確認回診 {display_date} {period_label}"
+#         else:
+#             col_text = f"【針灸】{display_date} {display_time}"
+#             display_text = f"確認回診 {display_date} {display_time}"
+
+#         columns.append(
+#             CarouselColumn(
+#                 text=col_text[:120],
+#                 actions=[
+#                     PostbackAction(
+#                         label="確認回診",
+#                         data=f"CONFIRM_APPT:{appt_id}",
+#                         display_text=display_text,
+#                     )
+#                 ],
+#             )
+#         )
+
+#     if not columns:
+#         line_bot_api.push_message(
+#             PushMessageRequest(
+#                 to=line_user_id,
+#                 messages=[text_msg],
+#             )
+#         )
+#         app.logger.info(
+#             f"[send_line_reminder_with_appts] 只有文字提醒 line_user_id={line_user_id} date={display_date}"
+#         )
+#         return
+
+#     carousel_msg = TemplateMessage(
+#         alt_text="回診提醒",
+#         template=CarouselTemplate(columns=columns),
+#     )
+
+#     line_bot_api.push_message(
+#         PushMessageRequest(
+#             to=line_user_id,
+#             messages=[text_msg, carousel_msg],
+#         )
+#     )
+
+#     app.logger.info(
+#         f"[send_line_reminder_with_appts] 已推播 line_user_id={line_user_id} date={display_date} count={len(columns)}"
+#     )
+
+# def send_line_reminder_with_appts(line_user_id: str, appts: list[dict]):
+#     """
+#     群組版推播：
+#     - 不再去查 Bookings
+#     - 直接用 appts（同一個人同一天的一組）組文字 + Carousel
+#     """
+#     if not line_user_id:
+#         app.logger.warning("[send_line_reminder_with_appts] 缺 line_user_id")
+#         return
+
+#     if not appts:
+#         app.logger.warning("[send_line_reminder_with_appts] appts 為空")
+#         return
+
+#     # 用最早的時間排序，顯示比較自然
+#     def _sort_key(a: dict):
+#         s = (a.get("startDateTime") or {}).get("dateTime") or ""
+#         return s
+
+#     appts_sorted = sorted(appts, key=_sort_key)
+
+#     # 取第一筆決定 display_date/稱呼
+#     first = appts_sorted[0]
+#     first_start_str = (first.get("startDateTime") or {}).get("dateTime")
+#     first_local = parse_booking_datetime_to_local(first_start_str) if first_start_str else None
+#     if not first_local:
+#         app.logger.warning("[send_line_reminder_with_appts] 無法解析第一筆預約時間")
+#         return
+
+#     display_date = first_local.strftime("%Y/%m/%d")
+#     customer_name = first.get("customerName") or "貴賓"
+
+#     text_msg = TextMessage(
+#          text=(
+#             f"{customer_name} 您好，\n"
+#             f"您在 {display_date} 有以下門診預約：\n"
+#             "請點選欲確認的時段進行回診確認。\n\n"
+#             "若無法前來，請提前致電診所取消，謝謝！"
+#         )
+#     )
+
+#     columns: list[CarouselColumn] = []
+    
+#     for item in appts_sorted:
+#         print(
+#             f"[REMINDER_ITEM] id={item.get('id')} "
+#             f"serviceName={item.get('serviceName')} "
+#             f"serviceNotes={item.get('serviceNotes')}",
+#             flush=True
+#         )
+#         s_str = (item.get("startDateTime") or {}).get("dateTime")
+#         s_local = parse_booking_datetime_to_local(s_str) if s_str else None
+#         if not s_local:
+#             continue
+
+#         time_str = s_local.strftime("%H:%M")
+#         svc_name = item.get("serviceName") or "門診"
+#         appt_id = item.get("id", "")
+
+#         col_text = f"{time_str} {svc_name}"
+
+#         columns.append(
+#             CarouselColumn(
+#                 text=col_text[:120],
+#                 actions=[
+#                     PostbackAction(
+#                         label="確認回診",
+#                         data=f"CONFIRM_APPT:{appt_id}",
+#                         display_text=f"確認回診 {display_date} {time_str}",
+#                     )
+#                 ],
+#             )
+#         )
+
+#     if not columns:
+#         line_bot_api.push_message(
+#             PushMessageRequest(
+#                 to=line_user_id,
+#                 messages=[text_msg],
+#             )
+#         )
+#         app.logger.info(
+#             f"[send_line_reminder_with_appts] 只有文字提醒 line_user_id={line_user_id} date={display_date}"
+#         )
+#         return
+
+#     carousel_msg = TemplateMessage(
+#         alt_text="回診提醒",
+#         template=CarouselTemplate(columns=columns),
+#     )
+
+#     line_bot_api.push_message(
+#         PushMessageRequest(
+#             to=line_user_id,
+#             messages=[text_msg, carousel_msg],
+#         )
+#     )
+
+#     app.logger.info(
+#         f"[send_line_reminder_with_appts] 已推播 line_user_id={line_user_id} date={display_date} count={len(columns)}"
+#     )
 
 
 
@@ -523,7 +775,15 @@ def process_reminder_group(
 
         # 1) 先推播一次（只用 items 的 appt 組 carousel）
         try:
-            appts = [appt for (_, appt) in items if appt]
+            appts = []
+            for ticket, appt in items:
+                if not appt:
+                    continue
+
+                appt["_booking_type"] = (_get_ticket_cf_value(ticket, ZENDESK_CF_BOOKING_TYPE) or "").strip().lower()
+                appt["_clinic_period"] = (_get_ticket_cf_value(ticket, ZENDESK_CF_CLINIC_PERIOD) or "").strip().lower()
+                appts.append(appt)
+
             send_line_reminder_with_appts(line_user_id, appts)
         except Exception as e:
             app.logger.error(
@@ -567,7 +827,22 @@ def process_reminder_group(
         )
         return processed
 
+def resolve_business_id_from_ticket(ticket: dict) -> str | None:
+    business_id = (_get_ticket_cf_value(ticket, ZENDESK_CF_BOOKING_BUSINESS_ID) or "").strip()
+    if business_id:
+        return business_id
 
+    booking_type = (_get_ticket_cf_value(ticket, ZENDESK_CF_BOOKING_TYPE) or "").strip().lower()
+    if booking_type == "acupuncture":
+        return BOOKINGS_BUSINESS_ACU_ID
+    if booking_type == "clinic":
+        return BOOKINGS_BUSINESS_CLINIC_ID
+
+    appt_category = (_get_ticket_cf_value(ticket, ZENDESK_CF_APPT_CATEGORY) or "").strip()
+    if appt_category in {ZENDESK_APPT_CATEGORY_ACU_BED1, ZENDESK_APPT_CATEGORY_ACU_BED2}:
+        return BOOKINGS_BUSINESS_ACU_ID
+
+    return BOOKINGS_BUSINESS_CLINIC_ID
 
 
 #好的正式版
@@ -628,7 +903,8 @@ def run_reminder_check(days_before: int | None = None) -> int:
 
         # 2. 找對應的 Bookings appointment
         booking_id = _get_ticket_cf_value(ticket, ZENDESK_CF_BOOKING_ID)
-        appt, local_start = get_appointment_by_id(booking_id)
+        business_id = resolve_business_id_from_ticket(ticket)
+        appt, local_start = get_appointment_by_id(booking_id, business_id)
         if not appt or not local_start:
             continue
 

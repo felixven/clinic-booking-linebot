@@ -111,14 +111,13 @@ def get_available_clinic_slots_for_session(date_str: str, business_id: str, sess
 
     return slots
 
-
 def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
     """
-    將 Bookings 的 startDateTime.dateTime (UTC) 字串轉成「台北時間 datetime」。
+    將 Bookings 的 startDateTime.dateTime (UTC) 字串轉成「台北時間 naive datetime」。
     例如:
-        "2025-11-20T06:00:00Z"
-        "2025-11-20T06:00:00.0000000Z"
-    都會轉成：2025-11-20 14:00:00 (UTC+8)
+        2025-11-20T06:00:00Z
+        2025-11-20T06:00:00.0000000Z
+    -> 2025-11-20 14:00:00
     """
     if not start_dt_str:
         return None
@@ -126,16 +125,17 @@ def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
     try:
         s = start_dt_str.strip()
 
-        # 1) 去掉尾巴的 Z
         if s.endswith("Z"):
             s = s[:-1]
 
-        # 2) 有小數秒就只留到秒
         if "." in s:
             s = s.split(".", 1)[0]
 
-        # 3) 變成 datetime（目前視為 naive UTC）
-        utc_dt = datetime.fromisoformat(s)
+        utc_dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        local_dt = utc_dt.astimezone(ZoneInfo("Asia/Taipei"))
+
+        # 回傳 naive local，避免舊程式比較時炸掉
+        return local_dt.replace(tzinfo=None)
 
     except Exception as e:
         app.logger.error(
@@ -143,9 +143,132 @@ def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
         )
         return None
 
-    # 4) 加上 8 小時變成台北時間（之後真的上線要改成用 tz aware 再說）
-    local_dt = utc_dt + timedelta(hours=8)
-    return local_dt
+# def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
+#     """
+#     將 Bookings 的 startDateTime.dateTime (UTC) 字串轉成台北時間 datetime
+#     例如:
+#         2025-11-20T06:00:00Z
+#         2025-11-20T06:00:00.0000000Z
+#     -> 2025-11-20 14:00:00+08:00
+#     """
+#     if not start_dt_str:
+#         return None
+
+#     try:
+#         s = start_dt_str.strip()
+
+#         # 去掉尾巴 Z
+#         if s.endswith("Z"):
+#             s = s[:-1]
+
+#         # 有小數秒就只留到秒
+#         if "." in s:
+#             s = s.split(".", 1)[0]
+
+#         # 先視為 UTC
+#         utc_dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+
+#         # 轉台北時間
+#         local_dt = utc_dt.astimezone(ZoneInfo("Asia/Taipei"))
+#         return local_dt
+
+#     except Exception as e:
+#         app.logger.error(
+#             f"[parse_booking_datetime_to_local] 解讀 Bookings dateTime 失敗: {start_dt_str}, error: {e}"
+#         )
+#         return None
+    
+def get_clinic_period_from_local_dt(local_dt: datetime | None) -> str | None:
+    if not local_dt:
+        return None
+
+    hhmm = local_dt.strftime("%H:%M")
+
+    if MORNING_START <= hhmm <= MORNING_END:
+        return "morning"
+
+    if AFTERNOON_START <= hhmm <= AFTERNOON_END:
+        return "evening"
+
+    return None
+
+import re
+
+def extract_line_user_id_from_service_notes(service_notes: str) -> str | None:
+    if not service_notes:
+        return None
+
+    m = re.search(r"\[LINE_USER\]\s*(\S+)", service_notes)
+    return m.group(1).strip() if m else None
+
+
+def has_existing_clinic_period_booking(line_user_id: str, date_str: str, period: str) -> bool:
+    """
+    檢查同一病患是否已存在同一天同時段（早/晚）的門診預約
+    """
+    try:
+        appts = list_appointments_for_date(
+            date_str=date_str,
+            business_id=BOOKINGS_BUSINESS_CLINIC_ID,
+        ) or []
+
+        for appt in appts:
+            service_notes = appt.get("serviceNotes") or ""
+            appt_line_user_id = extract_line_user_id_from_service_notes(service_notes)
+
+            if appt_line_user_id != line_user_id:
+                continue
+
+            start_obj = appt.get("startDateTime") or {}
+            start_dt_str = start_obj.get("dateTime")
+            local_dt = parse_booking_datetime_to_local(start_dt_str)
+            appt_period = get_clinic_period_from_local_dt(local_dt)
+
+            if appt_period != period:
+                continue
+
+            return True
+
+        return False
+
+    except Exception as e:
+        app.logger.error(f"[has_existing_clinic_period_booking] error: {e}")
+        return False
+
+# def parse_booking_datetime_to_local(start_dt_str: str) -> datetime | None:
+#     """
+#     將 Bookings 的 startDateTime.dateTime (UTC) 字串轉成「台北時間 datetime」。
+#     例如:
+#         "2025-11-20T06:00:00Z"
+#         "2025-11-20T06:00:00.0000000Z"
+#     都會轉成：2025-11-20 14:00:00 (UTC+8)
+#     """
+#     if not start_dt_str:
+#         return None
+
+#     try:
+#         s = start_dt_str.strip()
+
+#         # 1) 去掉尾巴的 Z
+#         if s.endswith("Z"):
+#             s = s[:-1]
+
+#         # 2) 有小數秒就只留到秒
+#         if "." in s:
+#             s = s.split(".", 1)[0]
+
+#         # 3) 變成 datetime（目前視為 naive UTC）
+#         utc_dt = datetime.fromisoformat(s)
+
+#     except Exception as e:
+#         app.logger.error(
+#             f"[parse_booking_datetime_to_local] 解讀 Bookings dateTime 失敗: {start_dt_str}, error: {e}"
+#         )
+#         return None
+
+#     # 4) 加上 8 小時變成台北時間（之後真的上線要改成用 tz aware 再說）
+#     local_dt = utc_dt + timedelta(hours=8)
+#     return local_dt
 
 # --- 輔助函式：取得指定日期所有預約 (實際呼叫 Graph API) ---
 def list_appointments_for_date(date_str: str, business_id: str) -> list:

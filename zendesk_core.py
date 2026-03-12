@@ -40,7 +40,10 @@ from config import (
     ZENDESK_UF_ACU_OK_3_DOCTOR_APPROVED_KEY,
     ZENDESK_CF_APPT_CATEGORY,
     ZENDESK_CF_VISIT_COMPLETED,
-    ZENDESK_VISIT_COMPLETED_NO
+    ZENDESK_VISIT_COMPLETED_NO,
+    ZENDESK_CF_BOOKING_BUSINESS_ID,
+    ZENDESK_CF_BOOKING_TYPE,
+    ZENDESK_CF_CLINIC_PERIOD
 )
 
 from bookings_core import (
@@ -715,8 +718,13 @@ def create_zendesk_appointment_ticket(
     local_start_dt: datetime,
     zendesk_customer_id: int,
     customer_name: str,
-    booking_service_name: str = "一般門診",
-    appt_category: str = None,
+    booking_service_name: str,
+    appt_category: str | None = None,
+    booking_type: str = "clinic",
+    business_id: str | None = None,
+    line_user_id: str | None = None,
+    clinic_period: str | None = None,
+    bed: str | None = None,
 ):
     """
     在 Zendesk 內建立一個新的 Ticket，作為預約確認提醒的排程觸發點。
@@ -778,7 +786,11 @@ def create_zendesk_appointment_ticket(
         {"id": ZENDESK_CF_REMINDER_ATTEMPTS, "value": 0},
         {"id": ZENDESK_CF_LAST_CALL_ID, "value": ""},
         {"id": ZENDESK_CF_APPT_CATEGORY, "value": appt_category},
+        {"id": ZENDESK_CF_BOOKING_BUSINESS_ID, "value": business_id or ""},
+        {"id": ZENDESK_CF_BOOKING_TYPE, "value": booking_type or "clinic"},
     ]
+    if clinic_period:
+        custom_fields.append({"id": ZENDESK_CF_CLINIC_PERIOD, "value": clinic_period})
 
     payload: dict = {
         "ticket": {
