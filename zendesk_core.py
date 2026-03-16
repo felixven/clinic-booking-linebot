@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
+from line_client import line_bot_api
 
 from config import (
     PROFILE_STATUS_EMPTY,
@@ -43,7 +44,9 @@ from config import (
     ZENDESK_VISIT_COMPLETED_NO,
     ZENDESK_CF_BOOKING_BUSINESS_ID,
     ZENDESK_CF_BOOKING_TYPE,
-    ZENDESK_CF_CLINIC_PERIOD
+    ZENDESK_CF_CLINIC_PERIOD,
+    ZENDESK_CF_LINE_DISPLAY_NAME,
+    ZENDESK_UF_LINE_DISPLAY_NAME_KEY
 )
 
 from bookings_core import (
@@ -330,8 +333,16 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         app.logger.warning("[upsert_zendesk_user_basic_profile] 缺少 line_user_id")
         return None
 
+    line_display_name = None
     try:
-        count, user = search_zendesk_user_by_line_id(line_user_id,retries=1)
+        profile = line_bot_api.get_profile(line_user_id)
+        if profile and hasattr(profile, "display_name"):
+            line_display_name = profile.display_name
+    except Exception as e:
+        app.logger.error(f"[upsert_zendesk_user_basic_profile] get_profile failed: {e}")
+
+    try:
+        count, user = search_zendesk_user_by_line_id(line_user_id, retries=1)
     except Exception as e:
         app.logger.error(f"[upsert_zendesk_user_basic_profile] 搜尋 user 失敗: {e}")
         count, user = 0, None
@@ -355,11 +366,12 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         user_payload["external_id"] = line_user_id
         user_fields = user.get("user_fields") or {}
 
-        # 確保 line_user_id 有寫回去（雖然 fieldvalue 已經能查到，但欄位還是要正確）
         if line_user_id:
             user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
         if profile_status is not None:
             user_fields[ZENDESK_UF_PROFILE_STATUS_KEY] = profile_status
+        if line_display_name is not None:
+            user_fields[ZENDESK_UF_LINE_DISPLAY_NAME_KEY] = line_display_name
 
         if user_fields:
             user_payload["user_fields"] = user_fields
@@ -378,7 +390,9 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
             app.logger.info(
                 f"[upsert_zendesk_user_basic_profile] 更新 user_id={updated.get('id')} 成功 "
                 f"phone={updated.get('phone')} external_id={updated.get('external_id')} "
-                f"uf_profile_status={uf.get(ZENDESK_UF_PROFILE_STATUS_KEY)} uf_line={uf.get(ZENDESK_UF_LINE_USER_ID_KEY)}"
+                f"uf_profile_status={uf.get(ZENDESK_UF_PROFILE_STATUS_KEY)} "
+                f"uf_line={uf.get(ZENDESK_UF_LINE_USER_ID_KEY)} "
+                f"uf_line_name={uf.get(ZENDESK_UF_LINE_DISPLAY_NAME_KEY)}"
             )
             return updated
         except Exception as e:
@@ -393,10 +407,12 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
     if profile_status is not None:
         user_fields[ZENDESK_UF_PROFILE_STATUS_KEY] = profile_status
+    if line_display_name is not None:
+        user_fields[ZENDESK_UF_LINE_DISPLAY_NAME_KEY] = line_display_name
 
     user_body = {
         "role": "end-user",
-        "external_id": line_user_id, 
+        "external_id": line_user_id,
     }
     if name is not None:
         user_body["name"] = name
@@ -415,7 +431,6 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
         app.logger.info(f"[upsert_zendesk_user_basic_profile] 建立新 user 成功 id={created.get('id')}")
         return created
     except Exception as e:
-        # 422 自救：外部 id 可能已存在（前面 search 剛好沒抓到）
         try:
             status = getattr(resp, "status_code", None)
             body = getattr(resp, "text", "")[:300]
@@ -432,7 +447,6 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
                 return None
 
             if u2 and u2.get("id"):
-                # 改走 update（把原本 update 那段重用）
                 user_id = u2["id"]
                 put_url = f"{base_url}/api/v2/users/{user_id}.json"
 
@@ -442,13 +456,14 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
                 if phone is not None:
                     user_payload["phone"] = phone
 
-                # 注意：如果這筆已經有 external_id，就不用硬塞（但塞同值也OK）
                 user_payload["external_id"] = line_user_id
 
                 user_fields = (u2.get("user_fields") or {})
                 user_fields[ZENDESK_UF_LINE_USER_ID_KEY] = line_user_id
                 if profile_status is not None:
                     user_fields[ZENDESK_UF_PROFILE_STATUS_KEY] = profile_status
+                if line_display_name is not None:
+                    user_fields[ZENDESK_UF_LINE_DISPLAY_NAME_KEY] = line_display_name
                 user_payload["user_fields"] = user_fields
 
                 try:
@@ -723,6 +738,7 @@ def create_zendesk_appointment_ticket(
     booking_type: str = "clinic",
     business_id: str | None = None,
     line_user_id: str | None = None,
+    line_display_name: str | None = None,
     clinic_period: str | None = None,
     bed: str | None = None,
 ):
@@ -788,6 +804,7 @@ def create_zendesk_appointment_ticket(
         {"id": ZENDESK_CF_APPT_CATEGORY, "value": appt_category},
         {"id": ZENDESK_CF_BOOKING_BUSINESS_ID, "value": business_id or ""},
         {"id": ZENDESK_CF_BOOKING_TYPE, "value": booking_type or "clinic"},
+        {"id": ZENDESK_CF_LINE_DISPLAY_NAME, "value": line_display_name or ""},
     ]
     if clinic_period:
         custom_fields.append({"id": ZENDESK_CF_CLINIC_PERIOD, "value": clinic_period})

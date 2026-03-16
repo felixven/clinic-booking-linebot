@@ -129,6 +129,7 @@ def health_check():
 from config import (
     ZENDESK_UF_LINE_USER_ID_KEY,
     ZENDESK_UF_PROFILE_STATUS_KEY,
+    ZENDESK_UF_LINE_DISPLAY_NAME_KEY,
     PROFILE_STATUS_NEED_PHONE,
     PROFILE_STATUS_COMPLETE,
     PROFILE_STATUS_NEED_NAME,
@@ -934,6 +935,15 @@ def handle_message(event: MessageEvent):
 
             phone = (state.get("phone") or "").strip()
             # 更新 Zendesk：name + profile_status=complete（手機已經有了）
+            line_display_name = None
+            try:
+                profile = line_bot_api.get_profile(line_user_id_for_state)
+                if profile and hasattr(profile, "display_name"):
+                    line_display_name = profile.display_name
+            except Exception as e:
+                app.logger.error(f"[ASK_NAME_AFTER_PHONE] get_profile failed: {e}")
+
+            # 更新 Zendesk：name + profile_status=complete（手機已經有了）
             base_url, headers = _build_zendesk_headers()
             url = f"{base_url}/api/v2/users/{zendesk_user_id}.json"
             
@@ -949,6 +959,7 @@ def handle_message(event: MessageEvent):
                             if is_valid_name(name)
                             else PROFILE_STATUS_NEED_NAME
                         ),
+                        ZENDESK_UF_LINE_DISPLAY_NAME_KEY: line_display_name or "",
                     },
                 }
             }
@@ -992,11 +1003,11 @@ def handle_message(event: MessageEvent):
                 "已為您完成基本資料建檔\n"
                 f"姓名：{name}\n"
                 f"手機：{phone_display}\n\n"
-                "接下來請選擇要預約的日期範圍："
+                "請問您想預約什麼項目？"
             )
 
             print(f"[ASK_NAME_AFTER_PHONE] before_reply_date_range uid={line_user_id_for_state}", flush=True)
-            reply_date_range_buttons(event, info_text)
+            reply_booking_type_buttons(event, info_text)
             print(f"[ASK_NAME_AFTER_PHONE] after_reply_date_range uid={line_user_id_for_state}", flush=True)
             return
 
@@ -1053,6 +1064,14 @@ def handle_message(event: MessageEvent):
             base_url, headers = _build_zendesk_headers()
             url = f"{base_url}/api/v2/users/{zendesk_user_id}.json"
 
+            line_display_name = None
+            try:
+                profile = line_bot_api.get_profile(line_user_id_for_state)
+                if profile and hasattr(profile, "display_name"):
+                    line_display_name = profile.display_name
+            except Exception as e:
+                app.logger.error(f"[CONFIRM_CLAIM] get_profile failed: {e}")
+
             payload = {
                 "user": {
                     "external_id": line_user_id_for_state,
@@ -1063,6 +1082,7 @@ def handle_message(event: MessageEvent):
                             if is_valid_name(found_name)
                             else PROFILE_STATUS_NEED_NAME
                         ),
+                        ZENDESK_UF_LINE_DISPLAY_NAME_KEY: line_display_name or "",
                     },
                 }
             }
@@ -1571,6 +1591,14 @@ def handle_message(event: MessageEvent):
                 else PROFILE_STATUS_NEED_NAME
             )
 
+            line_display_name = None
+            try:
+                profile = line_bot_api.get_profile(line_user_id_for_state)
+                if profile and hasattr(profile, "display_name"):
+                    line_display_name = profile.display_name
+            except Exception as e:
+                app.logger.error(f"[ASK_PHONE] get_profile failed: {e}")
+
             # 寫進 Zendesk：phone + profile_status=complete
             user = None
             zendesk_user_id = state.get("zendesk_user_id")
@@ -1591,6 +1619,7 @@ def handle_message(event: MessageEvent):
                         "user_fields": {
                             ZENDESK_UF_LINE_USER_ID_KEY: line_user_id_for_state,
                             ZENDESK_UF_PROFILE_STATUS_KEY: profile_status_value,
+                            ZENDESK_UF_LINE_DISPLAY_NAME_KEY: line_display_name or "",
                         },
                     }
                 }
@@ -1667,7 +1696,7 @@ def handle_message(event: MessageEvent):
                 "已為您完成基本資料建檔\n"
                 f"姓名：{name}\n"
                 f"手機：{digits}\n\n"
-                "接下來請選擇要預約的日期範圍："
+                "請問您想預約什麼項目？"
             )
 
             reply_booking_type_buttons(event, info_text)
@@ -2754,6 +2783,7 @@ def handle_message(event: MessageEvent):
                                 booking_type="acupuncture",
                                 business_id=business_id,
                                 line_user_id=line_user_id,
+                                line_display_name=line_display_name,
                                 bed=bed,
                             )
                             app.logger.info(
@@ -3331,6 +3361,7 @@ def handle_postback(event):
                     booking_type="clinic",
                     business_id=BOOKINGS_BUSINESS_CLINIC_ID,
                     line_user_id=line_user_id,
+                    line_display_name=line_display_name,
                     clinic_period=period,
                 )
         except Exception as e:
