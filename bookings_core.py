@@ -7,7 +7,7 @@ import json
 from flask import current_app as app  # 用 app.logger
 
 from config import (
-    BOOKINGS_DEMO_SERVICE_ID,
+    BOOKINGS_SERVICE_CLINIC_ID,
     BOOKINGS_DEMO_STAFF_ID,
     BOOKINGS_BUSINESS_CLINIC_ID,
     SLOT_INTERVAL_MINUTES,
@@ -859,7 +859,7 @@ def create_booking_appointment(
     duration: int = APPOINTMENT_DURATION_MINUTES 
 
     # fallback：沒傳就用原本 demo 常數（不影響流程）
-    final_service_id = service_id or BOOKINGS_DEMO_SERVICE_ID
+    final_service_id = service_id or BOOKINGS_SERVICE_CLINIC_ID
 
     # staff：針灸才一定需要；內科若不想指定，就讓它 None
     # （目前呼叫端：針灸會傳 staff_member_ids；內科傳 None）

@@ -125,9 +125,20 @@ def enter_input_step(*, line_bot_api, event, line_user_id: str, step: str, promp
     )
 
 def reply_acu_terms_buttons(line_bot_api, event):
+    acu_notice_text = (
+        "📍為維護您的權益，請依預約時間準時報到。\n"
+        "📍如需更改時間，請提前一天來電告知。\n"
+        "📍如為第一次接受針灸療程，請於現場簽署針灸同意書。\n"
+        "－－－－－－－－－－\n"
+        "❤️ 溫馨提醒 ❤️\n"
+        "• 請穿著寬鬆上衣及褲子（可攜帶至診所更換）\n"
+        "• 請避免空腹、過飽或過度疲勞，以免暈針\n"
+        "• 如為刺絡療法（放血），請記得攜帶診所開立的拔罐杯及紫雲膏，或可於現場購買"
+    )
+
     buttons_template = ButtonsTemplate(
         title="針灸同意事項",
-        text="為確保療程安排與注意事項已確認，請先閱讀並同意後再進行針灸預約。",
+        text="為確保您已閱讀上述注意事項，請確認是否同意後繼續預約。",
         actions=[
             PostbackAction(
                 label="同意並繼續",
@@ -145,10 +156,15 @@ def reply_acu_terms_buttons(line_bot_api, event):
     send_line(
         line_bot_api,
         event,
-        messages=[TemplateMessage(alt_text="針灸同意事項", template=buttons_template)],
-        label="acu_terms_buttons",
+        messages=[
+            TextMessage(text=acu_notice_text),
+            TemplateMessage(
+                alt_text="針灸同意事項",
+                template=buttons_template
+            ),
+        ],
+        label="acu_terms_with_buttons",
     )
-
 
 # def clear_pending_state(line_user_id: str) -> bool:
 #     """

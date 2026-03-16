@@ -3,7 +3,7 @@ load_dotenv()
 import os
 
 # ======== Booking 相關資料 ========
-BOOKINGS_DEMO_SERVICE_ID = os.getenv("BOOKINGS_DEMO_SERVICE_ID")
+BOOKINGS_SERVICE_CLINIC_ID = os.getenv("BOOKINGS_SERVICE_CLINIC_ID")
 BOOKINGS_DEMO_STAFF_ID = os.getenv("BOOKINGS_DEMO_STAFF_ID")
 
 # === Bookings business ids（針灸分床）===
@@ -257,7 +257,7 @@ ACU_SERVICE_IDS = {
 }
 
 # ======== 診所資料（ ========
-CLINIC_IMAGE_URL = "https://res.cloudinary.com/drbhr7kmb/image/upload/v1763351663/benyamin-bohlouli-B_sK_xgzwVA-unsplash_n6jy9m.jpg"
+CLINIC_IMAGE_URL = "https://res.cloudinary.com/drbhr7kmb/image/upload/v1773294806/518276842_1259670889504572_582414793845671874_n_kq13ve.jpg"
 CLINIC_NAME = "龍吟中醫診所"
 CLINIC_ADDRESS = "臺中市西屯區青海路二段242之32號"
 CLINIC_LAT = 24.1718527355441

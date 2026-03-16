@@ -1354,7 +1354,7 @@ def search_zendesk_tickets_for_voice_reminder(state: str):
     field_key = f"custom_field_{ZENDESK_CF_REMINDER_STATE}"
     query = (
         f"type:ticket "
-        f"ticket_form_id:{ZENDESK_APPOINTMENT_FORM_ID} "
+        #f"ticket_form_id:{ZENDESK_APPOINTMENT_FORM_ID} "
         f"-status:solved "
         f"{field_key}:{state}"
     )

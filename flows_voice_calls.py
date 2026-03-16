@@ -213,7 +213,7 @@ def process_voice_call_group(line_user_id: str, appt_date_str: str, ticket_ids: 
         patient_name = (user or {}).get("name") or "貴賓"
         phone = extract_phone_from_zendesk_user(user)
     
-        # ✅ 測試模式：強制覆蓋電話（避免用假資料）
+        # 測試模式：強制覆蓋電話（避免用假資料）
         if VOICE_DEMO_MODE and VOICE_TEST_PHONE:
             app.logger.warning(
                 "[VOICE DEMO] override phone %s -> %s",

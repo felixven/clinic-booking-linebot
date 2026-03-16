@@ -147,7 +147,7 @@ from config import (
     BOOKINGS_SERVICE_ACU_BED2_ID,
     BOOKINGS_BUSINESS_CLINIC_ID,
     BOOKINGS_BUSINESS_ACU_ID,
-    BOOKINGS_DEMO_SERVICE_ID,
+    BOOKINGS_SERVICE_CLINIC_ID,
     BOOKINGS_BUSINESS_ACU_BED1_ID,
     BOOKINGS_BUSINESS_ACU_BED2_ID,
     BOOKINGS_SERVICE_ACU_BED_ID,
@@ -301,6 +301,13 @@ def reply_confirm_appt_buttons(*, event, date_str: str, time_str: str):
 #         )
 #     )
 
+def _mask_secret(s: str | None) -> str:
+    if not s:
+        return "None"
+    if len(s) <= 8:
+        return s
+    return f"{s[:4]}...{s[-4:]}"
+
 def _bg_handle_line_webhook(*, body: str, signature: str, req_id: str):
     """
     背景處理 handler.handle，但補齊 Flask 的 app/request context，
@@ -343,6 +350,12 @@ def _bg_handle_line_webhook(*, body: str, signature: str, req_id: str):
                 headers={"X-Line-Signature": signature},
             ):
                 try:
+                    runtime_secret = os.getenv("LINE_CHANNEL_SECRET")
+                    print(
+                        f"[CB_BG_SECRET][{req_id}] runtime_secret={_mask_secret(runtime_secret)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     handler.handle(body, signature)
                 except InvalidSignatureError:
                     print(f"[CB_BAD_SIG][{req_id}]", file=sys.stderr, flush=True)
@@ -769,7 +782,7 @@ def handle_message(event: MessageEvent):
                                             action=MessageAction(label="預約看診", text="預約看診")
                                         ),
                                         QuickReplyItem(
-                                            action=MessageAction(label="取消預約", text="取消預約")
+                                            action=MessageAction(label="取消預約", text="取消")
                                         ),
                                     ]
                                 ),
@@ -2656,7 +2669,7 @@ def handle_message(event: MessageEvent):
                     return
             
             else:
-                service_id = BOOKINGS_DEMO_SERVICE_ID
+                service_id = BOOKINGS_SERVICE_CLINIC_ID
                 business_id = BOOKINGS_BUSINESS_CLINIC_ID
 
             print(f"[ACU_CREATE] uid={line_user_id} type={booking_type} business_id={business_id} service_id={service_id} staff={staff_member_ids} date={date_str} time={time_str}", flush=True)  
@@ -2991,12 +3004,12 @@ def handle_message(event: MessageEvent):
 
     # === 其他訊息（最後 default 回覆） ===
     app.logger.info("非線上約診相關指令，請真人回覆")
-    send_line(
-        line_bot_api,
-        event,
-        messages=[TextMessage(text="非「線上約診」相關訊息，請稍候由專人為您回覆喔！")],
-        label="remind_message",
-    )
+    # send_line(
+    #     line_bot_api,
+    #     event,
+    #     messages=[TextMessage(text="非「線上約診」相關訊息，請稍候由專人為您回覆喔！")],
+    #     label="remind_message",
+    # )
     return
 
 @handler.add(PostbackEvent)
@@ -3263,7 +3276,7 @@ def handle_postback(event):
 
         # 建 Bookings（門診 business/service 用現有常數）
         business_id = BOOKINGS_BUSINESS_CLINIC_ID
-        service_id = BOOKINGS_DEMO_SERVICE_ID  # 目前門診用這個（若有正式 service_id 就換掉）
+        service_id = BOOKINGS_SERVICE_CLINIC_ID  # 目前門診用這個（若有正式 service_id 就換掉）
         staff_member_ids = None
 
         created = create_booking_appointment(
