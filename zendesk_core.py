@@ -46,7 +46,8 @@ from config import (
     ZENDESK_CF_BOOKING_TYPE,
     ZENDESK_CF_CLINIC_PERIOD,
     ZENDESK_CF_LINE_DISPLAY_NAME,
-    ZENDESK_UF_LINE_DISPLAY_NAME_KEY
+    ZENDESK_UF_LINE_DISPLAY_NAME_KEY,
+    ZENDESK_UF_FUTURE_BOOKING_COUNT_KEY,
 )
 
 from bookings_core import (
@@ -79,6 +80,96 @@ def _get_ticket_cf_value(ticket: dict, field_id: int, default=None):
         if cf.get("id") == field_id:
             return cf.get("value")
     return default
+
+
+def _log_ambiguous_zendesk_users(line_user_id: str, users: list[dict]) -> None:
+    ids = [str(u.get("id")) for u in users[:10] if u.get("id")]
+    app.logger.error(
+        f"[ZD_SEARCH][AMBIGUOUS] external_id={line_user_id} count={len(users)} ids={','.join(ids)}"
+    )
+
+
+def get_future_booking_count_from_user(user: dict | None) -> int:
+    if not user:
+        return 0
+
+    user_fields = user.get("user_fields") or {}
+    raw = user_fields.get(ZENDESK_UF_FUTURE_BOOKING_COUNT_KEY)
+
+    if raw in (None, ""):
+        return 0
+
+    try:
+        return max(0, int(raw))
+    except Exception:
+        app.logger.warning(
+            f"[future_booking_count] invalid raw value user_id={user.get('id')} raw={raw!r}"
+        )
+        return 0
+
+
+def get_future_booking_count_by_user_id(user_id: int) -> int:
+    user = get_zendesk_user_by_id(user_id)
+    return get_future_booking_count_from_user(user)
+
+
+def update_future_booking_count(user_id: int, new_count: int) -> dict | None:
+    if not user_id:
+        return None
+
+    try:
+        safe_count = max(0, int(new_count))
+    except Exception:
+        app.logger.error(
+            f"[future_booking_count] invalid new_count user_id={user_id} new_count={new_count!r}"
+        )
+        return None
+
+    user = get_zendesk_user_by_id(user_id)
+    if not user:
+        app.logger.error(f"[future_booking_count] user not found user_id={user_id}")
+        return None
+
+    base_url, headers = _build_zendesk_headers()
+    url = f"{base_url}/api/v2/users/{user_id}.json"
+
+    user_fields = dict(user.get("user_fields") or {})
+    user_fields[ZENDESK_UF_FUTURE_BOOKING_COUNT_KEY] = safe_count
+    payload = {"user": {"user_fields": user_fields}}
+
+    try:
+        resp = requests.put(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        updated = (resp.json() or {}).get("user") or user
+        app.logger.info(
+            f"[future_booking_count] updated user_id={user_id} count={safe_count}"
+        )
+        return updated
+    except Exception as e:
+        app.logger.error(
+            f"[future_booking_count] update failed user_id={user_id} count={safe_count}: {e}"
+        )
+        return None
+
+
+def adjust_future_booking_count(user_id: int, delta: int) -> dict | None:
+    if not user_id:
+        return None
+
+    try:
+        safe_delta = int(delta)
+    except Exception:
+        app.logger.error(
+            f"[future_booking_count] invalid delta user_id={user_id} delta={delta!r}"
+        )
+        return None
+
+    current_count = get_future_booking_count_by_user_id(user_id)
+    next_count = max(0, current_count + safe_delta)
+    app.logger.info(
+        f"[future_booking_count] adjust user_id={user_id} current={current_count} delta={safe_delta} next={next_count}"
+    )
+    return update_future_booking_count(user_id, next_count)
 
 def search_zendesk_users_by_phone(phone_digits: str):
     base_url, headers = _build_zendesk_headers()
@@ -155,11 +246,18 @@ def create_zendesk_user(line_user_id: str, name: str, phone: str):
         return None
 
     # 1) 先搜是否已有使用者
+    count = 0
     try:
         count, existing_user = search_zendesk_user_by_line_id(line_user_id)
     except Exception as e:
         app.logger.error(f"[create_zendesk_user] 搜尋 line_user_id 時發生錯誤: {e}")
         existing_user = None
+
+    if count > 1:
+        app.logger.error(
+            f"[create_zendesk_user] line_user_id={line_user_id} 命中多筆 Zendesk user，停止自動建立/覆寫"
+        )
+        return None
 
     if existing_user:
         app.logger.info(
@@ -350,6 +448,12 @@ def upsert_zendesk_user_basic_profile(line_user_id, name=None, phone=None, profi
     base_url, headers = _build_zendesk_headers()
 
     # ✅ 只要找到任一筆，就 update（不要限制 count==1）
+    if count > 1:
+        app.logger.error(
+            f"[upsert_zendesk_user_basic_profile] line_user_id={line_user_id} 命中多筆 Zendesk user，停止自動更新"
+        )
+        return None
+
     if user and count >= 1:
         user_id = user.get("id")
         if not user_id:
@@ -674,6 +778,9 @@ def search_zendesk_user_by_line_id(line_user_id: str, retries: int = 3, sleep_se
         )
 
         if count >= 1:
+            if count > 1:
+                _log_ambiguous_zendesk_users(line_user_id, users)
+
             # 若多筆：有 phone 優先，其次 updated_at
             def score(u: dict):
                 phone = (u.get("phone") or "").strip()
@@ -741,6 +848,7 @@ def create_zendesk_appointment_ticket(
     line_display_name: str | None = None,
     clinic_period: str | None = None,
     bed: str | None = None,
+    booking_source: str = "line",
 ):
     """
     在 Zendesk 內建立一個新的 Ticket，作為預約確認提醒的排程觸發點。
@@ -765,6 +873,13 @@ def create_zendesk_appointment_ticket(
     base_url, headers = _build_zendesk_headers()
     url: str = f"{base_url}/api/v2/tickets.json"
 
+    existing_ticket = find_zendesk_ticket_by_booking_id(booking_id)
+    if existing_ticket:
+        app.logger.warning(
+            f"[create_zendesk_appointment_ticket] booking_id={booking_id} 已有 ticket_id={existing_ticket.get('id')}"
+        )
+        return {"ticket": existing_ticket}
+
     # ====== 1. 組 subject / body ======
 
     # 依服務項目決定 subject 類型：門診預約 / 針灸預約
@@ -774,19 +889,24 @@ def create_zendesk_appointment_ticket(
         f"【{subject_type}】{customer_name}，將於 "
         f"{local_start_dt.strftime('%Y/%m/%d %H:%M')} 看診"
     )
+    # 來源顯示文字
+    if booking_source == "voice":
+        source_label = "語音預約系統"
+    else:
+        source_label = "LINE Bot"
 
     ticket_body: str = (
-        "這是由 LINE Bot 自動建立的預約提醒 Ticket。\n"
+        f"這是由 {source_label} 自動建立的預約提醒 Ticket。\n"
         "請在 **預約日期前 3 天** 確認此 Ticket 狀態。\n\n"
         "--- 預約資料 ---\n"
         f"Bookings ID: {booking_id}\n"
         f"客戶 ID (Zendesk): {zendesk_customer_id}\n"
-        f"預約時間: {local_start_dt.strftime('%Y/%m/%d %H:%M')}  ～ "
+        f"預約時間: {local_start_dt.strftime('%Y/%m/%d %H:%M')} ～ "
         f"{local_end_dt.strftime('%H:%M')}\n"
         f"預約項目: {booking_service_name}\n\n"
         "--- 提醒流程 ---\n"
         "如果到期時，Bookings 備註內『尚未』顯示 'Confirmed via LINE'，"
-        "則需要通知 LINE Bot 進行回呼確認。"
+        "則需要通知系統進行後續確認。"
     )
 
     # ====== 2. custom_fields ======
@@ -806,18 +926,25 @@ def create_zendesk_appointment_ticket(
         {"id": ZENDESK_CF_BOOKING_TYPE, "value": booking_type or "clinic"},
         {"id": ZENDESK_CF_LINE_DISPLAY_NAME, "value": line_display_name or ""},
     ]
+
     if clinic_period:
         custom_fields.append({"id": ZENDESK_CF_CLINIC_PERIOD, "value": clinic_period})
 
+    # tags 改成依來源區分
+    tags = ["pending_confirmation", "booking_sync"]
+    if booking_source == "voice":
+        tags.append("voice_bot_appointment")
+    else:
+        tags.append("line_bot_appointment")
+
     payload: dict = {
         "ticket": {
-            #  指定使用「預約專用 Form」
             "ticket_form_id": ZENDESK_APPOINTMENT_FORM_ID,
             "subject": ticket_subject,
             "comment": {"body": ticket_body},
             "requester_id": zendesk_customer_id,
             "status": "pending",
-            "tags": ["line_bot_appointment", "pending_confirmation", "booking_sync"],
+            "tags": tags,
             "custom_fields": custom_fields,
         }
     }
@@ -832,6 +959,7 @@ def create_zendesk_appointment_ticket(
         ticket = resp.json().get("ticket", {})
         ticket_id: int = ticket.get("id")
         app.logger.info(f"Zendesk Ticket 建立成功，ID: {ticket_id}")
+        adjust_future_booking_count(zendesk_customer_id, 1)
         return resp.json()
     except requests.exceptions.HTTPError as e:
         app.logger.error(f"Zendesk Ticket 建立失敗，HTTP 錯誤: {e.response.status_code}")
@@ -1757,4 +1885,3 @@ def mark_zendesk_ticket_failed_timeout(*, ticket_id: int, appt_date: str, attemp
     except Exception as e:
         app.logger.error(f"[failed_timeout] PUT failed ticket_id={ticket_id}: {e}")
         return False
-

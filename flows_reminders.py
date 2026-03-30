@@ -904,8 +904,20 @@ def run_reminder_check(days_before: int | None = None) -> int:
         # 2. 找對應的 Bookings appointment
         booking_id = _get_ticket_cf_value(ticket, ZENDESK_CF_BOOKING_ID)
         business_id = resolve_business_id_from_ticket(ticket)
-        appt, local_start = get_appointment_by_id(booking_id, business_id)
+        try:
+            appt, local_start = get_appointment_by_id(booking_id, business_id)
+        except Exception as e:
+            app.logger.error(
+                f"[run_reminder_check] get_appointment_by_id failed "
+                f"ticket_id={ticket_id} booking_id={booking_id!r} business_id={business_id!r} err={e}"
+            )
+            continue
+
         if not appt or not local_start:
+            app.logger.warning(
+                f"[run_reminder_check] skip missing appointment "
+                f"ticket_id={ticket_id} booking_id={booking_id!r} business_id={business_id!r}"
+            )
             continue
 
         # 3. 找 line_user_id（這個是之後分組的 key）
@@ -1137,6 +1149,5 @@ def run_reminder_check(days_before: int | None = None) -> int:
 #     )
 
 #     return processed_groups
-
 
 

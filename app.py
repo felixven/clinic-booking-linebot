@@ -49,7 +49,6 @@ from bookings_core import (
     get_available_acu_slots_for_date,
     is_acu_slot_available,
     has_existing_clinic_period_booking,
-    get_available_clinic_slots_for_session
     
 )
 
@@ -58,10 +57,13 @@ from zendesk_core import (
     search_zendesk_user_by_line_id,
     upsert_zendesk_user_basic_profile,
     create_zendesk_appointment_ticket,
+    adjust_future_booking_count,
+    get_zendesk_ticket_by_id,
     search_zendesk_users_by_phone,
     _build_zendesk_headers,
     run_fail_queued_tickets,
-    check_acupuncture_eligibility_from_zendesk
+    check_acupuncture_eligibility_from_zendesk,
+    get_future_booking_count_from_user,
 )
 
 from patient_core import (
@@ -103,6 +105,18 @@ from utils import (
     reply_acu_terms_buttons
 )
 
+from voice.booking_service import(
+    identify_patient_by_phone,
+    get_clinic_date_options,
+    get_clinic_period_options,
+    create_clinic_booking
+)
+
+from tools_booking_lookup import (
+    find_booking_candidates_for_import,
+    render_find_booking_id_tool,
+)
+
 from state_store import get_state, set_state, clear_state, acquire_lock
 
 from dedupe_store import check_and_mark_webhook
@@ -124,6 +138,66 @@ app = Flask(__name__)
 @app.route("/line-booking", methods=["GET"])
 def health_check():
     return "OK", 200
+
+
+@app.route("/tools/find-booking-id", methods=["GET"])
+def find_booking_id_tool():
+    return render_find_booking_id_tool(), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/api/tools/find-booking-id", methods=["POST"])
+def api_find_booking_id():
+    body = request.get_json(silent=True) or {}
+    booking_type = (body.get("booking_type") or "").strip().lower()
+    date_str = (body.get("date") or "").strip()
+    time_str = (body.get("time") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    patient_name = (body.get("patient_name") or "").strip()
+
+    if booking_type not in {"clinic", "acupuncture"}:
+        return jsonify({"success": False, "reason": "invalid_booking_type"}), 400
+    if not date_str or not time_str:
+        return jsonify({"success": False, "reason": "missing_required_fields"}), 400
+    if not phone and not patient_name:
+        return jsonify({"success": False, "reason": "phone_or_name_required"}), 400
+
+    try:
+        business_id, candidates = find_booking_candidates_for_import(
+            booking_type=booking_type,
+            date_str=date_str,
+            time_str=time_str,
+            phone=phone,
+            patient_name=patient_name,
+        )
+    except Exception as e:
+        app.logger.error(
+            f"[find_booking_id] failed booking_type={booking_type} date={date_str} time={time_str} "
+            f"phone={phone} name={patient_name} err={repr(e)}"
+        )
+        return jsonify({"success": False, "reason": "lookup_failed", "message": str(e)}), 500
+
+    if not candidates:
+        return jsonify({
+            "success": False,
+            "reason": "not_found",
+            "matches": 0,
+            "business_id": business_id,
+        }), 200
+
+    if len(candidates) == 1:
+        return jsonify({
+            "success": True,
+            "matches": 1,
+            **candidates[0],
+        }), 200
+
+    return jsonify({
+        "success": False,
+        "reason": "multiple_matches",
+        "matches": len(candidates),
+        "business_id": business_id,
+        "candidates": candidates,
+    }), 200
 
 
 from config import (
@@ -274,6 +348,23 @@ def reply_confirm_appt_buttons(*, event, date_str: str, time_str: str):
         messages=[TemplateMessage(alt_text="確認預約", template=buttons)],
         label="clinic_confirm_buttons",
     )
+
+def extract_zendesk_user_id_from_service_notes(service_notes: str | None) -> int | None:
+    """
+    從 Bookings serviceNotes 中解析 Zendesk user id
+    例如: "[ZD_USER] 55939294433177"
+    """
+    if not service_notes:
+        return None
+
+    m = re.search(r"\[ZD_USER\]\s*(\d+)", service_notes)
+    if not m:
+        return None
+
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
 
 
@@ -2631,6 +2722,17 @@ def handle_message(event: MessageEvent):
                 try:
                     print(f"[CONFIRM_APPT] before_search_zd uid={line_user_id}", flush=True)
                     zd_count, zd_user = search_zendesk_user_by_line_id(line_user_id)
+                    if zd_count > 1:
+                        app.logger.error(
+                            f"[CONFIRM_APPT] ambiguous Zendesk users uid={line_user_id} count={zd_count}"
+                        )
+                        send_line(
+                            line_bot_api,
+                            event,
+                            messages=[TextMessage(text="目前病患資料綁定異常，為避免預約資料寫錯，請先聯繫診所協助處理。")],
+                            label="confirm_appt_zd_ambiguous",
+                        )
+                        return
                     if zd_user:
                         # Zendesk 裡的 name / phone
                         zd_name = zd_user.get("name") or customer_name
@@ -2639,6 +2741,15 @@ def handle_message(event: MessageEvent):
                         customer_phone = zd_phone
                         # 關鍵：從 Zendesk User 物件中取得 ID
                         zendesk_customer_id = zd_user.get("id")
+                        future_booking_count = get_future_booking_count_from_user(zd_user)
+                        if future_booking_count >= 2:
+                            send_line(
+                                line_bot_api,
+                                event,
+                                messages=[TextMessage(text="您目前已有 2 筆未來預約，如需重新安排，請先取消既有預約後再試。")],
+                                label="confirm_appt_future_booking_limit",
+                            )
+                            return
                     print(f"[CONFIRM_APPT] after_search_zd uid={line_user_id} found={'Y' if zd_user else 'N'}", flush=True)
 
 
@@ -3223,9 +3334,11 @@ def handle_postback(event):
 
         state = get_state(line_user_id) or {}
         step = (state.get("step") or "").strip()
+        state_missing = not bool(state)
         print(f"[PB] CLINIC_CONFIRM state step={step} state={state}", flush=True)
 
-        if step != "wait_confirm_clinic_period":
+        # Redis 掛掉時 get_state() 會回空 dict，這時不要把有效的確認按鈕誤判成過期。
+        if step != "wait_confirm_clinic_period" and not state_missing:
             send_line(
                 line_bot_api,
                 event,
@@ -3233,6 +3346,11 @@ def handle_postback(event):
                 label="clinic_confirm_step_mismatch",
             )
             return
+
+        if state_missing:
+            app.logger.warning(
+                f"[PB] CLINIC_CONFIRM degraded_without_state uid={line_user_id} date={date_str} time={time_str} period={period}"
+            )
         
         # 防重複點擊 / 防重複建立（與「確認預約」共用同邏輯）
         lock_key = f"confirm:clinic:{line_user_id}:{date_str}:{time_str}"
@@ -3290,10 +3408,30 @@ def handle_postback(event):
 
         try:
             zd_count, zd_user = search_zendesk_user_by_line_id(line_user_id)
+            if zd_count > 1:
+                app.logger.error(
+                    f"[CLINIC_CONFIRM] ambiguous Zendesk users uid={line_user_id} count={zd_count}"
+                )
+                send_line(
+                    line_bot_api,
+                    event,
+                    messages=[TextMessage(text="目前病患資料綁定異常，為避免預約資料寫錯，請先聯繫診所協助處理。")],
+                    label="clinic_confirm_zd_ambiguous",
+                )
+                return
             if zd_user:
                 customer_name = zd_user.get("name") or customer_name
                 customer_phone = zd_user.get("phone") or customer_phone
                 zendesk_customer_id = zd_user.get("id")
+                future_booking_count = get_future_booking_count_from_user(zd_user)
+                if future_booking_count >= 2:
+                    send_line(
+                        line_bot_api,
+                        event,
+                        messages=[TextMessage(text="您目前已有 2 筆未來預約，如需重新安排，請先取消既有預約後再試。")],
+                        label="clinic_confirm_future_booking_limit",
+                    )
+                    return
         except Exception as e:
             app.logger.error(f"[CLINIC_CONFIRM] search_zendesk_user_by_line_id failed: {e}")
 
@@ -3607,7 +3745,322 @@ def cron_run_reminder_fail():
     )
     return result, 200
 
+#語音inbound相關
+#identify patient
+@app.route("/voice/identify-patient", methods=["POST"])
+def voice_identify_patient():
+    body = request.get_json(silent=True) or {}
+    phone = body.get("phone", "")
+    flow = body.get("flow", "clinic_booking")
 
+    result = identify_patient_by_phone(phone, flow=flow)
+    return jsonify(result), 200
+
+#get booking options
+@app.route("/voice/get-booking-options", methods=["POST"])
+def voice_get_booking_options():
+    body = request.get_json(silent=True) or {}
+
+    flow = body.get("flow", "clinic_booking")
+    stage = body.get("stage")
+    date_str = body.get("date")
+    page = int(body.get("page", 0))
+
+    print(f"[VOICE_OPTIONS] body={body}", flush=True)
+
+    if flow != "clinic_booking":
+        return jsonify({
+            "success": False,
+            "message": "unsupported_flow",
+            "reason": "only_clinic_booking_supported_in_v1",
+        }), 400
+
+    if stage == "date":
+        options = get_clinic_date_options(page=page, page_size=3)
+        return jsonify({
+            "success": True,
+            "stage": "date",
+            "options": options,
+        }), 200
+
+    if stage == "period":
+        if isinstance(date_str, dict):
+            date_str = date_str.get("text") or date_str.get("value")
+
+        if not date_str:
+            return jsonify({
+                "success": False,
+                "message": "missing_date",
+            }), 400
+
+        options = get_clinic_period_options(date_str=date_str)
+        return jsonify({
+            "success": True,
+            "stage": "period",
+            "option_count": len(options),
+            "options": options,
+        }), 200
+
+    return jsonify({
+        "success": False,
+        "message": "invalid_stage",
+    }), 400
+
+#create booking
+@app.route("/voice/create-booking", methods=["POST"])
+def voice_create_booking():
+    body = request.get_json(silent=True) or {}
+    print(f"[VOICE_CREATE] body={body}", flush=True)
+
+    flow = body.get("flow", "clinic_booking")
+    phone = body.get("phone")
+    date_str = body.get("date")
+    period = body.get("period")
+
+    if isinstance(phone, dict):
+        phone = phone.get("text") or phone.get("value")
+
+    if isinstance(date_str, dict):
+        date_str = date_str.get("text") or date_str.get("value")
+
+    if isinstance(period, dict):
+        period = period.get("text") or period.get("value")
+
+    if flow != "clinic_booking":
+        return jsonify({
+            "success": False,
+            "message": "unsupported_flow"
+        }), 400
+
+    result = create_clinic_booking(
+        phone=phone,
+        date_str=date_str,
+        period=period,
+    )
+
+    return jsonify(result), 200
+
+@app.route("/voice/test-appts", methods=["GET"])
+def voice_test_appts():
+    import json
+
+    date_str = request.args.get("date")
+    appts = list_appointments_for_date(
+        date_str=date_str,
+        business_id=BOOKINGS_BUSINESS_CLINIC_ID
+    )
+
+    print(f"[TEST] appointments count={len(appts)}", flush=True)
+    if appts:
+        print(json.dumps(appts[0], ensure_ascii=False, indent=2), flush=True)
+
+    return jsonify({
+        "count": len(appts),
+        "first": appts[0] if appts else None
+    }), 200
+
+@app.route("/voice/create-zendesk-ticket", methods=["POST"])
+def voice_create_zendesk_ticket():
+    body = request.get_json(silent=True) or {}
+    print(f"[VOICE_ZD] body={body}", flush=True)
+
+    booking_id = body.get("booking_id")
+    service_notes = body.get("service_notes")
+    patient_name = body.get("patient_name")
+    date_str = body.get("date")
+    actual_time = body.get("actual_time")
+    booking_service_name = body.get("booking_service_name", "門診")
+    booking_type = body.get("booking_type", "clinic")
+    clinic_period = body.get("clinic_period")
+    booking_source = body.get("booking_source", "voice")
+
+    if isinstance(booking_id, dict):
+        booking_id = booking_id.get("text") or booking_id.get("value")
+
+    if isinstance(service_notes, dict):
+        service_notes = service_notes.get("text") or service_notes.get("value")
+
+    if isinstance(patient_name, dict):
+        patient_name = patient_name.get("text") or patient_name.get("value")
+
+    if isinstance(date_str, dict):
+        date_str = date_str.get("text") or date_str.get("value")
+
+    if isinstance(actual_time, dict):
+        actual_time = actual_time.get("text") or actual_time.get("value")
+
+    if isinstance(booking_service_name, dict):
+        booking_service_name = booking_service_name.get("text") or booking_service_name.get("value")
+
+    if isinstance(booking_type, dict):
+        booking_type = booking_type.get("text") or booking_type.get("value")
+
+    if isinstance(clinic_period, dict):
+        clinic_period = clinic_period.get("text") or clinic_period.get("value")
+
+    if isinstance(booking_source, dict):
+        booking_source = booking_source.get("text") or booking_source.get("value")
+
+    zendesk_user_id = extract_zendesk_user_id_from_service_notes(service_notes)
+
+    print(f"[VOICE_ZD] service_notes={service_notes}", flush=True)
+    print(f"[VOICE_ZD] zendesk_user_id={zendesk_user_id}", flush=True)
+
+    if not booking_id:
+        return jsonify({
+            "success": False,
+            "message": "missing_booking_id",
+        }), 400
+
+    if not zendesk_user_id:
+        return jsonify({
+            "success": False,
+            "message": "missing_zendesk_user_id",
+            "reason": "zd_user_not_found_in_service_notes",
+        }), 400
+
+    if not patient_name:
+        return jsonify({
+            "success": False,
+            "message": "missing_patient_name",
+        }), 400
+
+    if not date_str:
+        return jsonify({
+            "success": False,
+            "message": "missing_date",
+        }), 400
+
+    if not actual_time:
+        return jsonify({
+            "success": False,
+            "message": "missing_actual_time",
+        }), 400
+
+    try:
+        local_start_dt = datetime.strptime(f"{date_str} {actual_time}", "%Y-%m-%d %H:%M")
+    except Exception as e:
+        app.logger.error(f"[VOICE_ZD] parse local_start_dt failed err={repr(e)}")
+        return jsonify({
+            "success": False,
+            "message": "invalid_date_or_time",
+        }), 400
+
+    result = create_zendesk_appointment_ticket(
+        booking_id=booking_id,
+        local_start_dt=local_start_dt,
+        zendesk_customer_id=int(zendesk_user_id),
+        customer_name=patient_name,
+        booking_service_name=booking_service_name,
+        appt_category="門診" if booking_type == "clinic" else "針灸",
+        booking_type=booking_type,
+        business_id=BOOKINGS_BUSINESS_CLINIC_ID,
+        clinic_period=clinic_period,
+        booking_source=booking_source,
+    )
+
+    if not result:
+        return jsonify({
+            "success": False,
+            "message": "zendesk_ticket_failed",
+            "reason": "create_ticket_failed",
+        }), 200
+
+    return jsonify({
+        "success": True,
+        "message": "zendesk_ticket_created",
+    }), 200
+
+
+@app.route("/zendesk/ticket-solved", methods=["POST"])
+def zendesk_ticket_solved_webhook():
+    expected_secret = (os.getenv("ZENDESK_WEBHOOK_SECRET") or "").strip()
+    provided_secret = (request.headers.get("X-Webhook-Secret") or "").strip()
+
+    if expected_secret and provided_secret != expected_secret:
+        app.logger.warning("[ZD_SOLVED] invalid webhook secret")
+        return jsonify({
+            "success": False,
+            "message": "forbidden",
+        }), 403
+
+    body = request.get_json(silent=True) or {}
+    print(f"[ZD_SOLVED] body={body}", flush=True)
+
+    ticket_id = body.get("ticket_id")
+    requester_id = body.get("requester_id")
+    status = (body.get("status") or "").strip().lower()
+
+    if isinstance(ticket_id, dict):
+        ticket_id = ticket_id.get("text") or ticket_id.get("value")
+
+    if isinstance(requester_id, dict):
+        requester_id = requester_id.get("text") or requester_id.get("value")
+
+    if not ticket_id:
+        return jsonify({
+            "success": False,
+            "message": "missing_ticket_id",
+        }), 400
+
+    if status != "solved":
+        return jsonify({
+            "success": False,
+            "message": "unsupported_status",
+        }), 400
+
+    requester_id_int = None
+    if requester_id not in (None, ""):
+        try:
+            requester_id_int = int(requester_id)
+        except Exception:
+            return jsonify({
+                "success": False,
+                "message": "invalid_requester_id",
+            }), 400
+
+    if requester_id_int is None:
+        try:
+            ticket_id_int = int(ticket_id)
+        except Exception:
+            return jsonify({
+                "success": False,
+                "message": "invalid_ticket_id",
+            }), 400
+
+        ticket = get_zendesk_ticket_by_id(ticket_id_int)
+        if not ticket:
+            return jsonify({
+                "success": False,
+                "message": "ticket_not_found",
+            }), 404
+
+        requester_id = ticket.get("requester_id")
+        try:
+            requester_id_int = int(requester_id)
+        except Exception:
+            return jsonify({
+                "success": False,
+                "message": "missing_requester_id",
+            }), 400
+
+    updated = adjust_future_booking_count(requester_id_int, -1)
+    if not updated:
+        return jsonify({
+            "success": False,
+            "message": "future_booking_count_update_failed",
+        }), 500
+
+    user_fields = updated.get("user_fields") or {}
+    return jsonify({
+        "success": True,
+        "ticket_id": ticket_id,
+        "requester_id": requester_id_int,
+        "future_booking_count": user_fields.get("future_booking_count"),
+    }), 200
+
+
+ 
 @app.get("/ping")
 def ping():
     return {"ok": True, "ts": time.time()}, 200

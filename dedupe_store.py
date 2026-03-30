@@ -1,13 +1,32 @@
 # dedupe_store.py
 import hashlib
 import sys
+import threading
+import time
 from queue_core import redis_conn
 
 PREFIX = "linebot:dedupe:webhook:"   # 跟 linebot:pending: 同風格
 DEFAULT_TTL_SEC = 6 * 60 * 60        # 6 小時（可調 1~6 小時）
+_LOCAL_DEDUPE_LOCK = threading.Lock()
+_LOCAL_DEDUPE: dict[str, float] = {}
 
 def _key(key_id: str) -> str:
     return f"{PREFIX}{key_id}"
+
+
+def _check_and_mark_local(k: str, ttl_sec: int) -> bool:
+    now = time.time()
+    with _LOCAL_DEDUPE_LOCK:
+        expired = [key for key, expires_at in _LOCAL_DEDUPE.items() if expires_at <= now]
+        for key in expired:
+            _LOCAL_DEDUPE.pop(key, None)
+
+        expires_at = _LOCAL_DEDUPE.get(k)
+        if expires_at and expires_at > now:
+            return False
+
+        _LOCAL_DEDUPE[k] = now + ttl_sec
+        return True
 
 def _make_key_id(evt_id: str | None, msg_id: str | None, evt_ts: int | None, body: str) -> str:
     """
@@ -30,7 +49,7 @@ def check_and_mark_webhook(*, evt_id=None, msg_id=None, evt_ts=None, body="", tt
     回傳值：
     - True  => 第一次看到（放行）
     - False => 已看過（重送，直接擋）
-    - None  => Redis 出錯（fail-open 放行，但要 log）
+    - Redis 出錯時改走 process-local fallback，仍會回 True / False
     """
     key_id = _make_key_id(evt_id, msg_id, evt_ts, body)
     k = _key(key_id)
@@ -40,9 +59,15 @@ def check_and_mark_webhook(*, evt_id=None, msg_id=None, evt_ts=None, body="", tt
         ok = redis_conn.set(k, "1", nx=True, ex=ttl_sec)
         return True if ok else False
     except Exception as e:
-        # 這裡印出來會直接看到是不是 Redis 連線/timeout
+        # Redis 掛掉時改用 process-local fallback，避免直接 fail-open。
         print(f"[DEDUPE_EX] evt_id={evt_id} msg_id={msg_id} err={repr(e)}", file=sys.stderr, flush=True)
-        return None
+        local_ok = _check_and_mark_local(k, ttl_sec)
+        print(
+            f"[DEDUPE_LOCAL] evt_id={evt_id} msg_id={msg_id} ok={local_ok}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return local_ok
 
 
 # def check_and_mark_webhook(*, evt_id=None, msg_id=None, evt_ts=None, body="", ttl_sec: int = DEFAULT_TTL_SEC):

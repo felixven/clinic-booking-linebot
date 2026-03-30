@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import hashlib
 import os
 import requests
 import re
 import json
+from urllib.parse import quote
 from flask import current_app as app  # 用 app.logger
 
 from config import (
@@ -37,6 +39,10 @@ from config import (
     CLINIC_EVENING_START
 )
 
+GRAPH_TOKEN_TIMEOUT = (5, 15)
+GRAPH_API_TIMEOUT = (5, 20)
+BOOKING_KEY_MARKER = "[BOOKING_KEY]"
+
 # ======== 跟 Entra 拿 Microsoft Graph 的 access token ========
 
 def get_graph_token():
@@ -56,12 +62,69 @@ def get_graph_token():
         "grant_type": "client_credentials",
     }
 
-    resp = requests.post(url, data=data)
+    resp = requests.post(url, data=data, timeout=GRAPH_TOKEN_TIMEOUT)
     app.logger.info(
         f"GRAPH TOKEN STATUS: {resp.status_code}, BODY: {resp.text}")
 
     resp.raise_for_status()
     return resp.json()["access_token"]
+
+
+def _quote_appt_id(appt_id: str) -> str:
+    """
+    Bookings appointment id 有時會包含 /、+、= 等特殊字元，直接放進 URL path
+    會讓 Graph 把它切壞；因此這裡統一先做 URL encode。
+    """
+    return quote(appt_id, safe="")
+
+
+def _normalize_booking_phone(phone: str | None) -> str:
+    return re.sub(r"\D+", "", phone or "")
+
+
+def _make_booking_idempotency_key(
+    *,
+    business_id: str,
+    service_id: str,
+    date_str: str,
+    time_str: str,
+    line_user_id: str | None,
+    customer_phone: str | None,
+) -> str:
+    identity = line_user_id or _normalize_booking_phone(customer_phone) or "unknown"
+    raw = f"{business_id}|{service_id}|{date_str}|{time_str}|{identity}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _notes_contain_booking_key(notes: str | None, booking_key: str) -> bool:
+    if not notes:
+        return False
+    return f"{BOOKING_KEY_MARKER} {booking_key}" in notes
+
+
+def _find_existing_booking_by_key(date_str: str, business_id: str, booking_key: str) -> dict | None:
+    try:
+        appts = list_appointments_for_date(date_str, business_id=business_id)
+    except Exception as e:
+        app.logger.warning(
+            f"[BOOKING_IDEMPOTENCY] 查詢既有預約失敗 business_id={business_id} date={date_str}: {e}"
+        )
+        return None
+
+    for appt in appts:
+        notes = " ".join(
+            [
+                appt.get("serviceNotes") or "",
+                appt.get("customerNotes") or "",
+            ]
+        ).strip()
+        if _notes_contain_booking_key(notes, booking_key):
+            app.logger.warning(
+                f"[BOOKING_IDEMPOTENCY] 命中既有預約 booking_key={booking_key} booking_id={appt.get('id')}"
+            )
+            return appt
+
+    return None
 
 
 def _get_clinic_day_intervals_by_session(session: str) -> list[tuple[str, str]]:
@@ -304,7 +367,7 @@ def list_appointments_for_date(date_str: str, business_id: str) -> list:
     headers: dict = {"Authorization": f"Bearer {token}"}
     params: dict = {"start": start_time, "end": end_time}
 
-    resp = requests.get(url, headers=headers, params=params)
+    resp = requests.get(url, headers=headers, params=params, timeout=GRAPH_API_TIMEOUT)
     app.logger.info(f"CALENDAR VIEW STATUS: {resp.status_code}, URL: {resp.url}")
     resp.raise_for_status()
     return resp.json().get("value", [])
@@ -531,7 +594,8 @@ def get_appointment_by_id(appt_id: str, business_id: str):
 
     token = get_graph_token()
 
-    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{appt_id}"
+    encoded_appt_id = _quote_appt_id(appt_id)
+    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{encoded_appt_id}"
     headers = {"Authorization": f"Bearer {token}"}
 
     resp = requests.get(url, headers=headers)
@@ -618,7 +682,8 @@ def cancel_booking_appointment(appt_id: str, business_id: str = None):
     if not biz:
         raise Exception("缺 business_id（未傳入且 env BOOKING_BUSINESS_ID 也不存在）")
 
-    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{biz}/appointments/{appt_id}"
+    encoded_appt_id = _quote_appt_id(appt_id)
+    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{biz}/appointments/{encoded_appt_id}"
     headers = {"Authorization": f"Bearer {token}"}
 
     resp = requests.delete(url, headers=headers)
@@ -642,7 +707,8 @@ def update_booking_service_notes(appt_id: str, notes_text: str, business_id: str
         raise Exception("update_booking_service_notes: business_id 為空")
 
     token = get_graph_token()
-    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{appt_id}"
+    encoded_appt_id = _quote_appt_id(appt_id)
+    url = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments/{encoded_appt_id}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -844,6 +910,13 @@ def create_booking_appointment(
     else:
         booking_customer_name: str = customer_name
 
+    # fallback：沒傳就用原本 demo 常數（不影響流程）
+    final_service_id = service_id or BOOKINGS_SERVICE_CLINIC_ID
+
+    # staff：針灸才一定需要；內科若不想指定，就讓它 None
+    # （目前呼叫端：針灸會傳 staff_member_ids；內科傳 None）
+    final_staff_ids = staff_member_ids  # 不再 fallback 成 demo staff，避免內科/針灸 business 不相容
+
     # 預先組好 serviceNotes
     service_notes_lines: list = []
     if line_user_id:
@@ -852,18 +925,21 @@ def create_booking_appointment(
     if zendesk_customer_id:
         service_notes_lines.append(f"[ZD_USER] {zendesk_customer_id}")
 
+    booking_key = _make_booking_idempotency_key(
+        business_id=business_id,
+        service_id=final_service_id,
+        date_str=date_str,
+        time_str=time_str,
+        line_user_id=line_user_id,
+        customer_phone=customer_phone,
+    )
+    service_notes_lines.append(f"{BOOKING_KEY_MARKER} {booking_key}")
+
     service_notes: str = "\n".join(service_notes_lines) if service_notes_lines else None
 
     # URL 和 Duration 常數
     url: str = f"https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/{business_id}/appointments"
     duration: int = APPOINTMENT_DURATION_MINUTES 
-
-    # fallback：沒傳就用原本 demo 常數（不影響流程）
-    final_service_id = service_id or BOOKINGS_SERVICE_CLINIC_ID
-
-    # staff：針灸才一定需要；內科若不想指定，就讓它 None
-    # （目前呼叫端：針灸會傳 staff_member_ids；內科傳 None）
-    final_staff_ids = staff_member_ids  # 不再 fallback 成 demo staff，避免內科/針灸 business 不相容
 
 
     # payload: dict = {
@@ -904,6 +980,9 @@ def create_booking_appointment(
     if service_notes:
         payload["serviceNotes"] = service_notes
 
+    existing_booking = _find_existing_booking_by_key(date_str, business_id, booking_key)
+    if existing_booking:
+        return existing_booking
 
     headers: dict = {
         "Authorization": f"Bearer {token}",
@@ -911,7 +990,16 @@ def create_booking_appointment(
     }
 
     # --- 2. 建立 Bookings 預約 ---
-    resp = requests.post(url, headers=headers, json=payload)
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=GRAPH_API_TIMEOUT)
+    except requests.RequestException as e:
+        existing_booking = _find_existing_booking_by_key(date_str, business_id, booking_key)
+        if existing_booking:
+            app.logger.warning(
+                f"[CREATE_APPT] post 失敗但找到既有預約 booking_key={booking_key} err={e}"
+            )
+            return existing_booking
+        raise
     app.logger.info(f"CREATE APPT STATUS: {resp.status_code}, BODY: {resp.text}")
 
     # ===== DEBUG（保留 print，不刪）=====
@@ -1060,6 +1148,7 @@ def get_available_acu_slots_for_date(date_str: str) -> list[str]:
                 s = s.split(".", 1)[0]
             utc_dt = datetime.fromisoformat(s)
             local_dt = utc_dt + timedelta(hours=8)
+            hhmm = local_dt.strftime("%H:%M")
         except Exception:
             continue
 
@@ -1295,7 +1384,4 @@ def is_acu_slot_available(date_str: str, time_str: str) -> bool:
 #             return False
 
 #     return True
-
-
-
 
