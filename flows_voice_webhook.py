@@ -1,15 +1,69 @@
 # flows_voice_webhook.py
 from datetime import datetime
+import json
 from flask import current_app as app
 from zendesk_core import (
     mark_zendesk_ticket_voice_attempted,
     mark_zendesk_ticket_voice_succeeded,
     mark_zendesk_ticket_voice_failed,
 )
+from queue_core import redis_conn
 
 from utils import(
     parse_ticket_ids
 )
+
+VOICE_CALL_MAP_PREFIX = "voice_call_map:"
+VOICE_CALL_MAP_TTL_SEC = 7 * 24 * 60 * 60
+
+
+def _voice_call_map_key(call_id: str) -> str:
+    return f"{VOICE_CALL_MAP_PREFIX}{call_id}"
+
+
+def store_voice_call_mapping(call_id: str, ticket_ids: list[int]) -> None:
+    if not call_id or not ticket_ids:
+        return
+    try:
+        redis_conn.set(
+            _voice_call_map_key(str(call_id)),
+            json.dumps([int(x) for x in ticket_ids if x]),
+            ex=VOICE_CALL_MAP_TTL_SEC,
+        )
+        app.logger.info(
+            "[voice_webhook] stored call mapping call_id=%s ticket_ids=%s",
+            call_id,
+            ticket_ids,
+        )
+    except Exception as e:
+        app.logger.error(
+            "[voice_webhook] store mapping failed call_id=%s ticket_ids=%s err=%r",
+            call_id,
+            ticket_ids,
+            e,
+        )
+
+
+def load_voice_call_mapping(call_id: str) -> list[int]:
+    if not call_id:
+        return []
+    try:
+        raw = redis_conn.get(_voice_call_map_key(str(call_id)))
+    except Exception as e:
+        app.logger.error("[voice_webhook] load mapping failed call_id=%s err=%r", call_id, e)
+        return []
+
+    if not raw:
+        return []
+
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        return [int(x) for x in data if x]
+    except Exception as e:
+        app.logger.error("[voice_webhook] parse mapping failed call_id=%s err=%r", call_id, e)
+        return []
 
 def _get_metadata(data: dict) -> dict:
     m = data.get("metadata")
@@ -112,6 +166,15 @@ def handle_livehub_webhook(data: dict):
     if not ticket_ids:
         single = metadata.get("ticketId") or metadata.get("zendesk_ticket_id")
         ticket_ids = parse_ticket_ids(single)
+
+    if not ticket_ids and call_id:
+        ticket_ids = load_voice_call_mapping(str(call_id))
+        if ticket_ids:
+            app.logger.info(
+                "[voice_webhook] recovered ticket_ids from mapping call_id=%s ticket_ids=%s",
+                call_id,
+                ticket_ids,
+            )
 
 
     if not call_id or not ticket_ids:

@@ -80,67 +80,175 @@ def identify_patient_by_phone(phone_raw: str, flow: str = "clinic_booking") -> d
     """
     phone = normalize_phone(phone_raw)
 
-    if not phone:
+    def _empty_raw_user() -> dict:
+        return {
+            "active": False,
+            "alias": "",
+            "created_at": "",
+            "custom_role_id": 0,
+            "default_group_id": 0,
+            "details": "",
+            "email": None,
+            "external_id": "",
+            "iana_time_zone": "",
+            "id": 0,
+            "is_billing_admin": None,
+            "last_login_at": None,
+            "locale": "",
+            "locale_id": 0,
+            "moderator": False,
+            "name": "",
+            "notes": "",
+            "only_private_comments": False,
+            "organization_id": 0,
+            "phone": phone,
+            "photo": None,
+            "report_csv": False,
+            "restricted_agent": False,
+            "role": "",
+            "role_type": None,
+            "shared": False,
+            "shared_agent": False,
+            "shared_phone_number": False,
+            "signature": None,
+            "suspended": False,
+            "tags": [],
+            "ticket_restriction": "",
+            "time_zone": "",
+            "two_factor_auth_enabled": None,
+            "updated_at": "",
+            "url": "",
+            "user_fields": {
+                "clinic_acu_doctor_approved": False,
+                "clinic_acu_internal_patient": False,
+                "clinic_acu_seen_within_3_months": False,
+                "future_booking_count": 0,
+                "line_name": "",
+                "line_user_id": "",
+                "profile_status": "",
+                "record_no": None,
+                "state": None,
+            },
+            "verified": False,
+        }
+
+    def _base_response() -> dict:
         return {
             "success": False,
             "patient_found": False,
             "can_continue": False,
-            "reason": "invalid_phone",
-            "message": "手機格式不正確",
+            "reason": "",
+            "message": "",
+            "phone": phone,
+            "zendesk_user_id": "",
+            "patient_name": "",
+            "line_name": "",
+            "line_user_id": "",
+            "profile_status": "",
+            "future_booking_count": 0,
+            "raw_user": _empty_raw_user(),
         }
+
+    if not phone:
+        result = _base_response()
+        result.update(
+            {
+                "reason": "invalid_phone",
+                "message": "手機格式不正確",
+            }
+        )
+        return result
 
     try:
         users = search_zendesk_users_by_phone(phone) or []
     except Exception as e:
         print(f"[VOICE_IDENTIFY] search_zendesk_users_by_phone failed phone={phone} err={repr(e)}")
-        return {
-            "success": False,
-            "patient_found": False,
-            "can_continue": False,
-            "reason": "zendesk_search_failed",
-            "message": "查詢客戶資料失敗",
-            "phone": phone,
-        }
+        result = _base_response()
+        result.update(
+            {
+                "reason": "zendesk_search_failed",
+                "message": "查詢客戶資料失敗",
+            }
+        )
+        return result
 
     if not users:
-        return {
-            "success": True,
-            "patient_found": False,
-            "can_continue": False,
-            "reason": "patient_not_found",
-            "message": "查無既有客戶資料",
-            "phone": phone,
-        }
+        result = _base_response()
+        result.update(
+            {
+                "success": True,
+                "reason": "patient_not_found",
+                "message": "查無既有客戶資料",
+            }
+        )
+        return result
 
     # 第一版先取第一筆
     user = users[0]
     user_id = user.get("id")
     user_name = (user.get("name") or "").strip()
     user_phone = normalize_phone(user.get("phone") or phone)
+    raw_user = _empty_raw_user()
+    raw_user.update(user)
+    raw_user_fields = dict(raw_user.get("user_fields") or {})
+    raw_user_fields.setdefault("clinic_acu_doctor_approved", False)
+    raw_user_fields.setdefault("clinic_acu_internal_patient", False)
+    raw_user_fields.setdefault("clinic_acu_seen_within_3_months", False)
+    raw_user_fields.setdefault("future_booking_count", 0)
+    raw_user_fields.setdefault("line_name", "")
+    raw_user_fields.setdefault("line_user_id", "")
+    raw_user_fields.setdefault("profile_status", "")
+    raw_user_fields.setdefault("record_no", None)
+    raw_user_fields.setdefault("state", None)
+    raw_user["user_fields"] = raw_user_fields
+    line_name = str(raw_user_fields.get("line_name") or "")
+    line_user_id = str(raw_user_fields.get("line_user_id") or "")
+    profile_status = str(raw_user_fields.get("profile_status") or "")
+    future_booking_count = raw_user_fields.get("future_booking_count") or 0
+    try:
+        future_booking_count = int(future_booking_count)
+    except Exception:
+        future_booking_count = 0
 
     if is_placeholder_name(user_name):
-        return {
+        result = _base_response()
+        result.update(
+            {
+                "success": True,
+                "patient_found": True,
+                "reason": "invalid_name",
+                "message": "客戶姓名資料不完整",
+                "phone": user_phone,
+                "zendesk_user_id": str(user_id) if user_id else "",
+                "patient_name": user_name,
+                "line_name": line_name,
+                "line_user_id": line_user_id,
+                "profile_status": profile_status,
+                "future_booking_count": future_booking_count,
+                "raw_user": raw_user,
+            }
+        )
+        return result
+
+    result = _base_response()
+    result.update(
+        {
             "success": True,
             "patient_found": True,
-            "can_continue": False,
-            "reason": "invalid_name",
-            "message": "客戶姓名資料不完整",
+            "can_continue": True,
+            "reason": "",
+            "message": "ok",
             "phone": user_phone,
-            "zendesk_user_id": str(user_id) if user_id else None,
+            "zendesk_user_id": str(user_id) if user_id else "",
             "patient_name": user_name,
+            "line_name": line_name,
+            "line_user_id": line_user_id,
+            "profile_status": profile_status,
+            "future_booking_count": future_booking_count,
+            "raw_user": raw_user,
         }
-
-    return {
-        "success": True,
-        "patient_found": True,
-        "can_continue": True,
-        "reason": None,
-        "message": "ok",
-        "phone": user_phone,
-        "zendesk_user_id": str(user_id) if user_id else None,
-        "patient_name": user_name,
-        "raw_user": user,
-    }
+    )
+    return result
 
 def _build_candidate_dates_for_week(week_offset: int = 0) -> list:
     """

@@ -41,6 +41,7 @@ from config import (
     ZENDESK_CF_LAST_VOICE_ATTEMPT_DATE,
     APPOINTMENT_DURATION_MINUTES,
 )
+from flows_voice_webhook import store_voice_call_mapping
 
 
 
@@ -281,6 +282,14 @@ def process_voice_call_group(line_user_id: str, appt_date_str: str, ticket_ids: 
                 except Exception as ee:
                     app.logger.error(f"[VOICE GROUP] attempts+1 failed tid={tid}: {ee}")
             data = resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text
+            if isinstance(data, dict):
+                conversation_id = (
+                    data.get("conversationId")
+                    or data.get("callId")
+                    or data.get("id")
+                )
+                if conversation_id:
+                    store_voice_call_mapping(str(conversation_id), ticket_ids)
             app.logger.info(f"[VOICE GROUP] LiveHub response={data}")
         except Exception as e:
             app.logger.error(f"[VOICE GROUP] dialout 失敗: {e}")

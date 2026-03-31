@@ -1,4 +1,4 @@
-import requests
+import requests,re
 import json, uuid, time
 import sys
 import threading
@@ -3754,6 +3754,7 @@ def voice_identify_patient():
     flow = body.get("flow", "clinic_booking")
 
     result = identify_patient_by_phone(phone, flow=flow)
+    result.pop("raw_user", None)
     return jsonify(result), 200
 
 #get booking options
