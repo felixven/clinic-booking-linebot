@@ -758,7 +758,7 @@ def create_clinic_booking(phone: str, date_str: str, period: str) -> dict:
 
     return {
         "success": True,
-        "reason": None,
+        "reason": "",
         "message": "booking_created",
         "patient_name": patient_name,
         "phone": normalized_phone,

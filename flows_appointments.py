@@ -161,7 +161,7 @@ def flow_query_next_appointment(event, text: str):
 
         if btype == "clinic":
             # 門診：不顯示 HH:MM，只顯示早/晚
-            period_label = "早診" if local_start.hour < 12 else "晚診"
+            period_label = "早診9:00" if local_start.hour < 12 else "晚診 16:30"
             title = f"【門診】{display_date}（{period_label}）"
         else:
             # 針灸：顯示時間

@@ -1159,6 +1159,12 @@ def get_available_acu_slots_for_date(date_str: str) -> list[str]:
 
     available = []
     for hhmm, bed in day_map.items():
+        # 星期六實際上只有一張床；若任一床在同時段已有預約，就整個時段封鎖。
+        if wd == 5:
+            if hhmm not in booked_by_bed["bed1"] and hhmm not in booked_by_bed["bed2"]:
+                available.append(hhmm)
+            continue
+
         if hhmm not in booked_by_bed.get(bed, set()):
             available.append(hhmm)
 
@@ -1384,4 +1390,3 @@ def is_acu_slot_available(date_str: str, time_str: str) -> bool:
 #             return False
 
 #     return True
-

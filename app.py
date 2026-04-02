@@ -737,7 +737,14 @@ def handle_message(event: MessageEvent):
                 event,
                 messages=[
                     TextMessage(
-                        text="您目前正在填寫資料中。\n如要取消請按「取消」或輸入「取消」。"
+                        text="您目前正在填寫資料中。\n如要取消請按「取消」或輸入「取消」。",
+                        quick_reply=QuickReply(
+                            items=[
+                                QuickReplyItem(
+                                    action=MessageAction(label="取消預約", text="取消")
+                                ),
+                            ]
+                        ),
                     )
                 ],
                 label="already_in_flow_warning",
@@ -760,7 +767,14 @@ def handle_message(event: MessageEvent):
                 event,
                 messages=[
                     TextMessage(
-                        text="請先按下方按鈕「開始輸入」後再輸入。若要取消請輸入「取消」。"
+                        text="請先按下方按鈕「開始輸入」後再輸入。若要取消請輸入「取消」。",
+                        quick_reply=QuickReply(
+                            items=[
+                                QuickReplyItem(
+                                    action=MessageAction(label="取消預約", text="取消")
+                                ),
+                            ]
+                        ),
                     )
                 ],
                 label="consent",
@@ -3195,7 +3209,18 @@ def handle_postback(event):
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[TextMessage(text="您目前正在填寫其他資料。如需重新開始，請輸入「取消」。")],
+                    messages=[
+                        TextMessage(
+                            text="您目前正在填寫其他資料。如需重新開始，請輸入「取消」。",
+                            quick_reply=QuickReply(
+                                items=[
+                                    QuickReplyItem(
+                                        action=MessageAction(label="取消預約", text="取消")
+                                    ),
+                                ]
+                            ),
+                        )
+                    ],
                 )
             )
             return
